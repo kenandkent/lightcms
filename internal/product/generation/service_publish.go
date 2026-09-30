@@ -264,9 +264,6 @@ func mapSagaErr(err error) error {
 	case publication.CodeStageFailed, publication.CodeVerifyFailed, publication.CodeActivateFailed,
 		publication.CodeUnpublishStageFailed:
 		// Static-store / cutover failures are retryable 503s.
-		if storage.CodeOf(err) != "" || isStoreErr(err) {
-			return &Error{Code: CodeStoreUnavailable, Message: msg, RetryAfter: 30, Err: err}
-		}
 		return &Error{Code: CodeStoreUnavailable, Message: msg, RetryAfter: 30, Err: err}
 	case publication.CodeValidationFailed:
 		return genErr(CodeFieldValidationFailed, msg, err)
@@ -282,6 +279,17 @@ func mapSagaErr(err error) error {
 		return genErr(CodePublicURLFailed, msg, err)
 	case publication.CodeConflict:
 		return genErr(CodePublicationConflict, msg, err)
+	case publication.CodeNotFound:
+		// Rollback / revert-live with an unknown source publication ID:
+		// spec §27 PUBLICATION_NOT_FOUND, HTTP 404 (not a 500).
+		return genErr(CodePublicationNotFound, msg, err)
+	case CodeTemplateNotFound, CodeTemplateVersionNotFound:
+		// mapSagaCode resolves templatecontract not-found codes to these
+		// generation codes; deliver the spec §27 404s instead of collapsing
+		// to INTERNAL_ERROR.
+		return genErr(code, msg, err)
+	case CodeTemplateVersionConflict:
+		return genErr(code, msg, err)
 	case publication.CodeInternal:
 		return genErr(CodeInternal, msg, err)
 	default:
@@ -318,8 +326,6 @@ func mapSagaCode(err error) string {
 	}
 	return CodeInternal
 }
-
-func isStoreErr(err error) bool { return storage.CodeOf(err) != "" }
 
 // responseFromCache rebuilds a GenerateResponse from a replayed idempotency payload.
 func responseFromCache(op idempotency.Operation) (GenerateResponse, error) {

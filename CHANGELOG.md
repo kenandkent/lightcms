@@ -4,6 +4,25 @@ All notable changes to LightCMS are documented here, organized by version.
 
 ---
 
+## [7.3.0] - 2026-09-30
+
+### Added — V3 templatized page generation and static publication system
+- **Immutable publication records**: every publish mints a staged → active `content_publications` record with SHA-256 content hash, renderer version, and build SHA; canonical files cut over atomically with `.previous-*` sidecars for restart repair.
+- **Template versions**: immutable v1+ snapshots with contract/render hashes and a draft → active → deprecated lifecycle. Publishing against a non-active template is rejected with 409 `TEMPLATE_NOT_ACTIVE`.
+- **Idempotent operations**: stable operation keys for scheduler, import, copilot, search-replace, and upgrade callers; same-key replay creates no duplicate publication or outbox row; crashed-worker lease takeover instead of duplicates.
+- **Migration**: `migrate-publications` dry-run/apply reconciles legacy pages (verified vs `legacy_unverified` import, missing-static and invalid-path blocking reports), backfills template v1 + `current_version`, then swaps to the canonical index set. Resume-safe; re-run after completion is a no-op.
+- **Recovery scanner**: startup/interval pass repairs cutover crashes (previous restore, unpublish-backup restore, canonical rebuild), enforces the migration-gated orphan rule, and never deletes bytes (quarantine preserves).
+- **Legacy entry compatibility**: single binary serves the existing publish/unpublish/regenerate/by-path/asset routes with V3 semantics; manual regenerate is a fail-safe no-op returning 200 until the 410-vs-upgrade-redirect decision lands.
+- **MCP**: 122 tools including `get_template_schema`; public read-only MCP endpoint unchanged.
+
+### Fixed
+- Recovery scanner no longer treats fork copies as live pages: a fork sharing a live path previously drove the no-active orphan rule and quarantined the serving canonical (found by the 7.3.0 release rehearsal; regression test `TestScannerForkCopyKeepsLiveOnline`).
+- Migration template backfill now matches templates lacking `current_version` entirely (`$exists: false` alongside `$lte: 0`), per §35.2.
+- Publish/rollback error mapping preserves spec §27 not-found codes: unknown rollback source → 404 `PUBLICATION_NOT_FOUND`, unknown template/version → 404, template version conflict → 409 (previously all collapsed to 500 `INTERNAL_ERROR`).
+- Removed the dead `isStoreErr` tautology in the saga error mapper (both branches returned the same retryable 503).
+
+---
+
 ## [7.2.2] - 2026-07-07
 
 ### Fixed

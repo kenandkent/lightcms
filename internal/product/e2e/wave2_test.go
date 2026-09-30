@@ -349,13 +349,12 @@ func TestE2E_RestoreVersion404(t *testing.T) {
 	code, resp = e.postJSON("/api/v1/content/"+cid+"/revert-live",
 		map[string]any{"source_publication_id": "6abd026e6f2815eddbe8dd99"},
 		map[string]string{"Idempotency-Key": "rv-404-2"})
-	// Mapping wart pinned (minor): unknown source surfaces 500 with a
-	// PUBLICATION_NOT_FOUND message instead of 404. Specified fix:
-	// mapSagaErr should translate publication CodeNotFound to
-	// CodePublicationNotFound (404). Zero mutation either way.
+	// Task 19 fix landed: unknown source is 404 PUBLICATION_NOT_FOUND
+	// (mapSagaErr translates publication CodeNotFound). Zero mutation
+	// either way.
 	rawResp, _ := json.Marshal(resp)
-	if code != 500 || !strings.Contains(string(rawResp), "PUBLICATION_NOT_FOUND") {
-		t.Fatalf("revert unknown source = %d (%v), want pinned 500/PUBLICATION_NOT_FOUND", code, resp)
+	if code != 404 || !strings.Contains(string(rawResp), "PUBLICATION_NOT_FOUND") {
+		t.Fatalf("revert unknown source = %d (%v), want 404/PUBLICATION_NOT_FOUND", code, resp)
 	}
 	if n := e.count("content_publications", bson.M{}); n != pubsBefore {
 		t.Fatal("failed restore/revert minted publications")

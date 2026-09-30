@@ -345,7 +345,12 @@ func (s *Scanner) ScanOnce(ctx context.Context) (ScanReport, error) {
 		path string
 	}
 	var refs []contentRef
-	cur, err := s.db.Collection(CollectionContent).Find(ctx, bson.M{},
+	// Fork copies share their full_path with the live page by design
+	// (sparse copy-on-write workspaces). They own no canonical file and
+	// must never be reconciled as live pages: reconciling one runs the
+	// no-active orphan rule and quarantines the LIVE canonical out from
+	// under a serving page. "fork_id: nil" covers missing+null.
+	cur, err := s.db.Collection(CollectionContent).Find(ctx, bson.M{"fork_id": nil},
 		options.Find().SetProjection(bson.M{"_id": 1, "full_path": 1}))
 	if err != nil {
 		return *st.rpt, err
