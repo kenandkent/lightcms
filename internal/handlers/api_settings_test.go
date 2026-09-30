@@ -1,11 +1,16 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jonradoff/lightcms/v7/internal/middleware"
 
 	"github.com/gorilla/mux"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -806,4 +811,134 @@ func TestAPIUploadAssetFromURL_InvalidBody(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d; body: %s", rr.Code, rr.Body.String())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 13: remote asset hardening (DB-free: reject paths never reach the DB)
+// ---------------------------------------------------------------------------
+
+func TestAPIUploadAssetFromURL_ContentLengthTooLarge(t *testing.T) {
+	// Content-Length over 50 MiB must be rejected with ASSET_TOO_LARGE
+	// without reading or saving the body.
+	body := io.NopCloser(bytes.NewReader([]byte("tiny")))
+	resp := &http.Response{Body: body, ContentLength: (50 << 20) + 1}
+	if _, err := readBoundedRemoteBody(resp.Body, resp.ContentLength); err == nil {
+		t.Fatal("expected ASSET_TOO_LARGE for Content-Length 50MiB+1")
+	} else if !strings.Contains(err.Error(), "ASSET_TOO_LARGE") {
+		t.Fatalf("expected ASSET_TOO_LARGE, got %v", err)
+	}
+}
+
+func TestAPIUploadAssetFromURL_ChunkedTooLarge(t *testing.T) {
+	// Unknown length (chunked) body over 50 MiB must be rejected with
+	// ASSET_TOO_LARGE and must not return truncated bytes.
+	big := bytes.Repeat([]byte("a"), (50<<20)+1)
+	body := io.NopCloser(bytes.NewReader(big))
+	data, err := readBoundedRemoteBody(body, -1)
+	if err == nil {
+		t.Fatalf("expected ASSET_TOO_LARGE for chunked 50MiB+1, got %d bytes", len(data))
+	}
+	if !strings.Contains(err.Error(), "ASSET_TOO_LARGE") {
+		t.Fatalf("expected ASSET_TOO_LARGE, got %v", err)
+	}
+	if data != nil && len(data) > 0 && len(data) < len(big) {
+		t.Fatal("must not return truncated bytes on oversize")
+	}
+}
+
+func TestAPIUploadAssetFromURL_LoopbackBlocked(t *testing.T) {
+	ah := &APIHandler{}
+	for _, raw := range []string{
+		`{"url":"http://127.0.0.1/asset.png","serve_path":"/assets/a.png"}`,
+		`{"url":"http://localhost:8082/asset.png","serve_path":"/assets/a.png"}`,
+		`{"url":"http://10.0.0.1/asset.png","serve_path":"/assets/a.png"}`,
+		`{"url":"http://192.168.1.1/asset.png","serve_path":"/assets/a.png"}`,
+		`{"url":"http://[::1]/asset.png","serve_path":"/assets/a.png"}`,
+	} {
+		rr := httptest.NewRecorder()
+		req := authReq(http.MethodPost, "/api/v1/assets/from-url", strings.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		ah.APIUploadAssetFromURL(rr, req)
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("expected 502 SSRF block for %s, got %d; body: %s", raw, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+func TestAPIUploadAssetFromURL_DNSPrivateBlocked(t *testing.T) {
+	// localhost resolves to loopback; DNS-at-dial validation must block it.
+	if !isPrivateOrReservedIP(net.ParseIP("127.0.0.1")) {
+		t.Fatal("expected 127.0.0.1 to be blocked")
+	}
+	if !isPrivateOrReservedIP(net.ParseIP("::1")) {
+		t.Fatal("expected ::1 to be blocked")
+	}
+	if !isPrivateOrReservedIP(net.ParseIP("10.1.2.3")) {
+		t.Fatal("expected 10.1.2.3 to be blocked")
+	}
+	if !isPrivateOrReservedIP(net.ParseIP("169.254.169.254")) {
+		t.Fatal("expected link-local/metadata 169.254.169.254 to be blocked")
+	}
+	if !isPrivateOrReservedIP(net.ParseIP("fd00::1")) {
+		t.Fatal("expected IPv6 ULA fd00::1 to be blocked")
+	}
+	if isPrivateOrReservedIP(net.ParseIP("8.8.8.8")) {
+		t.Fatal("expected 8.8.8.8 to be public")
+	}
+}
+
+func TestAPIUploadAssetFromURL_UserinfoRejected(t *testing.T) {
+	ah := &APIHandler{}
+	rr := httptest.NewRecorder()
+	req := authReq(http.MethodPost, "/api/v1/assets/from-url", strings.NewReader(`{"url":"https://user:pass@example.com/asset.png","serve_path":"/assets/a.png"}`))
+	req.Header.Set("Content-Type", "application/json")
+	ah.APIUploadAssetFromURL(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for URL userinfo, got %d; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAPIUploadAssetFromURL_InvalidScheme(t *testing.T) {
+	ah := &APIHandler{}
+	for _, raw := range []string{
+		`{"url":"ftp://example.com/asset.png","serve_path":"/assets/a.png"}`,
+		`{"url":"file:///etc/passwd","serve_path":"/assets/a.png"}`,
+		`{"url":"javascript:alert(1)","serve_path":"/assets/a.png"}`,
+	} {
+		rr := httptest.NewRecorder()
+		req := authReq(http.MethodPost, "/api/v1/assets/from-url", strings.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		ah.APIUploadAssetFromURL(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for %s, got %d; body: %s", raw, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+func TestAPIUploadAssetFromURL_UnsafeServePath(t *testing.T) {
+	ah := &APIHandler{}
+	rr := httptest.NewRecorder()
+	req := authReq(http.MethodPost, "/api/v1/assets/from-url", strings.NewReader(`{"url":"https://example.com/asset.png","serve_path":"/static/evil.png"}`))
+	req.Header.Set("Content-Type", "application/json")
+	ah.APIUploadAssetFromURL(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unsafe serve_path, got %d; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAPIUploadAssetFromURL_FakeMIME(t *testing.T) {
+	// Remote HTML bytes saved as .png must fail MIME validation (delegated to
+	// AssetService via middleware.ValidateMIMEType). Unit-level proof that the
+	// validator backing the handler rejects the mismatch.
+	if got := fakeMIMECheck(); got {
+		t.Fatal("expected fake MIME (HTML as .png) to be rejected")
+	}
+}
+
+// fakeMIMECheck reports true when HTML bytes would (incorrectly) be accepted
+// as a .png. The handler delegates to AssetService.UploadAsset, which rejects
+// via middleware.ValidateMIMEType.
+func fakeMIMECheck() bool {
+	detected := http.DetectContentType([]byte("<html>not a png</html>"))
+	return middleware.ValidateMIMEType(".png", detected)
 }
