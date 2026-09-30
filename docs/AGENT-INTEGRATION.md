@@ -4,7 +4,7 @@
 > REST 契约见 `docs/openapi/page-generation-v1.yaml`，curl 示例见 `docs/API.md`；
 > 模板编写见 `docs/TEMPLATE-GUIDE.md`；发布运维见 `docs/PUBLICATION-RUNBOOK.md`；
 > 安全模型见 `docs/SECURITY.md`；管理员界面操作见 `docs/USER-MANUAL.md`；
-> 部署与备份见 `docs/DEPLOYMENT.md`、`docs/OPERATIONS.md`、`docs/BACKUP-RESTORE.md`。
+> 部署与备份见 `docs/DEPLOYMENT-LOCAL.md`、`docs/DEPLOYMENT-PRODUCTION.md`、`docs/OPERATIONS.md`、`docs/BACKUP-RESTORE.md`。
 
 行为依据（均已对照源码，而非凭记忆）：scope 组合见
 `internal/product/generation/service.go:checkScopes`；沙盒-only 限制见

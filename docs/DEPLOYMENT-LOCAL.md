@@ -1,7 +1,7 @@
 # LightCMS V3 本地联调部署文档（Task 18C）
 
 > 范围：单机 Docker + 本地构建的**联调/演练环境**，不是生产部署手册。
-> 生产拓扑、配置全表与日常运维见兄弟文档 `docs/DEPLOYMENT.md`、`docs/OPERATIONS.md`；
+> 生产拓扑、配置全表与日常运维见兄弟文档 `docs/DEPLOYMENT-PRODUCTION.md`、`docs/OPERATIONS.md`；
 > 发布操作细节见 `docs/PUBLICATION-RUNBOOK.md`；API 契约见 `docs/API.md` 与
 > `docs/openapi/page-generation-v1.yaml`；备份恢复见 `docs/BACKUP-RESTORE.md`；
 > 模板升级见 `docs/UPGRADE.md`。

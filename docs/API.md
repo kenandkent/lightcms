@@ -3,7 +3,7 @@
 > 适用对象：需要直接调用 REST API 的第三方集成方。
 > 权威契约：`docs/openapi/page-generation-v1.yaml`（12 条路由、全部状态码与错误码）。
 > Agent 专用指引见 `docs/AGENT-INTEGRATION.md`；模板编写见 `docs/TEMPLATE-GUIDE.md`；
-> 发布运维见 `docs/PUBLICATION-RUNBOOK.md`；部署与备份见 `docs/DEPLOYMENT.md`、
+> 发布运维见 `docs/PUBLICATION-RUNBOOK.md`；部署与备份见 `docs/DEPLOYMENT-LOCAL.md`、
 > `docs/OPERATIONS.md`、`docs/BACKUP-RESTORE.md`；升级见 `docs/UPGRADE.md`；
 > 安全模型见 `docs/SECURITY.md`；产品总览见 `docs/README-product.md`；
 > 管理员界面操作见 `docs/USER-MANUAL.md`。

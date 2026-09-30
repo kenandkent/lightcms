@@ -544,7 +544,7 @@ go test -p 1 ./internal/product/e2e -count=1
 
 **Owner:** Documentation worker. **Depends on:** Tasks 12, 16, 17 contracts. **Deliverable:** third party can integrate without source-code archaeology.
 
-**Files:** Create `docs/openapi/page-generation-v1.yaml`, `docs/API.md`, `docs/AGENT-INTEGRATION.md`, `docs/TEMPLATE-GUIDE.md`, `docs/PUBLICATION-RUNBOOK.md`, `docs/DEPLOYMENT.md`, `docs/OPERATIONS.md`, `docs/BACKUP-RESTORE.md`, `docs/UPGRADE.md`, `docs/UPSTREAM-SYNC.md`, `docs/SECURITY.md`, `docs/README-product.md`.
+**Files:** Create `docs/openapi/page-generation-v1.yaml`, `docs/API.md`, `docs/AGENT-INTEGRATION.md`, `docs/TEMPLATE-GUIDE.md`, `docs/USER-MANUAL.md`, `docs/PUBLICATION-RUNBOOK.md`, `docs/DEPLOYMENT-LOCAL.md`, `docs/DEPLOYMENT-PRODUCTION.md` (split from the originally planned single `docs/DEPLOYMENT.md`), `docs/OPERATIONS.md`, `docs/BACKUP-RESTORE.md`, `docs/UPGRADE.md`, `docs/UPSTREAM-SYNC.md`, `docs/SECURITY.md`, `docs/README-product.md`.
 
 **Interfaces:** OpenAPI is the public HTTP contract. Examples use the actual Task 12 route, `expected_template_version`, `Idempotency-Key`, scope combinations and error codes.
 
