@@ -24,6 +24,7 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/errors"
 	"github.com/jonradoff/lightcms/v7/internal/middleware"
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/product/pathkey"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/csrf"
@@ -1070,6 +1071,18 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 	// Extract and track internal links
 	content.InternalLinks = h.extractInternalLinksFromContent(&content)
 
+	// Task 16B: V3 canonical bookkeeping for direct Admin inserts
+	// (spec §12.8). Draft-only: no live file write.
+	if canon, err := pathkey.Canonical(content.FullPath); err == nil {
+		content.CanonicalFullPath = canon
+	}
+	content.PathScope = "live"
+	content.PathActive = true
+	content.CurrentVersion = 1
+	content.HasUnpublishedChanges = false
+	// Transient projection for the Admin response cycle.
+	content.RequiresPublish = !content.Published
+
 	id, err := h.db.InsertOne(ctx, "content", content)
 	if err != nil {
 		h.renderAdmin(w, r, "content_form", map[string]interface{}{
@@ -1088,10 +1101,8 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Warning: Failed to save initial content version: %v\n", err)
 	}
 
-	// Generate static page
-	if published {
-		h.generateStaticPage(ctx, &content, &tmpl)
-	}
+	// Task 16B: draft-only — no h.generateStaticPage here. Publishing is an
+	// explicit action via PublicationService (Admin Publish button).
 
 	// Submit for approval if contributor attempted to publish
 	if createContributorApproval && h.approvalService != nil {
@@ -1383,9 +1394,10 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 			createRedirectFromOld = true
 		}
 
-		// Delete old static file if path changed
-		oldStaticPath := h.getStaticFilePath(oldFullPath)
-		os.Remove(oldStaticPath)
+		// Task 16B: draft-only — never delete the old canonical file here.
+		// Rename-and-publish is a single PublicationService saga that locks
+		// old+new paths, cuts over atomically and commits redirect metadata
+		// together; a draft rename leaves both files untouched.
 	}
 
 	// Check if checkboxes are checked
@@ -1461,6 +1473,18 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	tempContent := &models.Content{Data: data}
 	internalLinks := h.extractInternalLinksFromContent(tempContent)
 
+	// Task 16B: V3 draft-only bookkeeping (spec §12.5, §12.8). Live files are
+	// never touched here; explicit Publish via PublicationService is required.
+	newCanonical := fullPath
+	if canon, err := pathkey.Canonical(fullPath); err == nil {
+		newCanonical = canon
+	}
+	newVersion := originalContent.CurrentVersion + 1
+	if newVersion < 1 {
+		newVersion = 1
+	}
+	hasUnpublished := published || originalContent.Published
+
 	update := bson.M{
 		"$set": bson.M{
 			"title":            title,
@@ -1468,6 +1492,11 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 			"folder_id":        folderID,
 			"folder_path":      folderPath,
 			"full_path":        fullPath,
+			"canonical_full_path": newCanonical,
+			"path_scope":          "live",
+			"path_active":         true,
+			"current_version":     newVersion,
+			"has_unpublished_changes": hasUnpublished,
 			"tags":             updatedTags,
 			"meta_description": metaDescription,
 			"og_image":         ogImage,
@@ -1554,13 +1583,8 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Warning: Failed to save content version: %v\n", err)
 	}
 
-	if published {
-		h.generateStaticPage(ctx, &existingContent, &tmpl)
-	} else {
-		// Remove static file if unpublished
-		staticPath := filepath.Join("content/generated", slug+".html")
-		os.Remove(staticPath)
-	}
+	// Task 16B: draft-only — no h.generateStaticPage / os.Remove here.
+	// Live bytes change only via PublicationService.Publish.
 
 	// Regenerate sitemap after content update
 	go h.RegenerateSitemap(context.Background())
@@ -1602,13 +1626,10 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delete static file using full path
-	staticPath := h.getStaticFilePath(content.FullPath)
-	if staticPath == "" {
-		// Fallback for legacy content
-		staticPath = filepath.Join("content/generated", content.Slug+".html")
-	}
-	os.Remove(staticPath)
+	// Task 16B: draft-only delete — never os.Remove the canonical file here.
+	// Live removal happens only through PublicationService.Unpublish; the
+	// recovery scanner converges leftovers. Direct file delete bypassing
+	// ContentService with no fork guard is removed.
 
 	// Remove any redirects that point to this page
 	// (no point keeping redirects to a deleted page)
@@ -1623,6 +1644,8 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 
 	// Soft delete: mark as deleted instead of removing from database
 	// Use a unique deleted path to avoid unique index conflicts
+	// Task 16B: release the canonical path (path_active=false) without
+	// touching live files.
 	now := time.Now()
 	deletedPath := fmt.Sprintf("__deleted__/%s/%d", id.Hex(), now.UnixNano())
 	update := bson.M{
@@ -1631,6 +1654,7 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 			"deleted_at": now,
 			"published":  false,       // Unpublish when deleting
 			"full_path":  deletedPath, // Unique path for deleted items
+			"path_active": false,
 			"updated_at": now,
 		},
 	}
@@ -1940,12 +1964,8 @@ func (h *Handler) ConfirmChangeTemplate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Regenerate static file if published
-	if content.Published {
-		content.TemplateID = newTemplateID
-		content.Data = newData
-		h.generateStaticPage(ctx, &content, &newTemplate)
-	}
+	// Task 16B: draft-only — changing templates never rewrites live bytes.
+	// The merged draft needs an explicit Publish via PublicationService.
 
 	http.Redirect(w, r, "/cm/content/"+contentID.Hex(), http.StatusSeeOther)
 }
@@ -2177,13 +2197,9 @@ func (h *Handler) RevertContentVersion(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Warning: Failed to save content version after revert: %v\n", err)
 	}
 
-	// Regenerate static file if published
-	if revertedContent.Published {
-		var tmpl models.Template
-		if err := h.db.FindOne(ctx, "templates", bson.M{"_id": revertedContent.TemplateID}, &tmpl); err == nil {
-			h.generateStaticPage(ctx, &revertedContent, &tmpl)
-		}
-	}
+	// Task 16B: draft-only revert — restore-as-draft only, never rewrites
+	// live bytes. Restore-and-publish / revert-live are separate explicit
+	// actions via Generation/PublicationService.
 
 	http.Redirect(w, r, "/cm/content/"+contentID.Hex(), http.StatusSeeOther)
 }
@@ -2214,9 +2230,9 @@ func (h *Handler) RegenerateContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if content.Published {
-		h.generateStaticPage(ctx, &content, &tmpl)
-	}
+	// Task 16B: manual regenerate no longer rewrites live files. The page
+	// keeps serving its active Publication until an explicit Publish.
+	_ = tmpl
 
 	http.Redirect(w, r, "/cm/content", http.StatusSeeOther)
 }
@@ -2694,6 +2710,8 @@ func (h *Handler) updateFolderPaths(ctx context.Context, oldPath, newPath string
 }
 
 // Update content folder paths and full paths when folder path changes
+// Task 16B: draft-only — updates paths without touching live files.
+// A folder move is a draft rename; publishing moved pages is explicit.
 func (h *Handler) updateContentFolderPaths(ctx context.Context, oldFolderPath, newFolderPath string) {
 	// Find all content with folder_path starting with old path
 	cursor, _ := h.db.FindMany(ctx, "content", bson.M{
@@ -2710,27 +2728,23 @@ func (h *Handler) updateContentFolderPaths(ctx context.Context, oldFolderPath, n
 			updatedFullPath = updatedFolderPath + "/" + c.Slug
 		}
 
-		// Delete old static file
-		oldStaticPath := h.getStaticFilePath(c.FullPath)
-		os.Remove(oldStaticPath)
+		// Task 16B: no os.Remove / generateStaticPage here (draft rename).
 
+		newCanon := updatedFullPath
+		if canon, err := pathkey.Canonical(updatedFullPath); err == nil {
+			newCanon = canon
+		}
 		h.db.UpdateOne(ctx, "content", bson.M{"_id": c.ID}, bson.M{
 			"$set": bson.M{
 				"folder_path": updatedFolderPath,
 				"full_path":   updatedFullPath,
+				"canonical_full_path": newCanon,
+				"has_unpublished_changes": c.Published,
 				"updated_at":  time.Now(),
 			},
 		})
 
-		// Regenerate static file at new location if published
-		if c.Published {
-			c.FolderPath = updatedFolderPath
-			c.FullPath = updatedFullPath
-			var tmpl models.Template
-			if err := h.db.FindOne(ctx, "templates", bson.M{"_id": c.TemplateID}, &tmpl); err == nil {
-				h.generateStaticPage(ctx, &c, &tmpl)
-			}
-		}
+		// Task 16B: no regenerate at the new location — explicit Publish required.
 	}
 }
 
@@ -3788,6 +3802,15 @@ func (h *Handler) renderContent(content *models.Content, tmpl *models.Template) 
 }
 
 func (h *Handler) generateStaticPage(ctx context.Context, content *models.Content, tmpl *models.Template) error {
+	// Task 16B fork-safety + live-write guard (spec §12.5, §16.6): fork
+	// copies share full_path with live pages and must never touch static
+	// files. Live mutation paths must go through PublicationService;
+	// this legacy helper is retained only for SeedDefaults bootstrapping.
+	// All Admin/REST mutation call sites in Task 16B/C were routed to the
+	// draft-only ContentService and no longer call this helper.
+	if content.ForkID != nil {
+		return nil
+	}
 	rendered := h.renderContent(content, tmpl)
 
 	// Use full path for file location, supporting folders
@@ -3811,47 +3834,16 @@ func (h *Handler) generateStaticPage(ctx context.Context, content *models.Conten
 }
 
 // regenerateAllContent regenerates all published content (used when header/footer/templates change)
+// Task 16B: disabled — V3 never auto-regenerates live pages. Explicit
+// Upgrade/Publish via PublicationService is required.
 func (h *Handler) regenerateAllContent(ctx context.Context) {
-	// Regenerate all published content items
-	cursor, err := h.db.FindMany(ctx, "content", bson.M{"published": true})
-	if err != nil {
-		return
-	}
-
-	var contents []models.Content
-	if err := cursor.All(ctx, &contents); err != nil {
-		return
-	}
-
-	for _, content := range contents {
-		var tmpl models.Template
-		if err := h.db.FindOne(ctx, "templates", bson.M{"_id": content.TemplateID}, &tmpl); err != nil {
-			continue
-		}
-		h.generateStaticPage(ctx, &content, &tmpl)
-	}
+	return
 }
 
 // regenerateContentByTemplate regenerates all content using a specific template
+// Task 16B: disabled — see above.
 func (h *Handler) regenerateContentByTemplate(ctx context.Context, templateID primitive.ObjectID) {
-	cursor, err := h.db.FindMany(ctx, "content", bson.M{"template_id": templateID, "published": true})
-	if err != nil {
-		return
-	}
-
-	var tmpl models.Template
-	if err := h.db.FindOne(ctx, "templates", bson.M{"_id": templateID}, &tmpl); err != nil {
-		return
-	}
-
-	var contents []models.Content
-	if err := cursor.All(ctx, &contents); err != nil {
-		return
-	}
-
-	for _, content := range contents {
-		h.generateStaticPage(ctx, &content, &tmpl)
-	}
+	return
 }
 
 func (h *Handler) renderPublic(w http.ResponseWriter, r *http.Request, theme *database.ThemeSettings, content string) {
@@ -4287,24 +4279,19 @@ func (h *Handler) updateDependentContentByPath(ctx context.Context, oldPath, new
 			// Re-extract internal links after update
 			content.InternalLinks = h.extractInternalLinksFromContent(&content)
 
-			// Update in database
+			// Update in database (draft-only: mark unpublished changes, no file write)
 			if err := h.db.UpdateOne(ctx, "content", bson.M{"_id": content.ID}, bson.M{
 				"$set": bson.M{
 					"data":           content.Data,
 					"internal_links": content.InternalLinks,
+					"has_unpublished_changes": content.Published,
 					"updated_at":     time.Now(),
 				},
 			}); err != nil {
 				return err
 			}
 
-			// Regenerate static page if published
-			if content.Published {
-				var tmpl models.Template
-				if err := h.db.FindOne(ctx, "templates", bson.M{"_id": content.TemplateID}, &tmpl); err == nil {
-					h.generateStaticPage(ctx, &content, &tmpl)
-				}
-			}
+			// Task 16B: no generateStaticPage here — draft link fix only.
 		}
 	}
 
@@ -4327,8 +4314,8 @@ func (h *Handler) updateDependentContentByPath(ctx context.Context, oldPath, new
 
 		if themeUpdated {
 			h.db.SaveThemeSettings(ctx, theme)
-			// Regenerate all content since header/footer changed
-			h.regenerateAllContent(ctx)
+			// Task 16B: no regenerateAllContent here — theme changes require
+			// explicit per-page Publish via PublicationService.
 		}
 	}
 
@@ -6200,11 +6187,12 @@ func (h *Handler) ReplaceExecute(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if needsUpdate {
-			// Update the content in database
+			// Update the content in database (draft-only: no live file write)
 			update := bson.M{
 				"$set": bson.M{
 					"title":      newTitle,
 					"data":       newData,
+					"has_unpublished_changes": content.Published,
 					"updated_at": time.Now(),
 				},
 			}
@@ -6222,13 +6210,7 @@ func (h *Handler) ReplaceExecute(w http.ResponseWriter, r *http.Request) {
 				fmt.Printf("Warning: Failed to save content version for %s: %v\n", content.ID.Hex(), err)
 			}
 
-			// Regenerate static page if published
-			if content.Published {
-				var tmpl models.Template
-				if err := h.db.FindOne(ctx, "templates", bson.M{"_id": content.TemplateID}, &tmpl); err == nil {
-					h.generateStaticPage(ctx, &content, &tmpl)
-				}
-			}
+			// Task 16B: no generateStaticPage here — draft bulk fix only.
 
 			updatedCount++
 		}

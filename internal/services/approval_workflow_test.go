@@ -135,7 +135,9 @@ func TestApprovalService_SequentialApprovalFlow(t *testing.T) {
 		t.Fatalf("after step 1: status=%s step=%d, want pending/1", mid.Status, mid.CurrentStep)
 	}
 
-	// Step 2: second approver — request approved, content published.
+	// Step 2: second approver — request approved, content NOT auto-published.
+	// Task 16B (spec §16.6): approval changes approval state only; explicit
+	// Publish via PublicationService is a separate action.
 	if err := svc.Approve(ctx, req.ID, approver2, "two@x.com", "step 2 ok"); err != nil {
 		t.Fatalf("Approve step 2: %v", err)
 	}
@@ -151,8 +153,8 @@ func TestApprovalService_SequentialApprovalFlow(t *testing.T) {
 	if err := db.FindOne(ctx, "content", bson.M{"_id": content.ID}, &published); err != nil {
 		t.Fatalf("reload content: %v", err)
 	}
-	if !published.Published || published.PendingApproval {
-		t.Errorf("content published=%v pending=%v, want true/false", published.Published, published.PendingApproval)
+	if published.Published || published.PendingApproval {
+		t.Errorf("content published=%v pending=%v, want false/false (approval never publishes)", published.Published, published.PendingApproval)
 	}
 
 	// Approving a non-pending request fails.

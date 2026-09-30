@@ -109,6 +109,10 @@ func (q *RegenQueue) worker(ctx context.Context) {
 }
 
 // processJob runs a single regeneration job with a 5-minute timeout.
+// Task 16B (spec §9.5, §16.6): V3 never auto-regenerates live pages from a
+// template change. The worker records the job outcome without writing
+// canonical files; an explicit Upgrade Job publishes per page via
+// PublicationService.
 func (q *RegenQueue) processJob(ctx context.Context, req regenRequest) {
 	jobCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -161,29 +165,15 @@ func (q *RegenQueue) processJob(ctx context.Context, req regenRequest) {
 	)
 
 	// Process in batches of ISRBatchSize.
+	// Task 16B: no live writes — record intent without touching canonical files.
 	for batchStart := 0; batchStart < len(ids); batchStart += ISRBatchSize {
 		end := batchStart + ISRBatchSize
 		if end > len(ids) {
 			end = len(ids)
 		}
-		batch := ids[batchStart:end]
 
-		for _, id := range batch {
-			content, err := q.contentService.GetContent(jobCtx, id)
-			if err != nil || content == nil {
-				log.Printf("[regen_queue] get content %s failed: %v", id.Hex(), err)
-				errors++
-				continue
-			}
-			if err := q.contentService.GenerateStaticPage(jobCtx, content); err != nil {
-				log.Printf("[regen_queue] regen %s failed: %v", id.Hex(), err)
-				errors++
-			} else {
-				processed++
-			}
-		}
-
-		// Persist progress after each batch.
+		// Persist progress after each batch (processed stays 0: explicit
+		// publish required; see Upgrade Job).
 		_ = q.db.UpdateOne(jobCtx, "regen_jobs",
 			bson.M{"template_id": req.templateID, "status": "running"},
 			bson.M{"$set": bson.M{

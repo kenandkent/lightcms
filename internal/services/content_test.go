@@ -490,12 +490,14 @@ func TestRegenerateAllContent(t *testing.T) {
 		t.Fatalf("RegenerateAllContent failed: %v", err)
 	}
 
+	// Task 16B: draft-only — RegenerateAllContent is a no-op for live files.
+	// Explicit per-page Publish via PublicationService is required.
 	for _, slug := range []string{"regen-1", "regen-2"} {
 		filePath := "content/generated/" + slug + ".html"
-		if _, err := os.Stat(filePath); err != nil {
-			t.Errorf("expected static file for %s", slug)
+		if _, err := os.Stat(filePath); err == nil {
+			t.Errorf("expected no static file for %s (regen disabled, explicit publish required)", slug)
+			os.Remove(filePath)
 		}
-		os.Remove(filePath)
 	}
 }
 
@@ -1345,15 +1347,15 @@ func TestRegenerateAllContent_WithBadTemplate(t *testing.T) {
 		Published: true, Data: map[string]interface{}{"content": "orphaned"},
 	})
 
-	// Should not fail — logs warnings for bad content, continues for good
+	// Should not fail — no-op in V3 (explicit publish required).
 	err := svc.RegenerateAllContent(ctx)
 	if err != nil {
 		t.Fatalf("RegenerateAllContent failed: %v", err)
 	}
 
-	// Good content should have been regenerated
-	if _, err := os.Stat(tmpDir + "/content/generated/regen-good.html"); err != nil {
-		t.Error("expected good content to be regenerated")
+	// Task 16B: no files written — draft-only.
+	if _, err := os.Stat(tmpDir + "/content/generated/regen-good.html"); err == nil {
+		t.Error("expected no static file (regen disabled, explicit publish required)")
 	}
 }
 

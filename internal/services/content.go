@@ -2060,92 +2060,19 @@ func renderSnippet(snippetHTML string, item models.Content) (string, error) {
 
 // RegenerateIndexPages regenerates all published pages whose templates contain lc:query directives.
 // Called after any content mutation so index pages stay in sync.
+// Task 16B: disabled for live writes — V3 index pages update only through
+// explicit Publish (PublicationService). Retained as a no-op so legacy
+// trigger sites keep compiling; the trigger itself is now a no-op for files.
 func (s *ContentService) RegenerateIndexPages(ctx context.Context) {
-	// Find all templates with lc:query directives
-	var templates []models.Template
-	if err := s.db.FindAll(ctx, "templates", bson.M{}, &templates); err != nil {
-		return
-	}
-
-	var indexTemplateIDs []primitive.ObjectID
-	for _, tmpl := range templates {
-		if strings.Contains(tmpl.HTMLLayout, "lc:query") {
-			indexTemplateIDs = append(indexTemplateIDs, tmpl.ID)
-		}
-	}
-	if len(indexTemplateIDs) == 0 {
-		return
-	}
-
-	// Find all published pages using index templates
-	var pages []models.Content
-	if err := s.db.FindAll(ctx, "content", bson.M{
-		"template_id": bson.M{"$in": indexTemplateIDs},
-		"published":   true,
-		"deleted":     bson.M{"$ne": true},
-	}, &pages); err != nil {
-		return
-	}
-
-	var purgedPaths []string
-	for i := range pages {
-		if err := s.GenerateStaticPage(ctx, &pages[i]); err != nil {
-			fmt.Printf("Warning: failed to regenerate index page %s: %v\n", pages[i].FullPath, err)
-		} else {
-			purgedPaths = append(purgedPaths, pages[i].FullPath)
-		}
-	}
-	if s.cfService != nil && len(purgedPaths) > 0 {
-		go s.cfService.PurgeByURLs(context.Background(), purgedPaths)
-	}
+	return
 }
 
 // RegenerateAllContent regenerates all published content.
 // Clears all content hashes first so every page is regenerated (needed when
 // theme/template/snippet changes affect rendered output globally).
+// Task 16B: disabled for live writes — explicit per-page Publish via
+// PublicationService is required. Retained as a no-op returning nil so
+// legacy admin/API entry points fail safe until Task 16C routes them.
 func (s *ContentService) RegenerateAllContent(ctx context.Context) error {
-	// Clear all content hashes to force full regeneration
-	s.db.Collection("content").UpdateMany(ctx,
-		bson.M{"content_hash": bson.M{"$exists": true}},
-		bson.M{"$unset": bson.M{"content_hash": ""}},
-	)
-
-	cursor, err := s.db.FindMany(ctx, "content",
-		bson.M{"published": true, "deleted": bson.M{"$ne": true}}, nil)
-	if err != nil {
-		return fmt.Errorf("failed to list content: %w", err)
-	}
-
-	var contents []models.Content
-	if err := cursor.All(ctx, &contents); err != nil {
-		return fmt.Errorf("failed to decode content: %w", err)
-	}
-
-	// Build the wikilink index once for all pages rather than once per page.
-	wikilinkIdx := s.buildWikilinkIndex(ctx)
-
-	// Parallel regeneration with a bounded worker pool.
-	const maxWorkers = 6
-	sem := make(chan struct{}, maxWorkers)
-	var wg sync.WaitGroup
-
-	for i := range contents {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(c models.Content) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := s.generateStaticPageWithWikilinkIndex(ctx, &c, wikilinkIdx); err != nil {
-				fmt.Printf("Warning: failed to generate page %s: %v\n", c.FullPath, err)
-			}
-		}(contents[i])
-	}
-	wg.Wait()
-
-	// Purge entire Cloudflare cache — every page was just regenerated.
-	if s.cfService != nil {
-		go s.cfService.PurgeEverything(context.Background())
-	}
-
 	return nil
 }
