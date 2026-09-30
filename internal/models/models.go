@@ -95,6 +95,13 @@ type Content struct {
 	CurrentVersion int64 `bson:"current_version,omitempty" json:"current_version"`
 	// HasUnpublishedChanges marks a live page with draft edits awaiting Publish.
 	HasUnpublishedChanges bool `bson:"has_unpublished_changes,omitempty" json:"has_unpublished_changes"`
+	// RequiresPublish is the API-facing companion to HasUnpublishedChanges
+	// (spec §12.7): true when the row needs an explicit Publish to change
+	// live output. Transient projection, never stored (bson:"-").
+	RequiresPublish bool `bson:"-" json:"requires_publish,omitempty"`
+	// ActivePublicationID is the control-plane truth pointer resolved by the
+	// Publication repository (spec §15.7). Transient projection, never stored.
+	ActivePublicationID *string `bson:"-" json:"active_publication_id,omitempty"`
 	// Fork fields — set when this content item belongs to a fork workspace
 	ForkID        *primitive.ObjectID `bson:"fork_id,omitempty" json:"fork_id,omitempty"`                 // nil for live content
 	BaseUpdatedAt *time.Time          `bson:"base_updated_at,omitempty" json:"base_updated_at,omitempty"` // updated_at of the live page at fork time (for conflict detection)

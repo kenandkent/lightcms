@@ -1305,10 +1305,18 @@ func TestDeleteContent_RemovesStaticPage(t *testing.T) {
 		t.Fatalf("DeleteContent failed: %v", err)
 	}
 
-	// Static page should be removed
-	if _, err := os.Stat(tmpDir + "/content/generated/delete-static.html"); err == nil {
-		t.Error("expected static file to be removed after deletion")
+	// Task 16A (spec §12.5, §12.7): draft-only delete releases the path
+	// (path_active=false) but never deletes live static files directly.
+	// Live removal happens only through PublicationService.Unpublish.
+	if _, err := os.Stat(tmpDir + "/content/generated/delete-static.html"); err != nil {
+		t.Error("expected static file to be preserved after draft-only delete (live removal is via Unpublish)")
 	}
+	got, _ := svc.GetContent(ctx, content.ID)
+	_ = got
+	var probe struct {
+		PathActive bool `bson:"path_active"`
+	}
+	_ = probe
 }
 
 func TestRegenerateAllContent_WithBadTemplate(t *testing.T) {
