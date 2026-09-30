@@ -284,6 +284,12 @@ func TestSlugWithPeriod(t *testing.T) {
 	if c.FullPath != "/release-2.0" {
 		t.Fatalf("full_path = %q, want /release-2.0", c.FullPath)
 	}
+	// Task 16A: content writes are draft-only — no implicit static file.
+	// Stage the live file explicitly (the saga owns this in production)
+	// so the serving assertions below exercise the dot-slug path.
+	if err := h.contentService.GenerateStaticPage(ctx, c); err != nil {
+		t.Fatalf("GenerateStaticPage: %v", err)
+	}
 
 	// Static file generated with .html suffix appended (no collision with
 	// the asset-serving path, which has no suffix).
