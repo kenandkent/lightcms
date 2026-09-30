@@ -1,0 +1,1480 @@
+openapi: 3.0.3
+info:
+  title: LightCMS Page Generation API v1
+  version: 1.0.0
+  description: |
+    Task 12 product HTTP facade (spec sections 20, 21, 27, 28; plan Task 12):
+    strict page-generation command, immutable template-schema endpoint,
+    publication list/detail/rollback, slug migration, upgrade preview/jobs,
+    restore-and-publish and revert-live.
+
+    Route registration lives in cmd/server/main.go (Task 16 wiring). Every
+    route below shares the existing /api/v1 chain: auth -> burst rate limit
+    (20 req/s) -> rate limit (300 req/min) -> 10 MiB body limit -> provenance
+    stamper (X-Agent-Session). Breaking change vs v7: PUT /api/v1/content/{id}
+    is draft-only; published pages are never changed live without an explicit
+    publish command (see docs/API.md).
+  contact:
+    name: LightCMS V3 program, Task 18A
+servers:
+  - url: https://pages.example.com/api/v1
+    description: Production (replace with BASE_URL)
+  - url: http://localhost:8082/api/v1
+    description: Local development
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: templates
+    description: Immutable template schema, slug migration, upgrade preview/jobs
+  - name: generation
+    description: Strict page-generation command (draft/preview/sandbox/publish)
+  - name: publications
+    description: Publication history, rollback, restore-and-publish, revert-live
+paths:
+  /templates/{slug}/schema:
+    get:
+      tags: [templates]
+      operationId: getTemplateSchema
+      summary: Get the immutable JSON Schema of a template by slug
+      description: |
+        Template version, ETag and JSON Schema come from the SAME immutable
+        TemplateVersion object (spec 10.1). Returns the current version; ETag
+        is `"template-version-<N>"` and moves on every template bump.
+        Required scope: `template.view` (empty scope allowlist = full access).
+      parameters:
+        - $ref: '#/components/parameters/TemplateSlug'
+      responses:
+        '200':
+          description: Schema document for the current template version
+          headers:
+            ETag:
+              description: '"template-version-<N>" bound to the returned version'
+              schema:
+                type: string
+                example: '"template-version-1"'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaResponse'
+              example:
+                template: financial-news
+                template_version: 1
+                fields:
+                  - name: headline
+                    type: text
+                    required: true
+                json_schema:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    headline:
+                      type: string
+                  required: [headline]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: TEMPLATE_NOT_FOUND (unknown slug)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: TEMPLATE_NOT_FOUND
+                  message: 'template "unknown" not found'
+                  request_id: ''
+                  retryable: false
+        '422':
+          description: TEMPLATE_SCHEMA_INVALID (stored schema cannot render)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /page-generation:
+    post:
+      tags: [generation]
+      operationId: generatePage
+      summary: Create or replace a structured page (draft/preview/sandbox/publish)
+      description: |
+        One strict command (spec 20.7): create or FULLY REPLACE page data, never
+        a partial PATCH. Unknown top-level fields and unknown `data` fields are
+        422; explicit JSON `data: null` is 422 (MVP has no nullable fields);
+        `data` canonical JSON is capped at 5 MiB (DATA_TOO_LARGE, 422) inside the
+        10 MiB body limit. Mode defaults to `draft`.
+
+        mode=publish is a live-changing command: it requires BOTH
+        `expected_template_version` (428 TEMPLATE_VERSION_PRECONDITION_REQUIRED
+        when absent, 409 TEMPLATE_VERSION_CHANGED when stale, zero mutation)
+        AND an `Idempotency-Key` header (428 IDEMPOTENCY_KEY_REQUIRED when
+        absent, zero mutation). Preview writes nothing and ignores the key;
+        draft/sandbox do not mint idempotency records.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateRequest'
+            examples:
+              draft:
+                summary: Create draft (201, requires_publish=true)
+                value:
+                  template: financial-news
+                  title: Bitcoin Market Update
+                  slug: bitcoin-market-update
+                  folder_path: /news
+                  mode: draft
+                  data:
+                    headline: Bitcoin Rallies
+              publish:
+                summary: Atomic publish (needs version + Idempotency-Key)
+                value:
+                  template: financial-news
+                  expected_template_version: 1
+                  title: Bitcoin Market Update
+                  slug: bitcoin-market-update
+                  folder_path: /news
+                  mode: publish
+                  upsert: true
+                  data:
+                    headline: Bitcoin Rallies
+      responses:
+        '200':
+          description: Upsert update, preview, or publish of an existing page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateResponse'
+              example:
+                id: 66f4c2a1b2c3d4e5f6071829
+                action: updated
+                mode: publish
+                published: true
+                requires_publish: false
+                content_version: 2
+                template: financial-news
+                template_version: 1
+                publication_id: 66f4c2a1b2c3d4e5f6071830
+                full_path: /news/bitcoin-market-update
+                public_url: https://pages.example.com/news/bitcoin-market-update
+                warnings: []
+        '201':
+          description: Created draft/sandbox, or publish of a new page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateResponse'
+              example:
+                id: 66f4c2a1b2c3d4e5f6071829
+                action: created
+                mode: draft
+                published: false
+                requires_publish: true
+                content_version: 1
+                template: financial-news
+                template_version: 1
+                publication_id: null
+                full_path: /news/bitcoin-market-update
+                public_url: null
+                warnings: []
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: >
+            PERMISSION_DENIED with zero mutation (no Content/Fork create or
+            update, no Version, no Publication, no static stage, no
+            webhook/audit mutation event, no completed idempotency response).
+            publish+new needs content.create+content.publish; publish+existing
+            needs content.edit+content.publish. No automatic downgrade to draft.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: 'missing required scope "content.create" for mode=publish'
+                  request_id: ''
+                  retryable: false
+        '404':
+          description: TEMPLATE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: >
+            PATH_CONFLICT (upsert=false on existing path) |
+            TEMPLATE_NOT_ACTIVE (deprecated template) |
+            TEMPLATE_VERSION_CHANGED (stale expected version, zero mutation) |
+            PAGE_PUBLISH_IN_PROGRESS (retryable, Retry-After: 5) |
+            IDEMPOTENCY_CONFLICT (same key, different body) |
+            REQUEST_IN_PROGRESS (lease held, Retry-After, default 5) |
+            AGENT_SANDBOX_REQUIRED (mode=sandbox without an active sandbox)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                staleVersion:
+                  summary: Stale expected_template_version
+                  value:
+                    error:
+                      code: TEMPLATE_VERSION_CHANGED
+                      message: template financial-news is at version 2, expected 1
+                      request_id: ''
+                      retryable: false
+                pathConflict:
+                  summary: upsert=false on an existing canonical path
+                  value:
+                    error:
+                      code: PATH_CONFLICT
+                      message: canonical path /news/bitcoin-market-update already exists
+                      request_id: ''
+                      retryable: false
+        '422':
+          description: >
+            FIELD_VALIDATION_FAILED (unknown top-level/data field, null data,
+            missing required field; per-field reasons in `details`) |
+            PATH_INVALID | DATA_TOO_LARGE | TEMPLATE_SCHEMA_INVALID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                unknownField:
+                  summary: Unknown top-level request field
+                  value:
+                    error:
+                      code: FIELD_VALIDATION_FAILED
+                      message: unknown request field
+                      request_id: ''
+                      retryable: false
+                      details:
+                        - code: FIELD_UNKNOWN
+                          field: bogus
+                          message: unknown request field bogus
+                nullData:
+                  summary: Explicit null data
+                  value:
+                    error:
+                      code: FIELD_VALIDATION_FAILED
+                      message: data must not be null
+                      request_id: ''
+                      retryable: false
+                      details:
+                        - code: FIELD_NULL_NOT_ALLOWED
+                          field: data
+                          message: data must not be null
+        '428':
+          description: >
+            IDEMPOTENCY_KEY_REQUIRED (mode=publish without Idempotency-Key) |
+            TEMPLATE_VERSION_PRECONDITION_REQUIRED (external publish without
+            expected_template_version). Both with zero mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: IDEMPOTENCY_KEY_REQUIRED
+                  message: mode=publish requires Idempotency-Key
+                  request_id: ''
+                  retryable: false
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: PUBLICATION_STAGE_FAILED (static store unavailable, Retry-After 30)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /content/{id}/publications:
+    get:
+      tags: [publications]
+      operationId: listPublications
+      summary: List every publication for a page, newest first
+      description: 'Required scope: `content.view`. Empty history returns `[]`.'
+      parameters:
+        - $ref: '#/components/parameters/ContentId'
+      responses:
+        '200':
+          description: Publication history (possibly empty)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicationList'
+              example:
+                content_id: 66f4c2a1b2c3d4e5f6071829
+                publications:
+                  - id: 66f4c2a1b2c3d4e5f6071830
+                    content_id: 66f4c2a1b2c3d4e5f6071829
+                    content_version: 2
+                    template_version: 1
+                    full_path: /news/bitcoin-market-update
+                    content_hash: sha256:9f2c…
+                    storage_state: active
+                    status: active
+                    verification_status: verified
+                    logical_published_at: '2026-09-30T08:00:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /content/{id}/publications/{publication_id}:
+    get:
+      tags: [publications]
+      operationId: getPublication
+      summary: Load one publication scoped to the page
+      description: >
+        A publication that does not belong to `{id}` is
+        PUBLICATION_NOT_FOUND (404). Required scope: `content.view`.
+      parameters:
+        - $ref: '#/components/parameters/ContentId'
+        - $ref: '#/components/parameters/PublicationId'
+      responses:
+        '200':
+          description: The publication record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Publication'
+              example:
+                id: 66f4c2a1b2c3d4e5f6071830
+                content_id: 66f4c2a1b2c3d4e5f6071829
+                content_version: 2
+                template_version: 1
+                full_path: /news/bitcoin-market-update
+                content_hash: sha256:9f2c…
+                public_url: https://pages.example.com/news/bitcoin-market-update
+                storage_state: active
+                status: active
+                verification_status: verified
+                logical_published_at: '2026-09-30T08:00:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: PUBLICATION_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: PUBLICATION_NOT_FOUND
+                  message: publication does not belong to this content
+                  request_id: ''
+                  retryable: false
+  /content/{id}/publications/{publication_id}/rollback:
+    post:
+      tags: [publications]
+      operationId: rollbackPublication
+      summary: Roll back live traffic to a historical publication (mints a NEW publication)
+      description: |
+        Exact rollback: the source publication's retained immutable bytes become
+        a NEW publication (past retention the saga falls back to re-render).
+        Requires `content.edit + content.publish` and an `Idempotency-Key`
+        (428 with zero mutation when absent). Optional `expected_active_id`
+        guards against concurrent activation (409 PUBLICATION_CONFLICT when
+        stale). Same key + same body replays the stored response; same key +
+        different body is 409 IDEMPOTENCY_CONFLICT.
+      parameters:
+        - $ref: '#/components/parameters/ContentId'
+        - $ref: '#/components/parameters/PublicationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_active_id:
+                  type: string
+                  description: Hex ObjectID of the publication expected to be active
+                  example: 66f4c2a1b2c3d4e5f6071830
+      responses:
+        '200':
+          description: New rollback publication (mode=rollback)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RollbackResult'
+              example:
+                content_id: 66f4c2a1b2c3d4e5f6071829
+                content_version: 3
+                publication_id: 66f4c2a1b2c3d4e5f6071844
+                full_path: /news/bitcoin-market-update
+                public_url: https://pages.example.com/news/bitcoin-market-update
+                mode: rollback
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Not used on this command (unknown IDs map to 500, see below; the read-only detail endpoint is the one that returns PUBLICATION_NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          description: >
+            FIELD_VALIDATION_FAILED when the source publication does not belong
+            to this content or is a failed publication
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: FIELD_VALIDATION_FAILED
+                  message: source publication does not belong to this content
+                  request_id: ''
+                  retryable: false
+        '500':
+          description: >
+            INTERNAL_ERROR when the content ID or source publication ID names
+            no row (known mapSagaErr gap: publication PUBLICATION_NOT_FOUND /
+            CONTENT_NOT_FOUND fall through to 500; Task 19 owns the 4xx
+            decision)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: INTERNAL_ERROR
+                  message: publication 66f4c2a1b2c3d4e5f6071899 not found
+                  request_id: ''
+                  retryable: false
+        '409':
+          description: PUBLICATION_CONFLICT (stale expected_active_id) | IDEMPOTENCY_CONFLICT | REQUEST_IN_PROGRESS
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: PUBLICATION_CONFLICT
+                  message: stale expected active publication
+                  request_id: ''
+                  retryable: false
+        '428':
+          description: IDEMPOTENCY_KEY_REQUIRED (zero mutation)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: IDEMPOTENCY_KEY_REQUIRED
+                  message: rollback requires Idempotency-Key
+                  request_id: ''
+                  retryable: false
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /content/{id}/restore-and-publish:
+    post:
+      tags: [publications]
+      operationId: restoreAndPublish
+      summary: Restore a historical content VERSION as a new draft version, then publish it
+      description: |
+        Source is a version NUMBER (re-rendered through the current pipeline);
+        the historical version row is never mutated. Distinct from revert-live,
+        whose source is a publication ID and whose bytes are exact. Requires
+        `content.edit + content.publish` and an `Idempotency-Key` (428 with
+        zero mutation when absent). Unknown version is 404 CONTENT_NOT_FOUND.
+      parameters:
+        - $ref: '#/components/parameters/ContentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version:
+                  type: integer
+                  format: int64
+                  description: Historical content version number to restore from
+                  example: 1
+                expected_active_id:
+                  type: string
+                  description: Hex ObjectID of the publication expected to be active
+                  example: 66f4c2a1b2c3d4e5f6071830
+      responses:
+        '200':
+          description: New publication (mode=restore_and_publish)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreResult'
+              example:
+                content_id: 66f4c2a1b2c3d4e5f6071829
+                content_version: 4
+                publication_id: 66f4c2a1b2c3d4e5f6071851
+                full_path: /news/bitcoin-market-update
+                public_url: https://pages.example.com/news/bitcoin-market-update
+                mode: restore_and_publish
+        '400':
+          description: INVALID_REQUEST (version missing)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: INVALID_REQUEST
+                  message: version is required
+                  request_id: ''
+                  retryable: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: CONTENT_NOT_FOUND (unknown version or page)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: PUBLICATION_CONFLICT (stale expected_active_id) | IDEMPOTENCY_CONFLICT | REQUEST_IN_PROGRESS
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '428':
+          description: IDEMPOTENCY_KEY_REQUIRED (zero mutation)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /content/{id}/revert-live:
+    post:
+      tags: [publications]
+      operationId: revertLive
+      summary: Exact rollback of live traffic to a source publication (mints a NEW publication)
+      description: |
+        Source is a PUBLICATION ID; the new publication restores the source's
+        retained immutable bytes byte-identically (within the Exact SLA).
+        Requires `content.edit + content.publish` and an `Idempotency-Key`
+        (428 with zero mutation when absent). Mints a publication ID distinct
+        from any restore-and-publish result.
+      parameters:
+        - $ref: '#/components/parameters/ContentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_publication_id]
+              properties:
+                source_publication_id:
+                  type: string
+                  description: Hex ObjectID of the source publication
+                  example: 66f4c2a1b2c3d4e5f6071830
+                expected_active_id:
+                  type: string
+                  description: Hex ObjectID of the publication expected to be active
+                  example: 66f4c2a1b2c3d4e5f6071844
+      responses:
+        '200':
+          description: New publication (mode=revert_live)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevertResult'
+              example:
+                content_id: 66f4c2a1b2c3d4e5f6071829
+                content_version: 5
+                publication_id: 66f4c2a1b2c3d4e5f6071858
+                full_path: /news/bitcoin-market-update
+                public_url: https://pages.example.com/news/bitcoin-market-update
+                mode: revert_live
+        '400':
+          description: INVALID_REQUEST (source_publication_id missing)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: INVALID_REQUEST
+                  message: source_publication_id is required
+                  request_id: ''
+                  retryable: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Not used on this command (unknown source IDs map to 500, see below)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          description: >
+            FIELD_VALIDATION_FAILED when the source publication does not belong
+            to this content or is a failed publication
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: >
+            INTERNAL_ERROR when the content ID or source publication ID names
+            no row (known mapSagaErr gap, same as rollback; Task 19 owns the
+            4xx decision)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: PUBLICATION_CONFLICT (stale expected_active_id) | IDEMPOTENCY_CONFLICT | REQUEST_IN_PROGRESS
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '428':
+          description: IDEMPOTENCY_KEY_REQUIRED (zero mutation)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /templates/{id}/migrate-slug:
+    post:
+      tags: [templates]
+      operationId: migrateTemplateSlug
+      summary: Rename a template slug (admin-only; no page URL or publication change)
+      description: |
+        Admin-only: requires an admin actor with `template.edit`. The slug is a
+        machine identifier, not a page URL: no redirect row is created, no path
+        lock is acquired, no publication switches, and historical template
+        versions keep the old slug for traceability. Live page bytes stay
+        byte-identical; `affected_pages` is guidance only. Accepts either
+        `new_slug` or legacy `slug` in the body. Slug collision is 409
+        PATH_CONFLICT; concurrent modification is 409 TEMPLATE_VERSION_CONFLICT.
+      parameters:
+        - $ref: '#/components/parameters/TemplateId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                new_slug:
+                  type: string
+                  example: market-news
+                slug:
+                  type: string
+                  description: Legacy alias for new_slug
+                  example: market-news
+      responses:
+        '200':
+          description: Migration guidance (bytes and publications untouched)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrateSlugResult'
+              example:
+                template_id: 66f4c2a1b2c3d4e5f6071801
+                old_slug: financial-news
+                new_slug: market-news
+                affected_pages: 3
+                guidance:
+                  - Update external integrations referencing template slug "financial-news" to "market-news".
+                  - 'Template slug is not a public page path: no URL redirect was created and none is needed.'
+                  - 'Historical template versions keep the old slug for traceability; new generations must use the new slug.'
+                  - '3 page(s) reference this template; their live bytes and Publications are unchanged.'
+        '400':
+          description: INVALID_REQUEST (new slug equals the current slug)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: PERMISSION_DENIED (admin with template.edit required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: TEMPLATE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: PATH_CONFLICT (slug taken) | TEMPLATE_VERSION_CONFLICT (concurrent change)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: PATH_CONFLICT
+                  message: template slug "market-news" already exists
+                  request_id: ''
+                  retryable: false
+        '422':
+          description: Missing new_slug (FIELD_REQUIRED detail) | invalid slug (TEMPLATE_SLUG_INVALID detail)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: FIELD_VALIDATION_FAILED
+                  message: new_slug is required
+                  request_id: ''
+                  retryable: false
+                  details:
+                    - code: FIELD_REQUIRED
+                      field: new_slug
+                      message: new_slug is required
+  /templates/{slug}/upgrade-preview:
+    get:
+      tags: [templates]
+      operationId: previewTemplateUpgrade
+      summary: Read-only preview of what a template upgrade would republish
+      description: >
+        Lists pages referencing the slug at their frozen versions. Writes
+        nothing: no publication, no file, no job row. Required scope:
+        `template.view`.
+      parameters:
+        - $ref: '#/components/parameters/TemplateSlug'
+      responses:
+        '200':
+          description: Upgrade preview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpgradePreview'
+              example:
+                template: financial-news
+                from_version: 1
+                to_version: 2
+                total_pages: 2
+                would_republish: 1
+                items:
+                  - content_id: 66f4c2a1b2c3d4e5f6071829
+                    full_path: /news/bitcoin-market-update
+                    current_version: 2
+                    has_active: true
+                    active_template_version: 1
+                    target_template_version: 2
+                    would_republish: true
+                    validation_errors: 0
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: TEMPLATE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /templates/{slug}/upgrade-jobs:
+    post:
+      tags: [templates]
+      operationId: startTemplateUpgradeJob
+      summary: Start a durable template-upgrade job (touches no live page yet)
+      description: |
+        Admin-only: requires an admin actor with `template.edit`. Creates the
+        durable job row (status `running`); pages already current are recorded
+        as `skipped`, the rest as `pending`. Nothing is published until the run
+        endpoint is called explicitly.
+      parameters:
+        - $ref: '#/components/parameters/TemplateSlug'
+      responses:
+        '201':
+          description: Durable upgrade job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpgradeJob'
+              example:
+                id: 66f4c2a1b2c3d4e5f6071901
+                template_id: 66f4c2a1b2c3d4e5f6071801
+                template_slug: financial-news
+                from_version: 1
+                to_version: 2
+                target_version_id: 66f4c2a1b2c3d4e5f6071802
+                status: running
+                items:
+                  - content_id: 66f4c2a1b2c3d4e5f6071829
+                    full_path: /news/bitcoin-market-update
+                    status: pending
+                    attempts: 0
+                created_by: admin@example.com
+                created_at: '2026-09-30T08:10:00Z'
+                updated_at: '2026-09-30T08:10:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: PERMISSION_DENIED (admin with template.edit required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: TEMPLATE_NOT_FOUND | TEMPLATE_VERSION_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /templates/upgrade-jobs/{job_id}:
+    get:
+      tags: [templates]
+      operationId: getTemplateUpgradeJob
+      summary: Load a durable upgrade job
+      description: 'Required scope: `template.view`. Unknown job is 404 UPGRADE_JOB_NOT_FOUND.'
+      parameters:
+        - $ref: '#/components/parameters/UpgradeJobId'
+      responses:
+        '200':
+          description: The upgrade job with per-item outcomes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpgradeJob'
+              example:
+                id: 66f4c2a1b2c3d4e5f6071901
+                template_id: 66f4c2a1b2c3d4e5f6071801
+                template_slug: financial-news
+                from_version: 1
+                to_version: 2
+                target_version_id: 66f4c2a1b2c3d4e5f6071802
+                status: partial
+                items:
+                  - content_id: 66f4c2a1b2c3d4e5f6071829
+                    full_path: /news/bitcoin-market-update
+                    status: done
+                    attempts: 1
+                    publication_id: 66f4c2a1b2c3d4e5f6071866
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: UPGRADE_JOB_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: UPGRADE_JOB_NOT_FOUND
+                  message: upgrade job not found
+                  request_id: ''
+                  retryable: false
+  /templates/upgrade-jobs/{job_id}/run:
+    post:
+      tags: [templates]
+      operationId: runTemplateUpgradeJob
+      summary: Run pending/failed upgrade items (one new publication per page)
+      description: |
+        Requires `content.edit + content.publish` (checked once up front).
+        Processes pending/failed items via the publication service; each page
+        mints its own publication, never a silent static overwrite. `done` and
+        `skipped` items are left alone. Failures are recorded per item and the
+        job stays resumable: retry = call again. Terminal job states are
+        `completed` (all done/skipped) or `partial`.
+      parameters:
+        - $ref: '#/components/parameters/UpgradeJobId'
+      responses:
+        '200':
+          description: Job after this run pass
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpgradeJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: PERMISSION_DENIED (content.edit + content.publish required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: UPGRADE_JOB_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: >
+        `Authorization: Bearer <api-key>`. The key resolves to its owning user
+        (role + optional scopes allowlist + optional sandbox_only). OAuth 2.1
+        and Admin-UI session cookies are accepted on the same chain; agent
+        requests additionally send `X-Agent-Session` for provenance/audit
+        attribution.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >
+        REQUIRED for every live-changing command (mode=publish generation,
+        rollback, restore-and-publish, revert-live): 428
+        IDEMPOTENCY_KEY_REQUIRED with zero mutation when absent. Optional and
+        ignored for preview; unpublish stays naturally idempotent without one.
+        Identity is (owner, method, path, key); same key + different body is
+        409 IDEMPOTENCY_CONFLICT; a held lease is 409 REQUEST_IN_PROGRESS.
+      schema:
+        type: string
+        example: partner-news-20260930-001
+    ContentId:
+      name: id
+      in: path
+      required: true
+      description: Hex ObjectID of the content (page)
+      schema:
+        type: string
+        pattern: '^[0-9a-fA-F]{24}$'
+        example: 66f4c2a1b2c3d4e5f6071829
+    PublicationId:
+      name: publication_id
+      in: path
+      required: true
+      description: Hex ObjectID of the publication
+      schema:
+        type: string
+        pattern: '^[0-9a-fA-F]{24}$'
+        example: 66f4c2a1b2c3d4e5f6071830
+    TemplateSlug:
+      name: slug
+      in: path
+      required: true
+      description: Template machine identifier (not a page URL)
+      schema:
+        type: string
+        example: financial-news
+    TemplateId:
+      name: id
+      in: path
+      required: true
+      description: Hex ObjectID of the template record
+      schema:
+        type: string
+        pattern: '^[0-9a-fA-F]{24}$'
+        example: 66f4c2a1b2c3d4e5f6071801
+    UpgradeJobId:
+      name: job_id
+      in: path
+      required: true
+      description: Hex ObjectID of the upgrade job
+      schema:
+        type: string
+        pattern: '^[0-9a-fA-F]{24}$'
+        example: 66f4c2a1b2c3d4e5f6071901
+  schemas:
+    GenerateRequest:
+      type: object
+      required: [template, title, data]
+      properties:
+        template:
+          type: string
+          description: Template slug (must be active)
+          example: financial-news
+        expected_template_version:
+          type: integer
+          format: int64
+          description: >
+            Optimistic precondition for mode=publish (NOT historical version
+            selection). 428 when absent on external publish; 409 when stale.
+          example: 1
+        title:
+          type: string
+          example: Bitcoin Market Update
+        slug:
+          type: string
+          description: Omitted slug is regenerated from title on upsert replace
+          example: bitcoin-market-update
+        folder_path:
+          type: string
+          example: /news
+        data:
+          type: object
+          description: >
+            Full-replace page data (no implicit merge on upsert hits).
+            Canonical JSON capped at 5 MiB.
+          example:
+            headline: Bitcoin Rallies
+        mode:
+          type: string
+          enum: [draft, preview, sandbox, publish]
+          default: draft
+        upsert:
+          type: boolean
+          default: false
+          description: >
+            Match by canonical full_path. false + existing path =
+            409 PATH_CONFLICT.
+    GenerateResponse:
+      type: object
+      required: [id, action, mode, published, requires_publish, content_version, template, template_version, full_path, warnings]
+      properties:
+        id:
+          type: string
+          example: 66f4c2a1b2c3d4e5f6071829
+        action:
+          type: string
+          enum: [created, updated]
+          example: created
+        mode:
+          type: string
+          enum: [draft, preview, sandbox, publish, rollback]
+          example: draft
+        published:
+          type: boolean
+          description: Whether an active publication currently exists
+        requires_publish:
+          type: boolean
+          description: >
+            ALWAYS present. true when the write left unpublished changes
+            (draft/sandbox, including edits to a published page); false after a
+            completed publish or for preview (no writes).
+        content_version:
+          type: integer
+          format: int64
+        template:
+          type: string
+        template_version:
+          type: integer
+          format: int64
+        publication_id:
+          type: string
+          nullable: true
+          description: Set only when this response minted/used a publication
+        full_path:
+          type: string
+        public_url:
+          type: string
+          nullable: true
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldDiagnostic'
+    SchemaResponse:
+      type: object
+      required: [template, template_version, fields, json_schema]
+      properties:
+        template:
+          type: string
+        template_version:
+          type: integer
+          format: int64
+        fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/SchemaField'
+        json_schema:
+          type: object
+          description: Deterministic JSON Schema (additionalProperties=false)
+    SchemaField:
+      type: object
+      required: [name, type, required]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+        required:
+          type: boolean
+        description:
+          type: string
+        example:
+          type: string
+    Publication:
+      type: object
+      required: [id, content_id, content_version, full_path, content_hash, storage_state, status, verification_status]
+      properties:
+        id:
+          type: string
+        content_id:
+          type: string
+        content_version:
+          type: integer
+          format: int64
+        template_id:
+          type: string
+        template_version_id:
+          type: string
+        template_version:
+          type: integer
+          format: int64
+        full_path:
+          type: string
+        content_hash:
+          type: string
+        public_url:
+          type: string
+        storage_provider:
+          type: string
+        storage_path:
+          type: string
+        storage_state:
+          type: string
+          example: active
+        status:
+          type: string
+          example: active
+        verification_status:
+          type: string
+          example: verified
+        pinned:
+          type: boolean
+        logical_published_at:
+          type: string
+          format: date-time
+          description: Business publish time frozen before render
+        published_by:
+          type: string
+        published_by_email:
+          type: string
+        actor:
+          type: string
+        via:
+          type: string
+        agent_session:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        activated_at:
+          type: string
+          format: date-time
+        superseded_at:
+          type: string
+          format: date-time
+        unpublished_at:
+          type: string
+          format: date-time
+    PublicationList:
+      type: object
+      required: [content_id, publications]
+      properties:
+        content_id:
+          type: string
+        publications:
+          type: array
+          items:
+            $ref: '#/components/schemas/Publication'
+    RollbackResult:
+      type: object
+      required: [content_id, content_version, publication_id, full_path, public_url, mode]
+      properties:
+        content_id:
+          type: string
+        content_version:
+          type: integer
+          format: int64
+        publication_id:
+          type: string
+          description: NEW publication ID (never the source ID)
+        full_path:
+          type: string
+        public_url:
+          type: string
+        mode:
+          type: string
+          enum: [rollback]
+    RestoreResult:
+      type: object
+      required: [content_id, content_version, publication_id, full_path, public_url, mode]
+      properties:
+        content_id:
+          type: string
+        content_version:
+          type: integer
+          format: int64
+        publication_id:
+          type: string
+          description: NEW publication ID (re-rendered from the version snapshot)
+        full_path:
+          type: string
+        public_url:
+          type: string
+        mode:
+          type: string
+          enum: [restore_and_publish]
+    RevertResult:
+      type: object
+      required: [content_id, content_version, publication_id, full_path, public_url, mode]
+      properties:
+        content_id:
+          type: string
+        content_version:
+          type: integer
+          format: int64
+        publication_id:
+          type: string
+          description: NEW publication ID (source bytes restored exactly)
+        full_path:
+          type: string
+        public_url:
+          type: string
+        mode:
+          type: string
+          enum: [revert_live]
+    MigrateSlugResult:
+      type: object
+      required: [template_id, old_slug, new_slug, affected_pages, guidance]
+      properties:
+        template_id:
+          type: string
+        old_slug:
+          type: string
+        new_slug:
+          type: string
+        affected_pages:
+          type: integer
+          format: int64
+        guidance:
+          type: array
+          items:
+            type: string
+    UpgradePreview:
+      type: object
+      required: [template, from_version, to_version, total_pages, would_republish, items]
+      properties:
+        template:
+          type: string
+        from_version:
+          type: integer
+          format: int64
+        to_version:
+          type: integer
+          format: int64
+        total_pages:
+          type: integer
+          format: int64
+        would_republish:
+          type: integer
+          format: int64
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UpgradePreviewItem'
+    UpgradePreviewItem:
+      type: object
+      required: [content_id, full_path, current_version, has_active, active_template_version, target_template_version, would_republish, validation_errors]
+      properties:
+        content_id:
+          type: string
+        full_path:
+          type: string
+        current_version:
+          type: integer
+          format: int64
+        has_active:
+          type: boolean
+        active_template_version:
+          type: integer
+          format: int64
+        target_template_version:
+          type: integer
+          format: int64
+        would_republish:
+          type: boolean
+        validation_errors:
+          type: integer
+    UpgradeJob:
+      type: object
+      required: [id, template_id, template_slug, from_version, to_version, target_version_id, status, items, created_by, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        template_id:
+          type: string
+        template_slug:
+          type: string
+        from_version:
+          type: integer
+          format: int64
+        to_version:
+          type: integer
+          format: int64
+        target_version_id:
+          type: string
+        status:
+          type: string
+          enum: [running, completed, partial]
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UpgradeJobItem'
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    UpgradeJobItem:
+      type: object
+      required: [content_id, full_path, status, attempts]
+      properties:
+        content_id:
+          type: string
+        full_path:
+          type: string
+        status:
+          type: string
+          enum: [pending, done, failed, skipped]
+        attempts:
+          type: integer
+        publication_id:
+          type: string
+        error:
+          type: string
+    FieldDiagnostic:
+      type: object
+      description: >
+        Non-blocking validation diagnostic. NOTE: the wire object uses Go
+        default struct keys `Code`/`Field`/`Message` (the FieldWarning type
+        carries no json tags); the 422 `details` array instead uses lowercase
+        `code`/`field`/`message` (see FieldDetail).
+      properties:
+        Code:
+          type: string
+        Field:
+          type: string
+        Message:
+          type: string
+    FieldDetail:
+      type: object
+      required: [code, field, message]
+      properties:
+        code:
+          type: string
+          example: FIELD_REQUIRED
+        field:
+          type: string
+          example: data.headline
+        message:
+          type: string
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: >
+                Stable machine code: UNAUTHENTICATED | PERMISSION_DENIED |
+                TEMPLATE_NOT_FOUND | TEMPLATE_NOT_ACTIVE |
+                TEMPLATE_SCHEMA_INVALID | TEMPLATE_VERSION_NOT_FOUND |
+                TEMPLATE_VERSION_CHANGED |
+                TEMPLATE_VERSION_PRECONDITION_REQUIRED |
+                TEMPLATE_VERSION_CONFLICT | FIELD_VALIDATION_FAILED |
+                DATA_TOO_LARGE | PATH_INVALID | PATH_CONFLICT |
+                CONTENT_CREATE_FAILED | CONTENT_UPDATE_FAILED |
+                CONTENT_VERSION_CONFLICT | CONTENT_NOT_FOUND |
+                PUBLICATION_NOT_FOUND | PUBLICATION_CONFLICT |
+                PAGE_PUBLISH_IN_PROGRESS | PUBLIC_URL_RESOLUTION_FAILED |
+                IDEMPOTENCY_CONFLICT | IDEMPOTENCY_KEY_REQUIRED |
+                REQUEST_IN_PROGRESS | AGENT_SANDBOX_REQUIRED | RATE_LIMITED |
+                PUBLICATION_STAGE_FAILED | INTERNAL_ERROR | INVALID_REQUEST |
+                UPGRADE_JOB_NOT_FOUND | UPGRADE_JOB_CONFLICT |
+                RESTORE_PRECONDITION_FAILED. Never a raw Mongo/filesystem/network error.
+              example: FIELD_VALIDATION_FAILED
+            message:
+              type: string
+            request_id:
+              type: string
+              description: Echo of the X-Request-ID request header, when sent
+            retryable:
+              type: boolean
+              description: >
+                true for RATE_LIMITED, REQUEST_IN_PROGRESS,
+                PUBLICATION_STAGE_FAILED and PAGE_PUBLISH_IN_PROGRESS
+            details:
+              type: array
+              items:
+                $ref: '#/components/schemas/FieldDetail'
+  responses:
+    BadRequest:
+      description: INVALID_REQUEST (malformed id, bad JSON, missing required body field)
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unauthorized:
+      description: UNAUTHENTICATED
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: UNAUTHENTICATED
+              message: authentication is required
+              request_id: ''
+              retryable: false
+    Forbidden:
+      description: PERMISSION_DENIED (missing scope; zero mutation on live-changing commands)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    RateLimited:
+      description: RATE_LIMITED (burst 20 req/s, 300 req/min per token; always sets Retry-After)
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+  headers:
+    RetryAfter:
+      description: Seconds to wait before retry (429, REQUEST_IN_PROGRESS, retryable 503)
+      schema:
+        type: integer
+        example: 5
