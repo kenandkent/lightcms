@@ -191,3 +191,67 @@ writes. Target: 16D.
 - Post-16E verification: re-run
   `rg 'GenerateStaticPage\(|PublishContent\(' internal cmd --glob '*.go' --glob '!**/*_test.go'`
   and account for every remaining hit here.
+
+## 10. Task 16 post-migration accounting (branch `task/16-integration`)
+
+Branch chain: `9ac4e62` (main) → `68b7a4e` 16A → `7bb0782` 16B →
+`40095de` 16A follow-up → `289b5ac` 16C → `2672b0a` 16D →
+`d6c8982` 16E → 16F (this gate). `go build ./...` + `go vet ./...`
+green at every gate commit; focused DB tests (`-p 1`, Task 0 stack)
+green per gate; full `go test -p 1 ./...` at close.
+
+`rg 'GenerateStaticPage\(|PublishContent\(' internal cmd --glob '*.go'
+--glob '!*_test.go'` (11 hits, all accounted — ZERO direct live-write
+callers remain):
+
+| hit | verdict |
+|---|---|
+| `services/content.go:659` `PublishContent` | DEFINITION kept as compatibility shim: delegates to the wired `legacyPublicationSaga` (16C `SetPublicationPublisher`); unwired binaries keep the legacy projection path (unit tests only). Every background caller now uses `PublishInternal` (16D) instead. |
+| `services/content.go:1266` `GenerateStaticPage` | DEFINITION retained as the render primitive; zero non-test callers. Only in-memory/test staging paths touch it. |
+| `services/content.go:1378` `removeStaticPage` | DEFINITION, zero callers (draft-only writes never delete live files). |
+| `services/content.go:2076` `RegenerateAllContent` | DEFINITION, now an unconditional nil no-op (16B). Callers (`settings.go:77`, `api_snippets.go:87,106`, `handlers.go:6427,6449`, REST `/regenerate`, MCP, CLI) all funnel into the no-op. KNOWN GAP: `/api/v1/regenerate` answers success while doing nothing — Task 17/19 must decide 410 vs upgrade-job redirect (recorded, not silently fixed). |
+| `services/publish_internal.go:87` | Unwired fallback inside `PublishInternal` (nil idem seam → legacy delegation). Production always wires the seam (16E `buildPublicationRuntime`, fatal on error). |
+| `handlers/api_content.go:673,1413` (publish/batch legacy fallbacks) | Reached only when `publicationService == nil` (unit-test path). A running server always wires it (16E fatal otherwise); even then the fallback delegates via the saga seam. |
+| `handlers/api_content.go:556,1271` `APIPublishContent`/`APIBatchPublishContent` | Handler DEFINITIONS (name match): wired branches route via saga + 428 + replay (16C); return Publication IDs. |
+| `apiclient/client.go:191,655` | HTTP wrappers → V3 REST publish routes with auto `Idempotency-Key` (16C). Not service calls. |
+| `mcp/content_tools.go:543,719` | Via API client → REST (inherit V3 semantics). |
+| `handlers/handlers.go:280,390` `h.generateStaticPage` | Seed-only bootstrap (hello-world + 404, matrix §4 "keep"). All mutation call sites neutered in 16B (draft-only comments at `:1120,:1602,:2747,:4310,:6229`). |
+| ` RegenQueue` worker / `content_watcher.go` / `approval.go` | No `GenerateStaticPage`/`PublishContent` hits: regen worker records intent only (explicit Upgrade Job publishes per page); watcher is a disabled no-op; approval changes approval state only (all 16B). |
+
+New Task 12/16 routes registered (all on the existing
+auth → burst → rate → body → provenance chain; specific paths stay
+above generic `{id}` routes):
+`POST /api/v1/page-generation`,
+`GET /api/v1/templates/{slug}/schema`,
+`GET /api/v1/templates/{slug}/upgrade-preview`,
+`POST /api/v1/templates/{slug}/upgrade-jobs`,
+`GET /api/v1/templates/upgrade-jobs/{job_id}`,
+`POST /api/v1/templates/upgrade-jobs/{job_id}/run`,
+`POST /api/v1/templates/{id}/migrate-slug`,
+`GET /api/v1/content/{id}/publications`,
+`GET /api/v1/content/{id}/publications/{publication_id}`,
+`POST /api/v1/content/{id}/publications/{publication_id}/rollback`,
+`POST /api/v1/content/{id}/restore-and-publish`,
+`POST /api/v1/content/{id}/revert-live`;
+Admin `/cm` (Task 15 handlers, shared runtime):
+`POST /cm/content/{id}/publish`, `GET /cm/content/{id}/publications`,
+`POST /cm/content/{id}/versions/{version}/restore_and_publish`,
+`POST /cm/content/{id}/publications/{publicationID}/revert_live`,
+`GET /cm/templates/{id}/upgrade-preview`,
+`POST /cm/templates/{id}/upgrade-start`,
+`POST /cm/upgrade-jobs/{jobID}/run`.
+New MCP tool: `get_template_schema` (122 authenticated tools total).
+
+Template backfill verdict (plan "throughout" requirement): EXISTS, no
+BLOCKER — `migration.backfillTemplates` creates CurrentVersion=1 + v1
+docs for pre-V3 templates (`migrate.go:777`), `backfillContents` writes
+canonical fields + CurrentVersion; runtime `templatecontract.Create`
+mints v1 (16B test pins CurrentVersion 1→2). No silent skip.
+
+Spec/plan conflicts recorded: (1) Task 14 test expected Connect to
+recreate the legacy `(full_path,fork_id)` index — overruled by the 16E
+handoff (post-migration set is drop-only; migration `dropIndex` is
+idempotent, verified); test updated. (2) Template concurrent-bump
+re-check under saga lock — verified already-satisfied (TV frozen under
+the lock held through `ActivateCAS`; facade enforces
+`expected_template_version` with 409); no code change.
