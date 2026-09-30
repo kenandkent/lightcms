@@ -19,6 +19,10 @@ type GetTemplateInput struct {
 	Slug string `json:"slug,omitempty" jsonschema:"Template slug"`
 }
 
+type TemplateSchemaInput struct {
+	Slug string `json:"slug" jsonschema:"Template slug,required"`
+}
+
 type CreateTemplateInput struct {
 	Name        string                    `json:"name" jsonschema:"Template name,required"`
 	Slug        string                    `json:"slug" jsonschema:"Template slug for URLs,required"`
@@ -148,7 +152,7 @@ func (s *Server) registerTemplateTools() {
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "update_template",
 		Title:       "Update Template",
-		Description: "Update an existing template. Changing the HTML layout will regenerate all content using this template.",
+		Description: "Update an existing template. Changing fields or HTML layout creates a new immutable template version; existing live pages are unchanged until an explicit per-page publish (template upgrade).",
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Update Template",
 			ReadOnlyHint:    false,
@@ -207,5 +211,29 @@ func (s *Server) registerTemplateTools() {
 			return errorResult(err), nil, nil
 		}
 		return textResult(fmt.Sprintf("Template %s deleted successfully", args.ID)), nil, nil
+	})
+
+	// Get template schema (Task 16D): thin authorized read-only adapter
+	// over the immutable TemplateVersion JSON Schema (Task 12 schema
+	// endpoint). Same object the page-generation facade validates
+	// against — agents never re-derive field shapes from HTML.
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_template_schema",
+		Title:       "Get Template Schema",
+		Description: "Get the immutable JSON Schema of a template by slug (current version): field names, types, required flags and the JSON Schema document used for validation.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:         "Get Template Schema",
+			ReadOnlyHint:  true,
+			OpenWorldHint: boolPtr(false),
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args TemplateSchemaInput) (*mcp.CallToolResult, any, error) {
+		if args.Slug == "" {
+			return errorResult(fmt.Errorf("slug is required")), nil, nil
+		}
+		schema, err := s.client.TemplateSchema(ctx, args.Slug)
+		if err != nil {
+			return errorResult(err), nil, nil
+		}
+		return jsonResult(schema), nil, nil
 	})
 }

@@ -55,6 +55,9 @@ func (s *SchedulerService) Stop() {
 }
 
 // runOnce queries for due content and publishes each item.
+// Task 16D: every item publishes through PublicationService under a stable
+// operation key (scheduler/<id>/v<version>) — a tick retry replays instead
+// of minting a duplicate Publication/outbox row.
 func (s *SchedulerService) runOnce(ctx context.Context) {
 	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -73,7 +76,8 @@ func (s *SchedulerService) runOnce(ctx context.Context) {
 	defer cursor.Close(runCtx)
 
 	type minContent struct {
-		ID primitive.ObjectID `bson:"_id"`
+		ID             primitive.ObjectID `bson:"_id"`
+		CurrentVersion int64              `bson:"current_version"`
 	}
 
 	for cursor.Next(runCtx) {
@@ -82,7 +86,9 @@ func (s *SchedulerService) runOnce(ctx context.Context) {
 			log.Printf("[scheduler] decode error: %v", err)
 			continue
 		}
-		if err := s.contentService.PublishContent(runCtx, item.ID); err != nil {
+		key := SchedulerOpKey(item.ID, item.CurrentVersion)
+		if err := s.contentService.PublishInternal(runCtx, item.ID,
+			"scheduler", "/internal/scheduler/publish", key); err != nil {
 			log.Printf("[scheduler] failed to publish %s: %v", item.ID.Hex(), err)
 		} else {
 			log.Printf("[scheduler] published content %s", item.ID.Hex())

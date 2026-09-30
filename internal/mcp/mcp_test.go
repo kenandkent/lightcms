@@ -110,7 +110,13 @@ func testAPI(t *testing.T) (*Server, *httptest.Server, func()) {
 	})
 
 	mux.HandleFunc("POST /api/v1/content/{id}/publish", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
+		// Task 16C: publish answers with the new Publication ID + URL.
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true, "publication_id": "pub-mcp-1",
+			"public_url": "http://x/page-one", "full_path": "/page-one",
+			"content_id": r.PathValue("id"), "content_version": 2,
+		})
 	})
 
 	mux.HandleFunc("POST /api/v1/content/{id}/unpublish", func(w http.ResponseWriter, r *http.Request) {
@@ -220,6 +226,18 @@ func testAPI(t *testing.T) (*Server, *httptest.Server, func()) {
 
 	mux.HandleFunc("DELETE /api/v1/templates/{id}", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
+	})
+
+	// Task 16D: immutable template schema endpoint (get_template_schema).
+	mux.HandleFunc("GET /api/v1/templates/{slug}/schema", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"template":         r.PathValue("slug"),
+			"template_version": 3,
+			"fields": []map[string]interface{}{
+				{"name": "body", "type": "richtext", "required": true},
+			},
+			"json_schema": map[string]interface{}{"type": "object"},
+		})
 	})
 
 	// ---------- Assets ----------
@@ -651,7 +669,7 @@ func TestNewServer_RegistersTools(t *testing.T) {
 	expected := []string{
 		"list_content", "get_content", "create_content", "update_content",
 		"delete_content", "publish_content", "unpublish_content",
-		"list_templates", "get_template", "create_template",
+		"list_templates", "get_template", "get_template_schema", "create_template",
 		"list_assets", "get_asset",
 		"get_theme", "update_theme", "get_site_config",
 		"search_content", "end_user_search",
@@ -1088,6 +1106,31 @@ func TestGetTemplate_MissingArgs(t *testing.T) {
 	text := resultText(t, result)
 	if !strings.Contains(text, "either id or slug is required") {
 		t.Errorf("unexpected error message: %s", text)
+	}
+}
+
+// Task 16D: get_template_schema is a thin authorized adapter over the
+// immutable Schema service (same versioned object the facade validates).
+func TestGetTemplateSchema(t *testing.T) {
+	s, _, cleanup := testAPI(t)
+	defer cleanup()
+
+	result := callTool(t, s, "get_template_schema", map[string]interface{}{
+		"slug": "blog-post",
+	})
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", resultText(t, result))
+	}
+	var resp map[string]interface{}
+	resultJSON(t, result, &resp)
+	if resp["template"] != "blog-post" {
+		t.Errorf("expected template='blog-post', got %v", resp["template"])
+	}
+	if resp["template_version"] != float64(3) {
+		t.Errorf("expected template_version=3, got %v", resp["template_version"])
+	}
+	if _, ok := resp["json_schema"]; !ok {
+		t.Errorf("expected json_schema in response: %v", resp)
 	}
 }
 

@@ -180,6 +180,29 @@ func (s *Service) advanceAttempt(ctx context.Context, existing *Operation, now t
 	return *next, nil
 }
 
+// TakeOverByKey finds the operation for (owner, method, path, key) and
+// takes over its expired lease (Task 16D: crashed-worker resume for
+// background jobs with stable operation keys). It returns the live record:
+// a concurrently completed operation reports StateCompleted (replay, do not
+// republish). A live lease or a missing record is an error — retry later.
+func (s *Service) TakeOverByKey(ctx context.Context, owner, method, path, key string) (Operation, error) {
+	existing, err := s.repo.FindByKey(ctx,
+		strings.TrimSpace(owner), strings.ToUpper(strings.TrimSpace(method)),
+		strings.TrimSpace(path), strings.TrimSpace(key))
+	if err != nil {
+		return Operation{}, err
+	}
+	if existing == nil {
+		return Operation{}, idemErr(CodeNotFound, "no such operation")
+	}
+	if existing.State == StateCompleted {
+		hit := *existing
+		hit.Replay = true
+		return hit, nil
+	}
+	return s.TakeOver(ctx, existing.ID, existing.LeaseGeneration)
+}
+
 // Get loads an operation by ID for takeover/resume reads.
 func (s *Service) Get(ctx context.Context, opID primitive.ObjectID) (Operation, error) {
 	op, err := s.repo.FindByID(ctx, opID)

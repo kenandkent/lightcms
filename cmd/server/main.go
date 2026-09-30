@@ -480,6 +480,9 @@ func main() {
 	// saga (background callers inherit V3 semantics until 16D gives them
 	// stable operation keys).
 	services.SetPublicationPublisher(pubService)
+	// Task 16D: background jobs (scheduler, import auto-publish, copilot,
+	// search-replace auto-republish) publish under stable operation keys.
+	services.SetInternalIdempotency(idemService)
 	apiHandler.SetPublicationRuntime(pubService, idemService, genService)
 	h.SetPublicationRuntime(pubService, idemService, genService)
 	productAPI := &httpapi.Handlers{

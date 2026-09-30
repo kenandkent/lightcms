@@ -285,11 +285,7 @@ func (s *Service) RunUpgradeJob(ctx context.Context, actor Actor, jobID primitiv
 			id := active.ID
 			expected = &id
 		}
-		res, perr := s.pubs.Publish(ctx, publication.PublishRequest{
-			ContentID: it.ContentID, ContentVersion: cv,
-			TemplateVersionID: job.TargetVersionID, ExpectedActiveID: expected,
-			Reason: "template upgrade job " + job.ID.Hex(),
-		})
+		res, perr := s.publishUpgradeItem(ctx, actor, job, it.ContentID, cv, job.TargetVersionID, expected)
 		it.Attempts++
 		changed = true
 		if perr != nil {
@@ -334,4 +330,49 @@ func (s *Service) RunUpgradeJob(ctx context.Context, actor Actor, jobID primitiv
 		"job_id": job.ID.Hex(), "status": string(job.Status),
 	})
 	return job, nil
+}
+
+// publishUpgradeItem publishes one upgrade-job page through the saga under
+// a stable per-item operation key (Task 16D: upgrade/<jobID>/<contentID>).
+// A job resume after a crash replays the cached completion instead of
+// minting a duplicate Publication/outbox row; a terminal pre-activation
+// failure gets a new attempt (new Publication ID) on resume. Without a
+// wired idempotency service the publish is unkeyed (legacy behavior).
+func (s *Service) publishUpgradeItem(ctx context.Context, actor Actor, job UpgradeJob, contentID primitive.ObjectID, cv int64, targetVersionID primitive.ObjectID, expected *primitive.ObjectID) (publication.PublicationResult, error) {
+	req := publication.PublishRequest{
+		ContentID: contentID, ContentVersion: cv,
+		TemplateVersionID: targetVersionID, ExpectedActiveID: expected,
+		Reason: "template upgrade job " + job.ID.Hex(),
+	}
+	if s.idem == nil {
+		return s.pubs.Publish(ctx, req)
+	}
+	owner := actor.Owner()
+	path := "/internal/upgrade-jobs/" + job.ID.Hex() + "/publish"
+	key := "upgrade/" + job.ID.Hex() + "/" + contentID.Hex()
+	op, berr := s.idem.Begin(ctx, owner, "POST", path, key, nil)
+	if berr != nil {
+		return publication.PublicationResult{}, mapIdemBeginErr(berr)
+	}
+	if op.Replay {
+		if hex, ok := op.Response["publication_id"].(string); ok && hex != "" {
+			if pid, perr := primitive.ObjectIDFromHex(hex); perr == nil {
+				return publication.PublicationResult{PublicationID: pid, ContentID: contentID}, nil
+			}
+		}
+		return publication.PublicationResult{}, genErr(CodeInternal, "idempotent replay without a cached publication", nil)
+	}
+	req.IdempotencyRecord = &op.ID
+	res, perr := s.pubs.Publish(ctx, req)
+	if perr != nil {
+		code := mapSagaCode(perr)
+		if code == "" {
+			code = string(publication.CodeActivateFailed)
+		}
+		_, _ = s.idem.MarkTerminal(ctx, op.ID, op.Attempt, code)
+		return publication.PublicationResult{}, mapSagaErr(perr)
+	}
+	_, _ = s.idem.Complete(ctx, op.ID, op.Attempt, 200,
+		map[string]any{"publication_id": res.PublicationID.Hex(), "content_id": contentID.Hex()}, false)
+	return res, nil
 }

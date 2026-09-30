@@ -3,6 +3,8 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -1051,6 +1053,9 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 	ctx, cancel := context.WithTimeout(r.Context(), bulkOpTimeout)
 	defer cancel()
 
+	// Task 16D: stable per-page operation keys for auto-republish.
+	srReqKey := searchReplaceRequestKey(r)
+
 	// Stream documents one-by-one — avoids loading the full collection into memory.
 	cursor, err := a.contentService.StreamContent(ctx, false)
 	if err != nil {
@@ -1117,7 +1122,11 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 			return nil
 		}
 		if req.AutoRepublish && wasPublished {
-			a.contentService.PublishContent(ctx, content.ID)
+			// Task 16D: republish through PublicationService under a stable
+			// per-page key — retries replay, never duplicate.
+			_ = a.contentService.PublishInternal(ctx, content.ID,
+				"search-replace", "/api/v1/search-replace/execute",
+				services.SearchReplaceOpKey(srReqKey, content.ID))
 		}
 		return &UpdatedPage{
 			ID: content.ID.Hex(), Title: newTitle,
@@ -1638,6 +1647,9 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 	ctx, cancel := context.WithTimeout(r.Context(), bulkOpTimeout)
 	defer cancel()
 
+	// Task 16D: stable per-page operation keys for auto-republish.
+	scopedReqKey := searchReplaceRequestKey(r)
+
 	// Push scope filters to MongoDB and stream results to avoid loading the full
 	// scoped set into memory before processing starts.
 	cursor2, err := a.contentService.StreamContentScoped(ctx, scopeToContentScope(req.Scope))
@@ -1691,7 +1703,11 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 			return nil
 		}
 		if req.AutoRepublish && wasPublished {
-			a.contentService.PublishContent(ctx, content.ID)
+			// Task 16D: republish through PublicationService under a stable
+			// per-page key — retries replay, never duplicate.
+			_ = a.contentService.PublishInternal(ctx, content.ID,
+				"search-replace", "/api/v1/search-replace/scoped/execute",
+				services.SearchReplaceOpKey(scopedReqKey, content.ID))
 		}
 		return &UpdatedPage{
 			ID: content.ID.Hex(), Title: newTitle,
@@ -1798,6 +1814,22 @@ func idemHTTPStatus(err error) int {
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+// searchReplaceRequestKey returns the stable key for one search-replace
+// execute request (Task 16D): the caller's Idempotency-Key header when
+// present, else one fresh random key for this request. Per-page operation
+// keys (sr/<reqkey>/<contentID>) make auto-republish retries replay instead
+// of minting duplicate Publications.
+func searchReplaceRequestKey(r *http.Request) string {
+	if key := strings.TrimSpace(r.Header.Get("Idempotency-Key")); key != "" {
+		return key
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("sr-req-%d", time.Now().UnixNano())
+	}
+	return "sr-req-" + hex.EncodeToString(b[:])
 }
 
 // sanitizeAPIError converts internal errors to safe external messages,
