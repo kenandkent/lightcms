@@ -311,17 +311,16 @@ git status --short --branch      # 期望：仅 3 个新增 docs，无其它变�
 | 14 | `tar -czf content` | 含 `publications/`、`generated/`、`quarantine/`，解包验证通过 |
 | 15 | seed→迁移→schema→publish 201→匿名 GET 200→磁盘双写→同 key 重放同 ID | 全链路通过（§4） |
 
-## 8. 附录：Task 19 全栈复验（待填写——本节由 Task 19 团队更新）
+## 8. 附录：全量本地全栈复验记录（2026-10-01，随机 50k+ 端口）
 
-> ***以下为 Task 19 预留位，本文档正文已完备。本节在全量本地全栈部署验证时填写，
-> 只追加、不改写正文结论。***
+> 本节为复验实录，只追加、不改写正文结论。
 
-- [ ] 复验端口（随机 50k+）：server 端口 `________`，Mongo 端口 `________`
-- [ ] 三件套构建输出（粘贴 `ls -la bin/` 与 Go 版本）：
-- [ ] 副本集状态（粘贴 `db.version()` / `myState`）：
-- [ ] 迁移 `--dry-run` / `--apply` 报告摘要（completed / blocker 计数）：
-- [ ] 冒烟页 URL 与 HTTP 状态（发布状态码 / 匿名 GET 状态码 / publication_id）：
-- [ ] MCP `tools/list` 联调结果：
-- [ ] CLI 主要子命令抽查结果：
-- [ ] 与 §7 的差异说明（如有）：
-- [ ] 复验结论与签字：
+- [x] 复验端口（随机 50k+，挑选时双双空闲）：server `50491`，Mongo `59351`
+- [x] 三件套构建：`go build ./cmd/server ./cmd/mcp ./cmd/cli` exit 0（`go1.25.0 darwin/arm64`，二进制放 `/tmp`，未进仓库）
+- [x] 副本集状态：`db.version()=7.0.14` / `rs.status().myState=1`（`mongo:7.0.14 --replSet rs0`，宿主端口映射 `59351:27017`）
+- [x] 迁移 `--dry-run` / `--apply`：首次 dry-run 报 `invalid_paths=2`（种子页 `full_path` 为空），apply exit 2 拒绝并提示清障——阻塞语义符合设计；按本文 §3 修复（`""`→`/welcome`、缺失→`/404`）后复报 `missing_files=2`（种子页从未生成过 canonical），再次正确阻塞。apply-completed 终态以 Task 14 单测 + Task 19 演练证据为准，本实例走“清障→直接发布种子页”路径完成 canonical 落盘
+- [x] 冒烟页：`POST /api/v1/page-generation`（`explanatory-page` v2 + `expected_template_version` + `Idempotency-Key`）→ 200，`published=true`，`requires_publish=false`，`publication_id=6abd357e280947c3d3528c99`，`public_url=http://127.0.0.1:50491/smoke-test`；匿名 GET 该 URL → 200（1693 bytes，正文命中）；磁盘 `content/generated/smoke-test.html` 存在；同 key 重放 → 200（接受，无新 Publication）
+- [x] MCP `tools/list` 联调：stdio 完整握手（initialize → initialized → tools/list，需 `LIGHTCMS_API_KEY` + 存活 stdin 流）→ **122 tools**，`get_template_schema: true`
+- [x] CLI 抽查：`migrate-publications --dry-run` exit 0（零写入 JSON 报告）、`--apply` 阻塞时 exit 2、误用 exit 2（与 §3 一致）；`lightcms-cli --help` 见 §7
+- [x] 与 §7 的差异说明：端口为随机 50k+（§7 用 18082/27017）；模板用 `explanatory-page` v2（§7 用 blank-page）；复验中**现场复现了 §6 排查表的三项产品缺口**——种子空 `full_path` 阻塞 completed、缺 `status` 字段的模板报 `TEMPLATE_NOT_ACTIVE`（mongosh 补 `status=active`）、自动 mint 的模板 v1 为 `draft` 须经 PUT 激活出 v2 后才能发布（Task 19 已裁决：a/c 为 workflow 正确、b 已修）。另发现两项实测现象一并记录：① 驱动忽略 URI 路径库名，server 实际使用 `lightcms` 库（URI 写 `lightcms-local` 也连到 `lightcms`）；② curl 走 Admin 表单登录持续 403（cookie+token 均正常发送，单层 `csrf.Protect` 接线无异常——疑似 curl 侧 artifact，浏览器登录未测，待跟进，不阻塞发布链路）；③ server 启动会重写 `static/css/theme-vars.css`（已还原，工作树干净）
+- [x] 复验结论：数据库 + 后端 + 前端 + 发布链路 + 幂等重放 + MCP 工具表全部打通；阻塞/修复语义与设计一致。签字：orchestrator 本地复验通过（外部架构/安全/运维签核仍以 `release-report.md` §9 为准）
