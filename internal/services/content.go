@@ -17,6 +17,7 @@ import (
 
 	"github.com/jonradoff/lightcms/v7/internal/database"
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
@@ -556,8 +557,35 @@ func (s *ContentService) UpdateContent(ctx context.Context, content *models.Cont
 	return nil
 }
 
+// PublicationPublisher is the Task 8 publication saga seam for the legacy
+// publish/unpublish entry points (spec §16.6: PublicationService is the only
+// live-mutation service). Task 16 wires the constructed saga via
+// SetPublicationPublisher and owns cmd/server/main.go; until then the seam is
+// nil and the legacy behavior below is preserved byte-for-byte.
+type PublicationPublisher interface {
+	Publish(ctx context.Context, req publication.PublishRequest) (publication.PublicationResult, error)
+	Unpublish(ctx context.Context, req publication.UnpublishRequest) error
+}
+
+// legacyPublicationSaga holds the Task 16 wiring. Package-level (not a
+// ContentService field) so Task 7's parallel edits to this file's struct and
+// rendering-entry region stay untouched.
+var legacyPublicationSaga PublicationPublisher
+
+// SetPublicationPublisher wires the Task 8 saga for legacy delegation.
+func SetPublicationPublisher(p PublicationPublisher) {
+	legacyPublicationSaga = p
+}
+
 // PublishContent publishes content and generates static page
 func (s *ContentService) PublishContent(ctx context.Context, id primitive.ObjectID) error {
+	if legacyPublicationSaga != nil {
+		// Delegate: latest content version + current template version are
+		// frozen under the saga page lock; the result (publication ID/URL)
+		// is intentionally not mapped onto the legacy error-only signature.
+		_, err := legacyPublicationSaga.Publish(ctx, publication.PublishRequest{ContentID: id})
+		return err
+	}
 	var content models.Content
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &content); err != nil {
 		return fmt.Errorf("content not found: %w", err)
@@ -588,6 +616,9 @@ func (s *ContentService) PublishContent(ctx context.Context, id primitive.Object
 
 // UnpublishContent unpublishes content and removes static page
 func (s *ContentService) UnpublishContent(ctx context.Context, id primitive.ObjectID) error {
+	if legacyPublicationSaga != nil {
+		return legacyPublicationSaga.Unpublish(ctx, publication.UnpublishRequest{ContentID: id})
+	}
 	var content models.Content
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &content); err != nil {
 		return fmt.Errorf("content not found: %w", err)
