@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Baseline LightCMS commit: `c1165be1327dc605bd196cd4dff4ebe35bfaa6f4`, version `7.2.2`. Record a new baseline and reconcile this plan before rebasing.
-- Project root for delegated work: `/Users/ken/workspace/newsPage/lightcms`. Files outside a delegated task's project root are read-only unless the user explicitly authorizes exact paths.
+- Project root for delegated work: `/Users/ken/workspace/newsPage`. Files outside a delegated task's project root are read-only unless the user explicitly authorizes exact paths.
 - One backend application binary and one Admin UI. `*Service` types are in-process Go types, not separately deployed services.
 - Product Page remains LightCMS `Content`; published drafts use existing Forks. Do not add `pages`, `page_versions`, new auth, new MCP backend, or new webhook engine.
 - MongoDB production and test environments must support transactions through replica set mode. Tests that require Mongo must fail the release gate when no test Mongo URI is configured; the existing skip behavior is not a successful integration run.
@@ -22,7 +22,7 @@
 - `Content.UpdateContent` must stop implicitly writing or deleting live files. Treat this as a documented external API behavior change.
 - External live-changing requests require `Idempotency-Key`; only pure 400/422 validation and successful responses are replay cached. Preview ignores the key.
 - Publication lifecycle and storage lifecycle are distinct; rollback creates a new Publication.
-- All product code and documentation are repository-relative under `/Users/ken/workspace/newsPage/lightcms`; documentation stays in `docs/` of this same Git repository.
+- All product code and documentation are repository-relative under `/Users/ken/workspace/newsPage`; documentation stays in `docs/` of this same Git repository.
 - `go test ./...`, `go vet ./...`, and server/MCP/CLI builds are final gates. Run DB tests with `-p 1` and a database name containing `test`.
 
 ## Review Focus
@@ -42,7 +42,7 @@ The plan is a single master plan with independently reviewable tasks. Each worke
 第三方执行时，每个子 Agent 只领取一个 Task ID。任务消息可直接使用下面的模板，替换方括号内的具体内容；`文件所有权` 必须与上表一致：
 
 ```text
-你负责 Task [编号和标题]。项目根目录是 /Users/ken/workspace/newsPage/lightcms。
+你负责 Task [编号和标题]。项目根目录是 /Users/ken/workspace/newsPage。
 必须先阅读：
 1. docs/LightCMS_V3_模板化页面生成与静态发布系统_最终设计方案.md 的相关章节；
 2. docs/superpowers/plans/2026-09-30-lightcms-template-static-publishing.md 的 Global Constraints、Shared interface contract 和你的 Task 全文；
