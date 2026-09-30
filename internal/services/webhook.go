@@ -110,6 +110,125 @@ func (s *WebhookService) FireEvent(ctx context.Context, event string, data inter
 	}()
 }
 
+// recordedPayload is the JSON body for durable outbox delivery (Task 9).
+// Shape contract for Task 18 (API/Agent docs):
+//
+//	{"event_id": "<event_type>:<publication_id hex>",
+//	 "event": "<event_type, e.g. content.publish>",
+//	 "timestamp": "<RFC3339 delivery time; changes per attempt>",
+//	 "data": {<stored outbox payload>}}
+//
+// event_id equals the X-LightCMS-Event-ID header and is stable across
+// retries; timestamp (hence the HMAC) changes per attempt but always verifies
+// with the endpoint secret. Must stay in sync with
+// publication.RecordedPayloadShape / publication.EventID.
+type recordedPayload struct {
+	EventID   string         `json:"event_id"`
+	Event     string         `json:"event"`
+	Timestamp string         `json:"timestamp"`
+	Data      map[string]any `json:"data"`
+}
+
+// DeliverRecordedEvent synchronously delivers one durable outbox event to all
+// active endpoints subscribed to eventType (Task 9 entry point). It reuses
+// the existing endpoint selection (active + events filter), HMAC signing
+// (X-LightCMS-Signature), delivery history (logDelivery), and retry policy:
+// retries are owned by the outbox worker (next_attempt_at backoff mirroring
+// retryWithBackoff's 30s/5m schedule), so this method attempts each endpoint
+// once and returns an error when any endpoint fails, letting the worker
+// requeue the event with the same stable eventID. At-least-once: a retry
+// redelivers to all endpoints; receivers dedupe via eventID. Existing
+// FireEvent/deliver/retryWithBackoff behavior is unchanged.
+func (s *WebhookService) DeliverRecordedEvent(ctx context.Context, eventType, eventID string, data map[string]any) error {
+	if eventType == "" {
+		return fmt.Errorf("webhook: event type is required")
+	}
+	if eventID == "" {
+		return fmt.Errorf("webhook: event ID is required")
+	}
+	if data == nil {
+		data = map[string]any{}
+	}
+	payload, err := json.Marshal(recordedPayload{
+		EventID:   eventID,
+		Event:     eventType,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Data:      data,
+	})
+	if err != nil {
+		return err
+	}
+
+	filter := bson.M{
+		"active": true,
+		"events": eventType,
+	}
+	cursor, err := s.db.FindMany(ctx, "webhooks", filter)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	deliveredTo := 0
+	var firstErr error
+	for cursor.Next(ctx) {
+		var wh WebhookDoc
+		if err := cursor.Decode(&wh); err != nil {
+			continue
+		}
+		if err := s.deliverRecorded(ctx, wh, eventType, eventID, payload); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		deliveredTo++
+	}
+	if err := cursor.Err(); err != nil {
+		return err
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	_ = deliveredTo // zero endpoints is success: nothing to deliver
+	return nil
+}
+
+// deliverRecorded sends one recorded payload to a single endpoint with the
+// stable event-ID header, HMAC signature, and delivery-history logging. It
+// mirrors deliver without altering its behavior.
+func (s *WebhookService) deliverRecorded(ctx context.Context, wh WebhookDoc, event, eventID string, payload []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wh.URL, bytes.NewReader(payload))
+	if err != nil {
+		s.logDelivery(wh.ID, event, 1, 0, false, err.Error())
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-LightCMS-Event", event)
+	req.Header.Set("X-LightCMS-Event-ID", eventID)
+	req.Header.Set("X-LightCMS-Signature", s.sign(wh.Secret, payload))
+	req.Header.Set("User-Agent", "LightCMS-Webhook/1.0")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		s.logDelivery(wh.ID, event, 1, 0, false, err.Error())
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck
+
+	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+	errMsg := ""
+	if !success {
+		errMsg = fmt.Sprintf("unexpected status %d", resp.StatusCode)
+	}
+	s.logDelivery(wh.ID, event, 1, resp.StatusCode, success, errMsg)
+	if !success {
+		return fmt.Errorf("webhook %s returned status %d", wh.URL, resp.StatusCode)
+	}
+	return nil
+}
+
 // deliver sends the payload to the webhook URL and logs the delivery attempt.
 func (s *WebhookService) deliver(ctx context.Context, wh WebhookDoc, event string, payload []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wh.URL, bytes.NewReader(payload))
