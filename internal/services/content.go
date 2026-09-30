@@ -17,6 +17,7 @@ import (
 
 	"github.com/jonradoff/lightcms/v7/internal/database"
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
@@ -1231,6 +1232,12 @@ func (s *ContentService) generateStaticPageWithWikilinkIndex(ctx context.Context
 	s.db.UpdateOne(ctx, "content", bson.M{"_id": content.ID}, bson.M{"$set": bson.M{"content_hash": hash}})
 
 	return nil
+}
+
+// RenderSnapshotHTML renders a frozen publication snapshot in memory without
+// writing a canonical file (Task 7 render snapshot; file cutover is Task 8 saga).
+func (s *ContentService) RenderSnapshotHTML(ctx context.Context, snap publication.RenderSnapshot) (publication.RenderResult, error) {
+	return publication.RenderDetailed(ctx, snap)
 }
 
 // removeStaticPage removes the static HTML file for content
