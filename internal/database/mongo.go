@@ -463,6 +463,164 @@ func (db *DB) Disconnect(ctx context.Context) error {
 	return db.client.Disconnect(ctx)
 }
 
+// DatabaseName returns the underlying Mongo database name. Used by test
+// guards to refuse destructive cleanup against non-test databases.
+func (db *DB) DatabaseName() string {
+	return db.database.Name()
+}
+
+// WithTransaction executes fn inside a Mongo multi-document transaction.
+// Callers must run against a replica set (standalone mongod cannot run
+// transactions). Repository methods called inside fn accept the
+// mongo.SessionContext as a context.Context and must not open nested
+// transactions.
+func (db *DB) WithTransaction(ctx context.Context, fn func(mongo.SessionContext) error) error {
+	sess, err := db.client.StartSession()
+	if err != nil {
+		return err
+	}
+	defer sess.EndSession(ctx)
+	_, err = sess.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+		return nil, fn(sc)
+	})
+	return err
+}
+
+// EnsureProductIndexes creates the V3 product indexes as an explicit
+// post-migration step. It is NOT called from Connect: Task 14 remediates
+// legacy collisions (canonical case variants, duplicate slugs/versions,
+// missing files) before invoking it. It does NOT drop the legacy
+// UNIQUE(full_path, fork_id) index; Task 14 drops that only after the new
+// canonical index is verified.
+func (db *DB) EnsureProductIndexes(ctx context.Context) error {
+	create := func(collection string, model mongo.IndexModel) error {
+		_, err := db.database.Collection(collection).Indexes().CreateOne(ctx, model)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// 1. Content canonical path: UNIQUE(canonical_full_path, path_scope)
+	// with partialFilter {path_active: true}. Live rows use path_scope
+	// "live"; fork copies use their fork ObjectID hex so a fork can share
+	// the live key while the same fork cannot duplicate it.
+	if err := create("content", mongo.IndexModel{
+		Keys: bson.D{{Key: "canonical_full_path", Value: 1}, {Key: "path_scope", Value: 1}},
+		Options: options.Index().
+			SetName("content_canonical_path_scope_unique").
+			SetUnique(true).
+			SetPartialFilterExpression(bson.M{"path_active": true}),
+	}); err != nil {
+		return err
+	}
+
+	// 2. Content versions: UNIQUE(content_id, version) for CAS allocation.
+	if err := create("content_versions", mongo.IndexModel{
+		Keys:    bson.D{{Key: "content_id", Value: 1}, {Key: "version", Value: 1}},
+		Options: options.Index().SetName("content_versions_content_id_version_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+
+	// 3. Templates: unique slug (migration remediates empty/duplicate/
+	// illegal/case-conflicting slugs first; see spec §34.1/§35.1).
+	if err := create("templates", mongo.IndexModel{
+		Keys:    bson.D{{Key: "slug", Value: 1}},
+		Options: options.Index().SetName("templates_slug_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+
+	// 4. Template versions: UNIQUE(template_id, version) plus query indexes.
+	if err := create("template_versions", mongo.IndexModel{
+		Keys:    bson.D{{Key: "template_id", Value: 1}, {Key: "version", Value: 1}},
+		Options: options.Index().SetName("template_versions_template_id_version_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+	if err := create("template_versions", mongo.IndexModel{
+		Keys:    bson.D{{Key: "template_id", Value: 1}, {Key: "created_at", Value: -1}},
+		Options: options.Index().SetName("template_versions_template_id_created_at"),
+	}); err != nil {
+		return err
+	}
+	if err := create("template_versions", mongo.IndexModel{
+		Keys:    bson.D{{Key: "slug", Value: 1}, {Key: "version", Value: -1}},
+		Options: options.Index().SetName("template_versions_slug_version"),
+	}); err != nil {
+		return err
+	}
+
+	// 5. Publications: partial unique active pointer + query indexes
+	// (spec §15.5/§15.8). The {content_id, status} partial unique IS the
+	// content_id+status index: exactly one active per content.
+	if err := create("content_publications", mongo.IndexModel{
+		Keys: bson.D{{Key: "content_id", Value: 1}, {Key: "status", Value: 1}},
+		Options: options.Index().
+			SetName("content_publications_active_unique").
+			SetUnique(true).
+			SetPartialFilterExpression(bson.M{"status": "active"}),
+	}); err != nil {
+		return err
+	}
+	if err := create("content_publications", mongo.IndexModel{
+		Keys:    bson.D{{Key: "content_id", Value: 1}, {Key: "activated_at", Value: -1}},
+		Options: options.Index().SetName("content_publications_content_activated"),
+	}); err != nil {
+		return err
+	}
+	if err := create("content_publications", mongo.IndexModel{
+		Keys:    bson.D{{Key: "template_version_id", Value: 1}},
+		Options: options.Index().SetName("content_publications_template_version"),
+	}); err != nil {
+		return err
+	}
+	if err := create("content_publications", mongo.IndexModel{
+		Keys:    bson.D{{Key: "content_hash", Value: 1}},
+		Options: options.Index().SetName("content_publications_hash"),
+	}); err != nil {
+		return err
+	}
+	if err := create("content_publications", mongo.IndexModel{
+		Keys:    bson.D{{Key: "created_at", Value: 1}},
+		Options: options.Index().SetName("content_publications_created"),
+	}); err != nil {
+		return err
+	}
+
+	// 6. Idempotency: UNIQUE(owner, method, path, key) + TTL(expires_at).
+	if err := create("idempotency_records", mongo.IndexModel{
+		Keys:    bson.D{{Key: "owner", Value: 1}, {Key: "method", Value: 1}, {Key: "path", Value: 1}, {Key: "key", Value: 1}},
+		Options: options.Index().SetName("idempotency_owner_method_path_key_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+	if err := create("idempotency_records", mongo.IndexModel{
+		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Options: options.Index().SetName("idempotency_expires_ttl").SetExpireAfterSeconds(0),
+	}); err != nil {
+		return err
+	}
+
+	// 7. Outbox: UNIQUE(event_type, aggregate_id) where aggregate_id is the
+	// publication ID (spec §28.1), plus a worker polling index.
+	if err := create("webhook_outbox", mongo.IndexModel{
+		Keys:    bson.D{{Key: "event_type", Value: 1}, {Key: "aggregate_id", Value: 1}},
+		Options: options.Index().SetName("webhook_outbox_event_aggregate_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+	if err := create("webhook_outbox", mongo.IndexModel{
+		Keys:    bson.D{{Key: "state", Value: 1}, {Key: "next_attempt_at", Value: 1}},
+		Options: options.Index().SetName("webhook_outbox_state_next"),
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Template operations
 func (db *DB) Templates() *mongo.Collection {
 	return db.database.Collection("templates")

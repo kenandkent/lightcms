@@ -163,7 +163,7 @@ func (s *AgentSessionService) Rollback(ctx context.Context, sessionID string) (*
 				if v.AgentSession == "" && !v.CreatedAt.Before(item.FirstAt) {
 					continue // no provenance: only trust versions that predate the session
 				}
-				target = v.Version
+				target = int(v.Version)
 				break
 			}
 			if target < 0 {

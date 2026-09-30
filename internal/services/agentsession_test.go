@@ -180,7 +180,7 @@ func TestVersionProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetVersions: %v", err)
 	}
-	byVersion := map[int]models.ContentVersion{}
+	byVersion := map[int64]models.ContentVersion{}
 	for _, v := range versions {
 		byVersion[v.Version] = v
 	}
