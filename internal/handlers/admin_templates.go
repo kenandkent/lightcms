@@ -391,6 +391,9 @@ var adminTemplates = map[string]string{
                             <option value="date" {{if eq .Type "date"}}selected{{end}}>Date</option>
                             <option value="image" {{if eq .Type "image"}}selected{{end}}>Image</option>
                             <option value="select" {{if eq .Type "select"}}selected{{end}}>Select</option>
+                            <option value="url" {{if eq .Type "url"}}selected{{end}}>URL</option>
+                            <option value="number" {{if eq .Type "number"}}selected{{end}}>Number</option>
+                            <option value="boolean" {{if eq .Type "boolean"}}selected{{end}}>Boolean</option>
                         </select>
                         <input type="text" name="field_placeholder[]" value="{{.Placeholder}}" placeholder="Placeholder">
                         <input type="text" name="field_options[]" value="{{.Options}}" placeholder="Options (comma-sep)">
@@ -431,6 +434,9 @@ var adminTemplates = map[string]string{
                     <option value="date">Date</option>
                     <option value="image">Image</option>
                     <option value="select">Select</option>
+                    <option value="url">URL</option>
+                    <option value="number">Number</option>
+                    <option value="boolean">Boolean</option>
                 </select>
                 <input type="text" name="field_placeholder[]" placeholder="Placeholder">
                 <input type="text" name="field_options[]" placeholder="Options (comma-sep)">
@@ -1039,6 +1045,7 @@ var adminTemplates = map[string]string{
                 <h3>{{.Name}}</h3>
                 <p>{{.Description}}</p>
                 <span class="template-category">{{.Category}}</span>
+                <span class="template-required">Required fields: {{range .Fields}}{{if .Required}}{{.Name}} {{end}}{{end}}</span>
             </a>
             {{end}}
         </div>
@@ -1531,10 +1538,24 @@ var adminTemplates = map[string]string{
             {{range .Template.Fields}}
             <div class="form-group">
                 <label for="field_{{.Name}}">{{.Label}}{{if .Required}} *{{end}}</label>
+                {{if .Description}}<p class="help-text">{{.Description}}</p>{{end}}
+                {{if .Example}}<p class="help-text">Example: <code>{{.Example}}</code></p>{{end}}
                 {{if eq .Type "text"}}
                 <input type="text" id="field_{{.Name}}" name="field_{{.Name}}"
                     value="{{if $.Content}}{{index $.Content.Data .Name}}{{end}}"
                     placeholder="{{.Placeholder}}" {{if .Required}}required{{end}}>
+                {{else if eq .Type "url"}}
+                <input type="url" id="field_{{.Name}}" name="field_{{.Name}}"
+                    value="{{if $.Content}}{{index $.Content.Data .Name}}{{end}}"
+                    placeholder="{{.Placeholder}}" {{if .Required}}required{{end}}>
+                {{else if eq .Type "number"}}
+                <input type="number" id="field_{{.Name}}" name="field_{{.Name}}"
+                    value="{{if $.Content}}{{index $.Content.Data .Name}}{{end}}"
+                    placeholder="{{.Placeholder}}" {{if .Required}}required{{end}}>
+                {{else if eq .Type "boolean"}}
+                <input type="hidden" name="field_{{.Name}}" value="off">
+                <label class="checkbox-label"><input type="checkbox" id="field_{{.Name}}" name="field_{{.Name}}" value="on"
+                    {{if $.Content}}{{if index $.Content.Data .Name}}checked{{end}}{{else}}{{if eq .Default "true"}}checked{{end}}{{end}}> {{.Label}}</label>
                 {{else if eq .Type "textarea"}}
                 <textarea id="field_{{.Name}}" name="field_{{.Name}}" rows="4"
                     placeholder="{{.Placeholder}}" {{if .Required}}required{{end}}>{{if $.Content}}{{index $.Content.Data .Name}}{{end}}</textarea>
@@ -1544,8 +1565,11 @@ var adminTemplates = map[string]string{
                         &lt;/&gt; Edit HTML
                     </button>
                 </div>
-                <textarea id="field_{{.Name}}" name="field_{{.Name}}" class="richtext"
+                <textarea id="field_{{.Name}}" name="field_{{.Name}}" class="richtext" data-field-type="richtext"
                     {{if .Required}}required{{end}}>{{if $.Content}}{{index $.Content.Data .Name}}{{end}}</textarea>
+                {{else if eq .Type "markdown"}}
+                <textarea id="field_{{.Name}}" name="field_{{.Name}}" rows="10" data-field-type="markdown"
+                    placeholder="{{.Placeholder}}" {{if .Required}}required{{end}}>{{if $.Content}}{{index $.Content.Data .Name}}{{end}}</textarea>
                 {{else if eq .Type "rawhtml"}}
                 <textarea id="field_{{.Name}}" name="field_{{.Name}}" rows="20" class="code-editor"
                     placeholder="{{.Placeholder}}" {{if .Required}}required{{end}}>{{if $.Content}}{{index $.Content.Data .Name}}{{end}}</textarea>
@@ -1568,6 +1592,7 @@ var adminTemplates = map[string]string{
                     {{end}}
                 </select>
                 {{end}}
+                {{with index $.FieldErrors .Name}}{{range .}}<p class="field-error" data-field="{{.Field}}">{{.Code}}: {{.Message}}</p>{{end}}{{end}}
             </div>
             {{end}}
 
