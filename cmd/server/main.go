@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +24,12 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/middleware"
 	"github.com/jonradoff/lightcms/v7/internal/models"
 	"github.com/jonradoff/lightcms/v7/internal/oauth"
+	"github.com/jonradoff/lightcms/v7/internal/product/generation"
+	"github.com/jonradoff/lightcms/v7/internal/product/httpapi"
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
+	"github.com/jonradoff/lightcms/v7/internal/product/publication"
+	"github.com/jonradoff/lightcms/v7/internal/product/publicurl"
+	"github.com/jonradoff/lightcms/v7/internal/product/storage"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/csrf"
@@ -396,6 +404,17 @@ func main() {
 	admin.HandleFunc("/forks/{id}/archive", h.ArchiveFork).Methods("POST")
 	admin.HandleFunc("/forks/{id}/delete", h.DeleteForkHandler).Methods("POST")
 
+	// Task 16C: Task 15 Admin publication UX (admin_publications.go). All
+	// seven handlers publish through the shared PublicationService wired
+	// above — never a locally constructed store-rooted service.
+	admin.HandleFunc("/content/{id}/publish", h.AdminProductPublish).Methods("POST")
+	admin.HandleFunc("/content/{id}/publications", h.AdminProductPublications).Methods("GET")
+	admin.HandleFunc("/content/{id}/versions/{version}/restore_and_publish", h.AdminProductRestoreAndPublish).Methods("POST")
+	admin.HandleFunc("/content/{id}/publications/{publicationID}/revert_live", h.AdminProductRevertLive).Methods("POST")
+	admin.HandleFunc("/templates/{id}/upgrade-preview", h.AdminProductUpgradePreview).Methods("GET")
+	admin.HandleFunc("/templates/{id}/upgrade-start", h.AdminProductUpgradeStart).Methods("POST")
+	admin.HandleFunc("/upgrade-jobs/{jobID}/run", h.AdminProductUpgradeRun).Methods("POST")
+
 	// REST API v1 routes (API key authenticated, JSON only)
 	apiKeyService := services.NewAPIKeyService(db)
 	linkCheckerService := services.NewLinkCheckerService(db)
@@ -421,6 +440,72 @@ func main() {
 	apiHandler.SetUserService(userService)
 	apiHandler.SetAgentSessionService(services.NewAgentSessionService(auditService, contentService))
 	apiHandler.SetMaintenanceService(maintenanceService)
+
+	// Task 16C/E: one shared in-process V3 publication runtime. Every
+	// live-changing entry point (REST single/batch publish + rollback,
+	// Admin publish, API client/CLI via REST, background jobs via the
+	// legacy delegation seam) targets this single saga instance; no
+	// caller constructs a parallel store-rooted service.
+	pubStore := storage.NewFilesystemStore("content")
+	pubRepo := publication.NewRepository(db, nil)
+	idemService, err := idempotency.NewService(db, idempotency.Options{})
+	if err != nil {
+		log.Fatalf("Failed to init idempotency service: %v", err)
+	}
+	var publicURLs *publicurl.Resolver
+	if baseURL, uerr := url.Parse(cfg.BaseURL); uerr == nil && baseURL != nil {
+		if resolver, rerr := publicurl.NewResolver(baseURL); rerr == nil {
+			publicURLs = resolver
+		} else {
+			log.Printf("Warning: public URL resolver disabled: %v", rerr)
+		}
+	}
+	pubAudit := func(ctx context.Context, action string, fields map[string]any) {
+		auditService.LogAsync(models.AuditLog{Action: action, Resource: "publication", Details: fields})
+	}
+	pubService := publication.NewService(db, pubRepo, pubStore, publication.Options{
+		Idem: idemService,
+		URLs: publicURLs,
+		Purge: func(ctx context.Context, urls []string) error {
+			return cfService.PurgeByURLs(ctx, urls)
+		},
+		Audit:    pubAudit,
+		BuildSHA: publicationBuildSHA(),
+	})
+	genService := generation.NewService(db, generation.Options{
+		Pubs: pubService, PubRepo: pubRepo, Idem: idemService, URLs: publicURLs,
+		Audit: pubAudit,
+	})
+	// Legacy ContentService.PublishContent/UnpublishContent delegate to the
+	// saga (background callers inherit V3 semantics until 16D gives them
+	// stable operation keys).
+	services.SetPublicationPublisher(pubService)
+	apiHandler.SetPublicationRuntime(pubService, idemService, genService)
+	h.SetPublicationRuntime(pubService, idemService, genService)
+	productAPI := &httpapi.Handlers{
+		Gen: genService,
+		ActorExtractor: func(r *http.Request) (generation.Actor, error) {
+			u, ok := auth.UserFromAPIContext(r.Context())
+			if !ok || u == nil {
+				return generation.Actor{}, fmt.Errorf("authentication is required")
+			}
+			kind := "human"
+			session := r.Header.Get("X-Agent-Session")
+			if session != "" {
+				kind = "agent"
+			}
+			return generation.Actor{
+				ID: u.ID, Email: u.Email, Authenticated: true,
+				IsAdmin: u.Role == models.RoleAdmin, Scopes: u.Scopes,
+				SandboxOnly: u.SandboxOnly, AgentSession: session,
+				Via: "api", ActorKind: kind,
+			}, nil
+		},
+		IdempotencyExtractor: func(r *http.Request) (string, bool) {
+			key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+			return key, key != ""
+		},
+	}
 	apiAuthMiddleware := middleware.NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
 		apiKey, err := apiKeyService.ValidateAPIKey(ctx, rawKey)
 		if err != nil {
@@ -531,6 +616,16 @@ func main() {
 		})
 	})
 
+	// Task 16C: Task 12 product routes. Specific publication/schema paths
+	// MUST stay above the generic /content/{id} and /templates/{id}
+	// routes below so old publish URLs and new publication URLs share
+	// one auth/rate/body/provenance chain with V3 semantics.
+	apiv1.HandleFunc("/page-generation", productAPI.HandleGenerate).Methods("POST")
+	apiv1.HandleFunc("/content/{id}/publications", productAPI.HandleListPublications).Methods("GET")
+	apiv1.HandleFunc("/content/{id}/publications/{publication_id}/rollback", productAPI.HandleRollback).Methods("POST")
+	apiv1.HandleFunc("/content/{id}/publications/{publication_id}", productAPI.HandleGetPublication).Methods("GET")
+	apiv1.HandleFunc("/content/{id}/restore-and-publish", productAPI.HandleRestoreAndPublish).Methods("POST")
+	apiv1.HandleFunc("/content/{id}/revert-live", productAPI.HandleRevertLive).Methods("POST")
 	// Content
 	apiv1.HandleFunc("/content", apiHandler.APIListContent).Methods("GET")
 	apiv1.HandleFunc("/content", apiHandler.APICreateContent).Methods("POST")
@@ -554,6 +649,14 @@ func main() {
 	apiv1.HandleFunc("/content/{id}/versions/{version}/revert", apiHandler.APIRevertContentVersion).Methods("POST")
 
 	// Templates
+	// Task 16C: Task 12 template schema/upgrade routes before generic
+	// /templates/{id} so slug-scoped schema reads never collide with IDs.
+	apiv1.HandleFunc("/templates/upgrade-jobs/{job_id}/run", productAPI.HandleRunUpgradeJob).Methods("POST")
+	apiv1.HandleFunc("/templates/upgrade-jobs/{job_id}", productAPI.HandleGetUpgradeJob).Methods("GET")
+	apiv1.HandleFunc("/templates/{slug}/schema", productAPI.HandleTemplateSchema).Methods("GET")
+	apiv1.HandleFunc("/templates/{slug}/upgrade-preview", productAPI.HandleUpgradePreview).Methods("GET")
+	apiv1.HandleFunc("/templates/{slug}/upgrade-jobs", productAPI.HandleStartUpgradeJob).Methods("POST")
+	apiv1.HandleFunc("/templates/{id}/migrate-slug", productAPI.HandleMigrateSlug).Methods("POST")
 	apiv1.HandleFunc("/templates", apiHandler.APIListTemplates).Methods("GET")
 	apiv1.HandleFunc("/templates", apiHandler.APICreateTemplate).Methods("POST")
 	apiv1.HandleFunc("/templates/{id}", apiHandler.APIGetTemplate).Methods("GET")
@@ -836,6 +939,22 @@ func main() {
 	}
 
 	log.Println("Server stopped")
+}
+
+// publicationBuildSHA reports the build identifier stamped into Publication
+// records (spec §15 renderer/build provenance). Task 16E overrides it with
+// the git SHA via ldflags (-X main.ProductBuildSHA=...); until then it
+// defaults to the build version string (Task 7 contract).
+var ProductBuildSHA string
+
+func publicationBuildSHA() string {
+	if strings.TrimSpace(ProductBuildSHA) != "" {
+		return strings.TrimSpace(ProductBuildSHA)
+	}
+	if v := build.GetVersion(); v != "" {
+		return v
+	}
+	return "dev"
 }
 
 // checkVersionMigration checks if the software version has changed and performs migration tasks

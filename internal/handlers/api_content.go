@@ -19,6 +19,7 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
+	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -563,6 +564,61 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Task 16C: route through PublicationService when wired. External
+	// single publish requires Idempotency-Key (428 when absent); the saga
+	// freezes versions under lock, cuts over atomically and returns the
+	// Publication ID + Public URL. Legacy path preserved when unwired.
+	if a.publicationService != nil {
+		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if key == "" {
+			a.jsonError(w, 428, "Idempotency-Key is required for publish")
+			return
+		}
+		var opID *primitive.ObjectID
+		var opAttempt int64
+		if a.idempotencyService != nil {
+			owner := ""
+			if u := a.getAPIUser(r); u != nil {
+				owner = u.ID
+				if owner == "" {
+					owner = u.Email
+				}
+			}
+			op, berr := a.idempotencyService.Begin(r.Context(), owner, r.Method, r.URL.Path, key, nil)
+			if berr != nil {
+				a.jsonError(w, idemHTTPStatus(berr), sanitizeAPIError(berr))
+				return
+			}
+			if op.Replay && op.Response != nil {
+				a.jsonResponse(w, http.StatusOK, op.Response)
+				return
+			}
+			opID = &op.ID
+			opAttempt = op.Attempt
+		}
+		res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID})
+		if perr != nil {
+			a.jsonError(w, publicationHTTPStatus(perr), sanitizeAPIError(perr))
+			return
+		}
+		if opID != nil && a.idempotencyService != nil {
+			_, _ = a.idempotencyService.Complete(r.Context(), *opID, opAttempt, 200, map[string]any{
+				"success":        true,
+				"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
+				"content_id": res.ContentID.Hex(), "full_path": res.FullPath,
+			}, false)
+		}
+		a.auditLog(r, "content.publish", "content", id.Hex(), map[string]interface{}{
+			"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
+		})
+		a.jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"success": true, "publication_id": res.PublicationID.Hex(),
+			"public_url": res.PublicURL, "full_path": res.FullPath,
+			"content_version": res.ContentVersion,
+		})
+		return
+	}
+
 	if err := a.contentService.PublishContent(r.Context(), id); err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -580,6 +636,17 @@ func (a *APIHandler) APIUnpublishContent(w http.ResponseWriter, r *http.Request)
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
 		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		return
+	}
+
+	// Task 16C: Unpublish is naturally idempotent — no Idempotency-Key.
+	if a.publicationService != nil {
+		if err := a.publicationService.Unpublish(r.Context(), publication.UnpublishRequest{ContentID: id}); err != nil {
+			a.jsonError(w, publicationHTTPStatus(err), sanitizeAPIError(err))
+			return
+		}
+		a.auditLog(r, "content.unpublish", "content", id.Hex(), nil)
+		a.jsonResponse(w, http.StatusOK, map[string]interface{}{"success": true})
 		return
 	}
 
@@ -1198,6 +1265,9 @@ func (a *APIHandler) renderContentWithWarnings(r *http.Request, content *models.
 
 // APIBatchPublishContent publishes multiple content items in one call.
 // Body: {"ids": ["id1","id2",...]} or {"publish_all_drafts": true}
+// Task 16C: routes per item through PublicationService when wired (no raw
+// GenerateStaticPage), requires Idempotency-Key (428 when absent), and
+// returns per-item Publication IDs. Legacy path preserved when unwired.
 func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Request) {
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
@@ -1237,6 +1307,33 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 
 	var published []string
 	var failed []map[string]string
+	var publications []map[string]string
+	if a.publicationService != nil {
+		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if key == "" {
+			a.jsonError(w, 428, "Idempotency-Key is required for batch publish")
+			return
+		}
+		for _, id := range ids {
+			res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id})
+			if perr != nil {
+				failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(perr)})
+			} else {
+				published = append(published, id.Hex())
+				publications = append(publications, map[string]string{
+					"id": id.Hex(), "publication_id": res.PublicationID.Hex(),
+					"public_url": res.PublicURL,
+				})
+			}
+		}
+		a.auditLog(r, "content.batch_publish", "content", "", map[string]interface{}{"count": len(published)})
+		a.jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"published":    published,
+			"publications": publications,
+			"failed":       failed,
+		})
+		return
+	}
 	for _, id := range ids {
 		if err := a.contentService.PublishContent(r.Context(), id); err != nil {
 			failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(err)})
@@ -1663,6 +1760,44 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 		resp["warning"] = "operation timed out; results are partial"
 	}
 	a.jsonResponse(w, http.StatusOK, resp)
+}
+
+// publicationHTTPStatus maps saga errors to HTTP statuses (spec §27).
+// Falls back to 500 for unknown internals; never leaks driver detail
+// (sanitizeAPIError handles the body).
+func publicationHTTPStatus(err error) int {
+	code := publication.CodeOf(err)
+	switch code {
+	case publication.CodeNotFound, "CONTENT_NOT_FOUND":
+		return http.StatusNotFound
+	case "FIELD_VALIDATION_FAILED", "PATH_INVALID", "CONTENT_PUBLISH_FAILED":
+		return 422
+	case "TEMPLATE_NOT_ACTIVE", "TEMPLATE_VERSION_CHANGED", "PATH_CONFLICT",
+		"PUBLICATION_CONFLICT", "PAGE_PUBLISH_IN_PROGRESS", "CONTENT_VERSION_CONFLICT":
+		return http.StatusConflict
+	case "PUBLIC_URL_RESOLUTION_FAILED":
+		return http.StatusFailedDependency
+	default:
+		if publication.IsConflict(err) {
+			return http.StatusConflict
+		}
+		return http.StatusInternalServerError
+	}
+}
+
+// idemHTTPStatus maps idempotency Begin errors to HTTP statuses.
+func idemHTTPStatus(err error) int {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "IDEMPOTENCY_CONFLICT"), strings.Contains(msg, "conflict"):
+		return http.StatusConflict
+	case strings.Contains(msg, "STALE_ATTEMPT"), strings.Contains(msg, "stale"):
+		return http.StatusConflict
+	case strings.Contains(msg, "REQUEST_IN_PROGRESS"), strings.Contains(msg, "in progress"):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // sanitizeAPIError converts internal errors to safe external messages,

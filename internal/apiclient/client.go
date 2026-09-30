@@ -3,6 +3,8 @@ package apiclient
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,6 +43,14 @@ func New(baseURL, apiKey string) *Client {
 
 // do executes an HTTP request with auth and JSON handling
 func (c *Client) do(ctx context.Context, method, path string, body interface{}, result interface{}) error {
+	return c.doWithIdempotencyKey(ctx, method, path, body, result, "")
+}
+
+// doWithIdempotencyKey executes an HTTP request, attaching Idempotency-Key
+// when key != "". Task 16C: externally triggered single/batch publish and
+// rollback REQUIRE the key (server answers 428 without it), so publish
+// callers below always send one.
+func (c *Client) doWithIdempotencyKey(ctx context.Context, method, path string, body interface{}, result interface{}, key string) error {
 	var bodyReader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -58,6 +68,9 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	if c.agentSession != "" {
 		req.Header.Set("X-Agent-Session", c.agentSession)
+	}
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -176,7 +189,45 @@ func (c *Client) RestoreContent(ctx context.Context, id string) error {
 }
 
 func (c *Client) PublishContent(ctx context.Context, id string) error {
-	return c.do(ctx, "POST", "/content/"+id+"/publish", nil, nil)
+	_, err := c.PublishContentResult(ctx, id)
+	return err
+}
+
+// PublishResult is the V3 publish response (spec §16.6): every publish
+// returns its Publication ID + Public URL, never just an ok flag.
+type PublishResult struct {
+	PublicationID  string `json:"publication_id"`
+	PublicURL      string `json:"public_url"`
+	FullPath       string `json:"full_path"`
+	ContentID      string `json:"content_id"`
+	ContentVersion int64  `json:"content_version"`
+}
+
+// newIdempotencyKey mints one random operation key per externally triggered
+// publish/rollback call. Distinct user actions get distinct keys (safe
+// retries of the SAME action must reuse the key via the *WithKey variants).
+func newIdempotencyKey() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// PublishContentResult publishes one item through PublicationService and
+// returns the new Publication ID + Public URL (Task 16C).
+func (c *Client) PublishContentResult(ctx context.Context, id string) (*PublishResult, error) {
+	return c.PublishContentWithKey(ctx, id, newIdempotencyKey())
+}
+
+// PublishContentWithKey publishes with a caller-supplied Idempotency-Key so
+// retries of the same action replay instead of minting duplicates.
+func (c *Client) PublishContentWithKey(ctx context.Context, id, key string) (*PublishResult, error) {
+	var result PublishResult
+	if err := c.doWithIdempotencyKey(ctx, "POST", "/content/"+id+"/publish", nil, &result, key); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 func (c *Client) UnpublishContent(ctx context.Context, id string) error {
@@ -600,13 +651,75 @@ func (c *Client) ReindexEmbeddings(ctx context.Context) (map[string]interface{},
 
 // BatchPublishContent publishes multiple content items at once.
 // Pass a list of IDs, or set PublishAllDrafts = true to publish every draft.
+// Task 16C: sends an Idempotency-Key (server requires it, 428 otherwise).
 func (c *Client) BatchPublishContent(ctx context.Context, ids []string, publishAllDrafts bool) (map[string]interface{}, error) {
+	return c.BatchPublishContentWithKey(ctx, ids, publishAllDrafts, newIdempotencyKey())
+}
+
+// BatchPublishContentWithKey publishes a batch with a caller-supplied
+// Idempotency-Key so retries of the same batch replay per item.
+func (c *Client) BatchPublishContentWithKey(ctx context.Context, ids []string, publishAllDrafts bool, key string) (map[string]interface{}, error) {
 	req := map[string]interface{}{
 		"ids":                ids,
 		"publish_all_drafts": publishAllDrafts,
 	}
 	var result map[string]interface{}
-	if err := c.do(ctx, "POST", "/content/batch-publish", req, &result); err != nil {
+	if err := c.doWithIdempotencyKey(ctx, "POST", "/content/batch-publish", req, &result, key); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// RollbackPublication creates a NEW publication restoring a historical
+// publication's retained bytes (spec §18.5). Requires an Idempotency-Key.
+func (c *Client) RollbackPublication(ctx context.Context, contentID, publicationID, expectedActiveID string) (map[string]interface{}, error) {
+	body := map[string]interface{}{}
+	if expectedActiveID != "" {
+		body["expected_active_id"] = expectedActiveID
+	}
+	var result map[string]interface{}
+	if err := c.doWithIdempotencyKey(ctx, "POST", "/content/"+contentID+"/publications/"+publicationID+"/rollback", body, &result, newIdempotencyKey()); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// RestoreAndPublish re-renders historical version data into a NEW
+// publication (spec §18.4). Requires an Idempotency-Key.
+func (c *Client) RestoreAndPublish(ctx context.Context, contentID string, version int64) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	if err := c.doWithIdempotencyKey(ctx, "POST", "/content/"+contentID+"/restore-and-publish",
+		map[string]interface{}{"version": version}, &result, newIdempotencyKey()); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// RevertLive restores a historical publication's exact bytes into a NEW
+// publication (spec §18.5). Requires an Idempotency-Key.
+func (c *Client) RevertLive(ctx context.Context, contentID, sourcePublicationID string) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	if err := c.doWithIdempotencyKey(ctx, "POST", "/content/"+contentID+"/revert-live",
+		map[string]interface{}{"source_publication_id": sourcePublicationID}, &result, newIdempotencyKey()); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// TemplateSchema fetches the immutable template JSON Schema (Task 12
+// schema endpoint; consumed by the MCP get_template_schema tool).
+func (c *Client) TemplateSchema(ctx context.Context, slug string) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	if err := c.do(ctx, "GET", "/templates/"+url.PathEscape(slug)+"/schema", nil, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ListPublications returns the publication history of one content item.
+func (c *Client) ListPublications(ctx context.Context, contentID string) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	if err := c.do(ctx, "GET", "/content/"+contentID+"/publications", nil, &result); err != nil {
 		return nil, err
 	}
 	return result, nil

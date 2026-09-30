@@ -24,7 +24,10 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/errors"
 	"github.com/jonradoff/lightcms/v7/internal/middleware"
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/product/generation"
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/pathkey"
+	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/csrf"
@@ -95,6 +98,19 @@ type Handler struct {
 	approvalService      *services.ApprovalService
 	maintenanceService   *services.MaintenanceService
 	agentService         *services.AgentService
+	// Task 16C/E: shared V3 publication runtime for the 7 Admin product
+	// handlers (admin_publications.go). Wired once in main.go; nil in unit
+	// tests falls back to the local construction those handlers used pre-16.
+	publicationService *publication.Service
+	idempotencyService *idempotency.Service
+	generationService  *generation.Service
+}
+
+// SetPublicationRuntime wires the shared V3 publication runtime (Task 16C/E).
+func (h *Handler) SetPublicationRuntime(pubs *publication.Service, idem *idempotency.Service, gen *generation.Service) {
+	h.publicationService = pubs
+	h.idempotencyService = idem
+	h.generationService = gen
 }
 
 // SetMaintenanceService wires the maintenance scan service (used by the copilot).
