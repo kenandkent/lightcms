@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -24,12 +23,6 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/middleware"
 	"github.com/jonradoff/lightcms/v7/internal/models"
 	"github.com/jonradoff/lightcms/v7/internal/oauth"
-	"github.com/jonradoff/lightcms/v7/internal/product/generation"
-	"github.com/jonradoff/lightcms/v7/internal/product/httpapi"
-	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
-	"github.com/jonradoff/lightcms/v7/internal/product/publication"
-	"github.com/jonradoff/lightcms/v7/internal/product/publicurl"
-	"github.com/jonradoff/lightcms/v7/internal/product/storage"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/csrf"
@@ -80,6 +73,13 @@ func main() {
 	defer db.Disconnect(context.Background())
 
 	log.Println("Connected to MongoDB successfully")
+
+	// Task 16E: `lightcms migrate-publications --dry-run|--apply` (Task 14
+	// contract) runs inside this same binary — no second migration binary.
+	if len(os.Args) > 1 && os.Args[1] == "migrate-publications" {
+		runMigrationCommand(cfg, db)
+		return
+	}
 
 	// Initialize session store with secure settings
 	sessionStore := sessions.NewCookieStore([]byte(cfg.SessionSecret))
@@ -441,74 +441,33 @@ func main() {
 	apiHandler.SetAgentSessionService(services.NewAgentSessionService(auditService, contentService))
 	apiHandler.SetMaintenanceService(maintenanceService)
 
-	// Task 16C/E: one shared in-process V3 publication runtime. Every
-	// live-changing entry point (REST single/batch publish + rollback,
-	// Admin publish, API client/CLI via REST, background jobs via the
-	// legacy delegation seam) targets this single saga instance; no
-	// caller constructs a parallel store-rooted service.
-	pubStore := storage.NewFilesystemStore("content")
-	pubRepo := publication.NewRepository(db, nil)
-	idemService, err := idempotency.NewService(db, idempotency.Options{})
+	// Task 16E: ONE server construction function owns the entire V3
+	// publication runtime (saga, idempotency, URLs, generation, product
+	// HTTP handlers, scanner, outbox worker). Guards reject unsupported
+	// storage and production standalone Mongo before serving.
+	rt, err := buildPublicationRuntime(context.Background(), db, cfg, runtimeDeps{
+		Cloudflare: cfService, Audit: auditService, Webhooks: webhookService,
+	})
 	if err != nil {
-		log.Fatalf("Failed to init idempotency service: %v", err)
+		log.Fatalf("Failed to build publication runtime: %v", err)
 	}
-	var publicURLs *publicurl.Resolver
-	if baseURL, uerr := url.Parse(cfg.BaseURL); uerr == nil && baseURL != nil {
-		if resolver, rerr := publicurl.NewResolver(baseURL); rerr == nil {
-			publicURLs = resolver
-		} else {
-			log.Printf("Warning: public URL resolver disabled: %v", rerr)
-		}
+	// Ensure the full product index set (idempotency unique key, active
+	// publication pointer, outbox, template versions). Fatal: without
+	// these, same-key retries cannot replay and double-publish.
+	if err := db.EnsureProductIndexes(context.Background()); err != nil {
+		log.Fatalf("Failed to ensure product indexes (run `lightcms migrate-publications --dry-run` for blockers): %v", err)
 	}
-	pubAudit := func(ctx context.Context, action string, fields map[string]any) {
-		auditService.LogAsync(models.AuditLog{Action: action, Resource: "publication", Details: fields})
-	}
-	pubService := publication.NewService(db, pubRepo, pubStore, publication.Options{
-		Idem: idemService,
-		URLs: publicURLs,
-		Purge: func(ctx context.Context, urls []string) error {
-			return cfService.PurgeByURLs(ctx, urls)
-		},
-		Audit:    pubAudit,
-		BuildSHA: publicationBuildSHA(),
-	})
-	genService := generation.NewService(db, generation.Options{
-		Pubs: pubService, PubRepo: pubRepo, Idem: idemService, URLs: publicURLs,
-		Audit: pubAudit,
-	})
 	// Legacy ContentService.PublishContent/UnpublishContent delegate to the
-	// saga (background callers inherit V3 semantics until 16D gives them
-	// stable operation keys).
-	services.SetPublicationPublisher(pubService)
-	// Task 16D: background jobs (scheduler, import auto-publish, copilot,
-	// search-replace auto-republish) publish under stable operation keys.
-	services.SetInternalIdempotency(idemService)
-	apiHandler.SetPublicationRuntime(pubService, idemService, genService)
-	h.SetPublicationRuntime(pubService, idemService, genService)
-	productAPI := &httpapi.Handlers{
-		Gen: genService,
-		ActorExtractor: func(r *http.Request) (generation.Actor, error) {
-			u, ok := auth.UserFromAPIContext(r.Context())
-			if !ok || u == nil {
-				return generation.Actor{}, fmt.Errorf("authentication is required")
-			}
-			kind := "human"
-			session := r.Header.Get("X-Agent-Session")
-			if session != "" {
-				kind = "agent"
-			}
-			return generation.Actor{
-				ID: u.ID, Email: u.Email, Authenticated: true,
-				IsAdmin: u.Role == models.RoleAdmin, Scopes: u.Scopes,
-				SandboxOnly: u.SandboxOnly, AgentSession: session,
-				Via: "api", ActorKind: kind,
-			}, nil
-		},
-		IdempotencyExtractor: func(r *http.Request) (string, bool) {
-			key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-			return key, key != ""
-		},
-	}
+	// saga; background jobs publish under stable operation keys (16D).
+	services.SetPublicationPublisher(rt.Pubs)
+	services.SetInternalIdempotency(rt.Idem)
+	apiHandler.SetPublicationRuntime(rt.Pubs, rt.Idem, rt.Gen)
+	h.SetPublicationRuntime(rt.Pubs, rt.Idem, rt.Gen)
+	productAPI := rt.ProductAPI
+	// Durable workers run in this same process and stop with bgCtx:
+	// outbox delivery (webhook retries) and the recovery/GC scanner.
+	go rt.Outbox.Run(bgCtx)
+	go rt.Scanner.Run(bgCtx)
 	apiAuthMiddleware := middleware.NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
 		apiKey, err := apiKeyService.ValidateAPIKey(ctx, rawKey)
 		if err != nil {

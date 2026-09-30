@@ -583,6 +583,10 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		ContentID: plan.contentID, ContentVersion: plan.contentVersion,
 		TemplateID: plan.tv.TemplateID, TemplateVersionID: plan.tv.ID, TemplateVersion: plan.tv.Version,
 		FullPath: plan.fullPath, ContentHash: plan.recordHash,
+		// Task 16E: persist the resolved public URL on the record so the
+		// activation-transaction outbox insert carries it (no post-commit
+		// join required for delivery).
+		PublicURL:          plan.publicURL,
 		StorageProvider:    "filesystem",
 		StoragePath:        s.store.ImmutablePath(plan.contentID, plan.pubID),
 		LogicalPublishedAt: plan.logicalAt,

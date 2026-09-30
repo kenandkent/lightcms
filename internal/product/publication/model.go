@@ -110,6 +110,10 @@ type Publication struct {
 	TemplateVersion   int64              `bson:"template_version,omitempty" json:"template_version,omitempty"`
 	FullPath          string             `bson:"full_path" json:"full_path"`
 	ContentHash       string             `bson:"content_hash" json:"content_hash"`
+	// PublicURL is the resolved canonical public URL frozen at plan time
+	// (Task 16E): activation-transaction outbox inserts carry it so
+	// delivery never joins it back.
+	PublicURL string `bson:"public_url,omitempty" json:"public_url,omitempty"`
 
 	StorageProvider string       `bson:"storage_provider,omitempty" json:"storage_provider,omitempty"`
 	StoragePath     string       `bson:"storage_path,omitempty" json:"storage_path,omitempty"`
