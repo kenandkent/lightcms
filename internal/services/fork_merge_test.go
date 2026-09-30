@@ -132,10 +132,15 @@ func TestForkService_Merge_Errors(t *testing.T) {
 		t.Fatalf("insert fork-only page: %v", err)
 	}
 	db.SetFaultHook(testutil.FailOp("InsertOne"))
-	_, mergeErr := fs.Merge(ctx, fork.ID, uid, "x@x.com")
+	res, mergeErr := fs.Merge(ctx, fork.ID, uid, "x@x.com")
 	db.SetFaultHook(nil)
-	if mergeErr == nil {
-		t.Error("expected merge error when live-page insert fails")
+	// Task 16B: per-page partial results — failures land in Failed, no hard
+	// error aborts unrelated pages.
+	if mergeErr != nil {
+		t.Fatalf("unexpected hard merge error (want partial Failed): %v", mergeErr)
+	}
+	if res == nil || len(res.Failed) == 0 {
+		t.Error("expected partial merge failure in Failed when live-page insert fails")
 	}
 
 	// UpdateOne failure while updating an existing live page.
@@ -148,10 +153,13 @@ func TestForkService_Merge_Errors(t *testing.T) {
 		t.Fatalf("ForkPage: %v", err)
 	}
 	db.SetFaultHook(testutil.FailOp("UpdateOne"))
-	_, mergeErr = fs.Merge(ctx, fork2.ID, uid, "x@x.com")
+	res2, mergeErr := fs.Merge(ctx, fork2.ID, uid, "x@x.com")
 	db.SetFaultHook(nil)
-	if mergeErr == nil {
-		t.Error("expected merge error when live-page update fails")
+	if mergeErr != nil {
+		t.Fatalf("unexpected hard merge error (want partial Failed): %v", mergeErr)
+	}
+	if res2 == nil || len(res2.Failed) == 0 {
+		t.Error("expected partial merge failure in Failed when live-page update fails")
 	}
 }
 

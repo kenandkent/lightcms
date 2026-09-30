@@ -71,18 +71,14 @@ func (db *DB) createIndexes(ctx context.Context) error {
 	// Drop the old unpartitioned index first (ignore error if it doesn't exist).
 	// Drop both the old single-field index and any previous partial-index attempts.
 	db.database.Collection("content").Indexes().DropOne(ctx, "full_path_1")
-	// Compound unique index on (full_path, fork_id).
-	// Live pages have no fork_id (stored as null); fork copies have an ObjectID.
-	// The compound key ensures live pages can't duplicate full_path, while a live
-	// page and its fork copy can share the same full_path without conflicting.
-	_, err := db.database.Collection("content").Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{
-			{Key: "full_path", Value: 1},
-			{Key: "fork_id", Value: 1},
-		},
-		Options: options.Index().SetUnique(true).SetSparse(true),
-	})
-	if err != nil {
+	// Task 16E (Task 14 migration contract): the legacy UNIQUE
+	// (full_path, fork_id) SPARSE index is DROP-ONLY here. The migration
+	// drops it after the new canonical index is verified; Connect must NOT
+	// recreate it on restart, or the migration's post-condition breaks.
+	// Uniqueness is enforced by the canonical partial-unique index below
+	// (every Task 2+ write carries canonical_full_path/path_scope).
+	db.database.Collection("content").Indexes().DropOne(ctx, "full_path_1_fork_id_1")
+	if err := db.ensureCanonicalContentIndex(ctx); err != nil {
 		return err
 	}
 
@@ -90,7 +86,7 @@ func (db *DB) createIndexes(ctx context.Context) error {
 	db.database.Collection("content").Indexes().DropOne(ctx, "slug_1")
 
 	// Content slug index (non-unique now, since same slug can be in different folders)
-	_, err = db.database.Collection("content").Indexes().CreateOne(ctx, mongo.IndexModel{
+	_, err := db.database.Collection("content").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "slug", Value: 1}},
 	})
 	if err != nil {
@@ -492,6 +488,38 @@ func (db *DB) WithTransaction(ctx context.Context, fn func(mongo.SessionContext)
 // missing files) before invoking it. It does NOT drop the legacy
 // UNIQUE(full_path, fork_id) index; Task 14 drops that only after the new
 // canonical index is verified.
+// ensureCanonicalContentIndex creates the Task 2 canonical uniqueness
+// index — UNIQUE(canonical_full_path, path_scope) with partial filter
+// {path_active: true} — when missing. Same model as EnsureProductIndexes
+// item 1 (same name: CreateOne is idempotent). Called by createIndexes so
+// every boot enforces canonical uniqueness even before the full product
+// index set is ensured; legacy rows without canonical fields are excluded
+// by the partial filter and never conflict.
+func (db *DB) ensureCanonicalContentIndex(ctx context.Context) error {
+	_, err := db.database.Collection("content").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "canonical_full_path", Value: 1}, {Key: "path_scope", Value: 1}},
+		Options: options.Index().
+			SetName("content_canonical_path_scope_unique").
+			SetUnique(true).
+			SetPartialFilterExpression(bson.M{"path_active": true}),
+	})
+	return err
+}
+
+// IsReplicaSet reports whether the connected MongoDB topology supports
+// multi-document transactions (spec: production AND test must run replica
+// set mode). It runs the hello command and requires a replica set name.
+func (db *DB) IsReplicaSet(ctx context.Context) (bool, error) {
+	var hello struct {
+		SetName string `bson:"setName"`
+		Msg     string `bson:"msg"`
+	}
+	if err := db.database.RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello); err != nil {
+		return false, err
+	}
+	return hello.SetName != "", nil
+}
+
 func (db *DB) EnsureProductIndexes(ctx context.Context) error {
 	create := func(collection string, model mongo.IndexModel) error {
 		_, err := db.database.Collection(collection).Indexes().CreateOne(ctx, model)

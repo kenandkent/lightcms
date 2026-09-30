@@ -29,10 +29,25 @@ func NewForkService(db *database.DB, cs *ContentService) *ForkService {
 }
 
 // MergeResult summarises what happened when a fork was merged into live.
+// Task 16B (spec §12.6): draft merge only — never publishes. Published merges
+// land in RequiresPublish; canonical HTML is untouched until explicit Publish.
 type MergeResult struct {
-	Updated   int
-	Created   int
-	Conflicts []ForkConflict
+	Updated         int
+	Created         int
+	Conflicts       []ForkConflict
+	ContentIDs      []string
+	RequiresPublish []string
+	Failed          []MergeFailure
+}
+
+// MergeConflict is the spec §12.6 conflict detail alias (fork-wins, reported).
+type MergeConflict = ForkConflict
+
+// MergeFailure records a per-page merge failure; other pages still commit
+// (spec §12.6 per-page partial results).
+type MergeFailure struct {
+	FullPath string `json:"full_path"`
+	Error    string `json:"error"`
 }
 
 // ForkConflict records a page that was modified on the live site after the fork was made.
@@ -194,6 +209,11 @@ func (s *ForkService) RemovePage(ctx context.Context, forkID primitive.ObjectID,
 
 // Merge merges all fork pages into live content and marks the fork as merged.
 // Returns a MergeResult summarising what was created, updated, and any conflicts.
+// Task 16B (spec §12.3, §12.6, §16.6): draft merge only — merges data and
+// creates ContentVersions via the draft-only ContentService, preserves the
+// active Publication and canonical bytes, and returns requires_publish.
+// It never calls GenerateStaticPage, never deletes canonical files, and never
+// publishes. Each page commits independently (partial results on failure).
 func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, mergedByID primitive.ObjectID, mergedByEmail string) (*MergeResult, error) {
 	fork, err := s.GetByID(ctx, forkID)
 	if err != nil {
@@ -219,26 +239,36 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 			"deleted":   bson.M{"$ne": true},
 		}, &livePage)
 
-		now := time.Now()
-
 		if liveErr != nil {
-			// No live page — create new
+			// No live page — create new unpublished draft via the
+			// draft-only service (versioned, no live file write).
 			newPage := forkPage
-			newPage.ID = primitive.NewObjectID()
+			newPage.ID = primitive.ObjectID{}
 			newPage.ForkID = nil
 			newPage.BaseUpdatedAt = nil
-			newPage.CreatedAt = now
-			newPage.UpdatedAt = now
-			if _, err := s.db.InsertOne(ctx, "content", &newPage); err != nil {
-				return nil, fmt.Errorf("create live page %s: %w", forkPage.FullPath, err)
+			newPage.Published = false
+			newPage.PublishedAt = nil
+			if s.contentService != nil {
+				if err := s.contentService.CreateContent(ctx, &newPage, "fork merge"); err != nil {
+					result.Failed = append(result.Failed, MergeFailure{FullPath: forkPage.FullPath, Error: err.Error()})
+					continue
+				}
+			} else {
+				newPage.ID = primitive.NewObjectID()
+				now := time.Now()
+				newPage.CreatedAt = now
+				newPage.UpdatedAt = now
+				if _, err := s.db.InsertOne(ctx, "content", &newPage); err != nil {
+					result.Failed = append(result.Failed, MergeFailure{FullPath: forkPage.FullPath, Error: err.Error()})
+					continue
+				}
 			}
-			// Regenerate static file if published
-			if newPage.Published && s.contentService != nil {
-				_ = s.contentService.GenerateStaticPage(ctx, &newPage)
-			}
+			// Task 16B: no GenerateStaticPage — draft only.
 			result.Created++
+			result.ContentIDs = append(result.ContentIDs, newPage.ID.Hex())
+			result.RequiresPublish = append(result.RequiresPublish, newPage.ID.Hex())
 		} else {
-			// Live page exists — check for conflict
+			// Live page exists — check for conflict (fork wins, recorded).
 			if forkPage.BaseUpdatedAt != nil && livePage.UpdatedAt.After(*forkPage.BaseUpdatedAt) {
 				result.Conflicts = append(result.Conflicts, ForkConflict{
 					ForkItem:  forkPage,
@@ -248,41 +278,61 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 				// Still merge (fork wins), just record the conflict
 			}
 
-			// Update live page fields from fork
-			update := bson.M{"$set": bson.M{
-				"title":            forkPage.Title,
-				"slug":             forkPage.Slug,
-				"folder_id":        forkPage.FolderID,
-				"folder_path":      forkPage.FolderPath,
-				"full_path":        forkPage.FullPath,
-				"category":         forkPage.Category,
-				"tags":             forkPage.Tags,
-				"meta_description": forkPage.MetaDescription,
-				"og_image":         forkPage.OGImage,
-				"data":             forkPage.Data,
-				"use_header":       forkPage.UseHeader,
-				"use_footer":       forkPage.UseFooter,
-				"use_theme":        forkPage.UseTheme,
-				"raw_mode":         forkPage.RawMode,
-				"template_id":      forkPage.TemplateID,
-				"template_name":    forkPage.TemplateName,
-				"updated_at":       now,
-			}}
-			if err := s.db.UpdateOne(ctx, "content", bson.M{"_id": livePage.ID}, update); err != nil {
-				return nil, fmt.Errorf("update live page %s: %w", forkPage.FullPath, err)
+			// Draft merge through the versioned service: preserves the
+			// active Publication + canonical bytes, marks
+			// has_unpublished_changes. Never via raw UpdateOne + generate.
+			merged := livePage
+			merged.Title = forkPage.Title
+			merged.Slug = forkPage.Slug
+			merged.FolderID = forkPage.FolderID
+			merged.FolderPath = forkPage.FolderPath
+			merged.FullPath = forkPage.FullPath
+			merged.Category = forkPage.Category
+			merged.Tags = forkPage.Tags
+			merged.MetaDescription = forkPage.MetaDescription
+			merged.OGImage = forkPage.OGImage
+			merged.Data = forkPage.Data
+			merged.UseHeader = forkPage.UseHeader
+			merged.UseFooter = forkPage.UseFooter
+			merged.UseTheme = forkPage.UseTheme
+			merged.RawMode = forkPage.RawMode
+			merged.TemplateID = forkPage.TemplateID
+			merged.TemplateName = forkPage.TemplateName
+			if s.contentService != nil {
+				if err := s.contentService.UpdateContent(ctx, &merged, "fork merge"); err != nil {
+					result.Failed = append(result.Failed, MergeFailure{FullPath: forkPage.FullPath, Error: err.Error()})
+					continue
+				}
+			} else {
+				now := time.Now()
+				update := bson.M{"$set": bson.M{
+					"title":            forkPage.Title,
+					"slug":             forkPage.Slug,
+					"folder_id":        forkPage.FolderID,
+					"folder_path":      forkPage.FolderPath,
+					"full_path":        forkPage.FullPath,
+					"category":         forkPage.Category,
+					"tags":             forkPage.Tags,
+					"meta_description": forkPage.MetaDescription,
+					"og_image":         forkPage.OGImage,
+					"data":             forkPage.Data,
+					"use_header":       forkPage.UseHeader,
+					"use_footer":       forkPage.UseFooter,
+					"use_theme":        forkPage.UseTheme,
+					"raw_mode":         forkPage.RawMode,
+					"template_id":      forkPage.TemplateID,
+					"template_name":    forkPage.TemplateName,
+					"updated_at":       now,
+				}}
+				if err := s.db.UpdateOne(ctx, "content", bson.M{"_id": livePage.ID}, update); err != nil {
+					result.Failed = append(result.Failed, MergeFailure{FullPath: forkPage.FullPath, Error: err.Error()})
+					continue
+				}
 			}
-			// Regenerate static file if published
-			if livePage.Published && s.contentService != nil {
-				livePage.Title = forkPage.Title
-				livePage.Data = forkPage.Data
-				livePage.UseHeader = forkPage.UseHeader
-				livePage.UseFooter = forkPage.UseFooter
-				livePage.UseTheme = forkPage.UseTheme
-				livePage.TemplateID = forkPage.TemplateID
-				livePage.TemplateName = forkPage.TemplateName
-				_ = s.contentService.GenerateStaticPage(ctx, &livePage)
-			}
+			// Task 16B: no GenerateStaticPage — live bytes unchanged.
 			result.Updated++
+			result.ContentIDs = append(result.ContentIDs, livePage.ID.Hex())
+			result.RequiresPublish = append(result.RequiresPublish, livePage.ID.Hex())
 		}
 	}
 

@@ -205,6 +205,21 @@ func (s *ImportService) writeLog(ctx context.Context, jobID primitive.ObjectID, 
 // RSS import
 // ---------------------------------------------------------------------------
 
+// autoPublish publishes one freshly created import page through
+// PublicationService under a stable per-job operation key (Task 16D:
+// import/<jobID>/<contentID>). A job resume replays the cached completion
+// instead of minting a duplicate Publication/outbox row; failures are logged
+// to the import job log.
+func (s *ImportService) autoPublish(ctx context.Context, job *models.ImportJob, content *models.Content, fullPath string, logLine func(models.ImportLogLevel, string, string)) {
+	key := ImportOpKey(job.ID, content.ID)
+	if err := s.contentService.PublishInternal(ctx, content.ID,
+		"import", "/internal/imports/"+job.ID.Hex()+"/publish", key); err != nil {
+		logLine(models.ImportLogError, fmt.Sprintf("Auto-publish failed: %v", err), fullPath)
+		return
+	}
+	logLine(models.ImportLogInfo, "Auto-published", fullPath)
+}
+
 // RunRSSImport runs an RSS import for a configured source.
 // It creates a job record immediately and processes items asynchronously.
 func (s *ImportService) RunRSSImport(ctx context.Context, sourceID primitive.ObjectID, triggeredBy string) (*models.ImportJob, error) {
@@ -305,7 +320,9 @@ func (s *ImportService) RunRSSImport(ctx context.Context, sourceID primitive.Obj
 					created++
 					logLine(models.ImportLogInfo, "Created", fullPath)
 					if src.AutoPublish {
-						s.contentService.PublishContent(bgCtx, content.ID) //nolint:errcheck
+						// Task 16D: stable per-page operation key within this
+						// import job — a job resume replays, never duplicates.
+						s.autoPublish(bgCtx, job, content, fullPath, logLine)
 					}
 				}
 			}
@@ -455,7 +472,7 @@ func (s *ImportService) RunMarkdownImport(ctx context.Context, pages []importer.
 					logLine(models.ImportLogInfo, "Created", fullPath)
 					pubStr := importer.FrontmatterGet(page.Frontmatter, "published")
 					if autoPublish || pubStr == "true" {
-						s.contentService.PublishContent(bgCtx, content.ID) //nolint:errcheck
+						s.autoPublish(bgCtx, job, content, fullPath, logLine)
 					}
 				}
 			}
@@ -554,7 +571,7 @@ func (s *ImportService) RunCSVImport(ctx context.Context, records []importer.CSV
 					created++
 					logLine(models.ImportLogInfo, fmt.Sprintf("Row %d created", rec.Row), fullPath)
 					if autoPublish {
-						s.contentService.PublishContent(bgCtx, content.ID) //nolint:errcheck
+						s.autoPublish(bgCtx, job, content, fullPath, logLine)
 					}
 				}
 			}

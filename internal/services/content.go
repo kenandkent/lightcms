@@ -17,6 +17,7 @@ import (
 
 	"github.com/jonradoff/lightcms/v7/internal/database"
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/product/pathkey"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 
 	"github.com/microcosm-cc/bluemonday"
@@ -204,7 +205,55 @@ func (s *ContentService) TriggerIndexRegen() {
 	s.triggerIndexRegen()
 }
 
+// pathScopeFor returns the V3 path scope for a content row: "live" for main
+// content, the fork ObjectID hex for fork copies (spec §12.8).
+func pathScopeFor(c *models.Content) string {
+	if c.ForkID != nil && !c.ForkID.IsZero() {
+		return c.ForkID.Hex()
+	}
+	return "live"
+}
+
+// refreshRequiresPublish recomputes the transient RequiresPublish projection
+// (spec §12.7): main rows need an explicit Publish when they are unpublished
+// drafts or live rows with unpublished changes; fork copies never publish
+// directly (they merge first).
+func refreshRequiresPublish(c *models.Content) {
+	if c.ForkID != nil {
+		c.RequiresPublish = false
+		return
+	}
+	c.RequiresPublish = !c.Published || c.HasUnpublishedChanges
+}
+
+// setCanonicalFields stamps canonical path + scope + active + version defaults
+// for a new content row. Canonical errors leave fields empty; the DB unique
+// index plus findPathCaseConflict remain the final arbiters.
+func setCanonicalFields(c *models.Content) {
+	if canon, err := pathkey.Canonical(c.FullPath); err == nil {
+		c.CanonicalFullPath = canon
+	} else {
+		c.CanonicalFullPath = ""
+	}
+	c.PathScope = pathScopeFor(c)
+	c.PathActive = !c.Deleted
+	if c.CurrentVersion <= 0 {
+		c.CurrentVersion = 1
+	}
+	if c.ForkID != nil {
+		c.HasUnpublishedChanges = false
+	} else {
+		c.HasUnpublishedChanges = false
+	}
+}
+
 // CreateContent creates new content and saves the initial version
+// Task 16A (spec §12.5, §12.7): draft-only data/version operation. It never
+// writes or deletes live static files and never fires a live publish webhook.
+// Only PublicationService may change live output, Published projection and
+// active Publication state. Compatibility fields Published/PublishedAt are
+// stored as projections; HasUnpublishedChanges/RequiresPublish signal that an
+// explicit Publish is required.
 func (s *ContentService) CreateContent(ctx context.Context, content *models.Content, versionComment ...string) error {
 	now := time.Now()
 	content.CreatedAt = now
@@ -230,6 +279,10 @@ func (s *ContentService) CreateContent(ctx context.Context, content *models.Cont
 	// Extract internal links
 	content.InternalLinks = s.extractInternalLinks(content)
 
+	// V3 canonical path bookkeeping (spec §12.8).
+	setCanonicalFields(content)
+	refreshRequiresPublish(content)
+
 	// Insert content
 	id, err := s.db.InsertOne(ctx, "content", content)
 	if err != nil {
@@ -246,13 +299,9 @@ func (s *ContentService) CreateContent(ctx context.Context, content *models.Cont
 		return fmt.Errorf("failed to save initial version: %w", err)
 	}
 
-	// Generate static page if published (fork copies never touch static
-	// files or the embedding index — they go live only on merge)
-	if content.Published && content.ForkID == nil {
-		if err := s.GenerateStaticPage(ctx, content); err != nil {
-			// Log but don't fail
-			fmt.Printf("Warning: failed to generate static page: %v\n", err)
-		}
+	// Task 16A: draft-only — never GenerateStaticPage/removeStaticPage here.
+	// Embedding/keyword/index work is search-index maintenance, not live files.
+	if content.ForkID == nil {
 		s.triggerEmbedding(content.ID)
 	}
 
@@ -323,7 +372,8 @@ type BulkCreateResult struct {
 
 // BulkCreateContent creates multiple content items in a single batch.
 // Uses unordered InsertMany so one failure doesn't abort the rest.
-// HTML generation for published items runs in parallel (bounded to 10 goroutines).
+// Task 16A: draft-only — no static HTML generation for published items.
+// Only data/version rows plus search-index maintenance.
 func (s *ContentService) BulkCreateContent(ctx context.Context, items []*models.Content, versionComment string) []BulkCreateResult {
 	results := make([]BulkCreateResult, len(items))
 	now := time.Now()
@@ -346,6 +396,8 @@ func (s *ContentService) BulkCreateContent(ctx context.Context, items []*models.
 
 		mergeInlineTags(c)
 		c.InternalLinks = s.extractInternalLinks(c)
+		setCanonicalFields(c)
+		refreshRequiresPublish(c)
 
 		docs = append(docs, c)
 		validIndices = append(validIndices, i)
@@ -403,24 +455,15 @@ func (s *ContentService) BulkCreateContent(ctx context.Context, items []*models.
 	}
 
 	// Parallel HTML generation for published items (bounded concurrency)
-	sem := make(chan struct{}, 10)
-	var wg sync.WaitGroup
+	// Task 16A: removed — draft-only. Published items still get search-index
+	// maintenance but no static file writes. Explicit Publish via
+	// PublicationService is required to change live output.
 	for i, c := range items {
-		if !results[i].Success || !c.Published {
+		if !results[i].Success || c.ForkID != nil {
 			continue
 		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(content *models.Content) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := s.GenerateStaticPage(ctx, content); err != nil {
-				fmt.Printf("Warning: bulk create static page gen failed for %s: %v\n", content.FullPath, err)
-			}
-			s.triggerEmbedding(content.ID)
-		}(c)
+		s.triggerEmbedding(c.ID)
 	}
-	wg.Wait()
 
 	// Fire webhook events and trigger index rebuild once
 	if s.webhookService != nil {
@@ -439,6 +482,11 @@ func (s *ContentService) BulkCreateContent(ctx context.Context, items []*models.
 }
 
 // UpdateContent updates content and saves a new version with an optional comment
+// Task 16A (spec §12.5, §12.7): draft-only data/version operation. It updates
+// the Content row, creates a ContentVersion, refreshes canonical bookkeeping
+// and marks HasUnpublishedChanges when a live page exists. It never writes or
+// deletes live static files and never fires live publish/unpublish webhooks or
+// Cloudflare purges — only PublicationService does that.
 func (s *ContentService) UpdateContent(ctx context.Context, content *models.Content, versionComment ...string) error {
 	// Get the original content for versioning
 	var original models.Content
@@ -470,6 +518,38 @@ func (s *ContentService) UpdateContent(ctx context.Context, content *models.Cont
 	// Extract internal links
 	content.InternalLinks = s.extractInternalLinks(content)
 
+	// V3 canonical bookkeeping + CAS version allocation (spec §12.8, §13).
+	if canon, err := pathkey.Canonical(content.FullPath); err == nil {
+		content.CanonicalFullPath = canon
+	}
+	content.PathScope = pathScopeFor(content)
+	content.PathActive = !content.Deleted
+	newVersion := original.CurrentVersion + 1
+	if newVersion < 1 {
+		if n, cerr := s.db.Count(ctx, "content_versions", bson.M{"content_id": content.ID}); cerr == nil {
+			newVersion = n + 1
+			if n == 0 {
+				// saveVersion will persist original as v1; new write is v2.
+				newVersion = 2
+			}
+		} else {
+			newVersion = 1
+		}
+		if newVersion < 1 {
+			newVersion = 1
+		}
+	}
+	content.CurrentVersion = newVersion
+	// Any edit through this path leaves live bytes untouched, so a live page
+	// now has unpublished changes awaiting an explicit Publish. Fork copies
+	// are never live.
+	if content.ForkID == nil && (original.Published || content.Published) {
+		content.HasUnpublishedChanges = true
+	} else {
+		content.HasUnpublishedChanges = false
+	}
+	refreshRequiresPublish(content)
+
 	// Update content
 	update := bson.M{
 		"$set": bson.M{
@@ -480,6 +560,11 @@ func (s *ContentService) UpdateContent(ctx context.Context, content *models.Cont
 			"folder_id":        content.FolderID,
 			"folder_path":      content.FolderPath,
 			"full_path":        content.FullPath,
+			"canonical_full_path": content.CanonicalFullPath,
+			"path_scope":          content.PathScope,
+			"path_active":         content.PathActive,
+			"current_version":     content.CurrentVersion,
+			"has_unpublished_changes": content.HasUnpublishedChanges,
 			"category":         content.Category,
 			"tags":             content.Tags,
 			"meta_description": content.MetaDescription,
@@ -516,18 +601,11 @@ func (s *ContentService) UpdateContent(ctx context.Context, content *models.Cont
 	}
 
 	// Generate or remove static page based on publish status.
-	// Fork copies share full_path with live pages — never touch static
-	// files or the embedding index on their behalf.
-	if content.ForkID != nil {
-		// no static/embedding side effects for sandboxed content
-	} else if content.Published {
-		if err := s.GenerateStaticPage(ctx, content); err != nil {
-			fmt.Printf("Warning: failed to generate static page: %v\n", err)
-		}
+	// Task 16A: draft-only — never touch live static files here. Fork copies
+	// never had side effects; now live rows don't either. Search-index
+	// maintenance (embedding/keywords) is not a live-file write.
+	if content.ForkID == nil {
 		s.triggerEmbedding(content.ID)
-	} else {
-		// Remove static page if unpublished
-		s.removeStaticPage(content.FullPath)
 	}
 
 	// Rebuild search keyword cache when content changes
@@ -647,6 +725,9 @@ func (s *ContentService) UnpublishContent(ctx context.Context, id primitive.Obje
 }
 
 // DeleteContent soft-deletes content
+// Task 16A: draft-only — releases the canonical path (path_active=false) but
+// never deletes live static files directly. Live removal happens only through
+// PublicationService.Unpublish; the recovery scanner converges any leftover.
 func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectID) error {
 	var content models.Content
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &content); err != nil {
@@ -659,6 +740,7 @@ func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectI
 			"deleted":    true,
 			"deleted_at": now,
 			"updated_at": now,
+			"path_active": false,
 		},
 	}
 
@@ -666,8 +748,7 @@ func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectI
 		return fmt.Errorf("failed to delete content: %w", err)
 	}
 
-	// Remove static page
-	s.removeStaticPage(content.FullPath)
+	// Task 16A: no removeStaticPage here — live bytes stay until Unpublish.
 
 	// Rebuild search keyword cache
 	s.triggerKeywordRebuild()
@@ -684,18 +765,32 @@ func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectI
 		})
 	}
 	// Purge Cloudflare cache
-	if s.cfService != nil {
-		go s.cfService.PurgeByURLs(context.Background(), []string{content.FullPath})
-	}
+	// Task 16A: no live purge on draft delete — PublicationService owns
+	// post-activation purge. Legacy direct purge removed.
+	_ = content
 
 	return nil
 }
 
 // RestoreContent restores soft-deleted content
+// Task 16A: draft-only — re-claims the path (path_active=true) with a
+// PATH_CONFLICT check, but never regenerates live files. Publish is explicit.
 func (s *ContentService) RestoreContent(ctx context.Context, id primitive.ObjectID) error {
+	var probe models.Content
+	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &probe); err != nil {
+		// Legacy parity: restoring a nonexistent ID matched 0 docs and
+		// returned success (UpdateOne no-op + FindOne early-nil). Preserve
+		// that contract; explicit 404s belong to the HTTP layer.
+		return nil
+	}
+	if conflict := s.findPathCaseConflict(ctx, probe.FullPath, id); conflict != nil {
+		return fmt.Errorf("path %s conflicts with existing page %s — paths are case-insensitive", probe.FullPath, conflict.FullPath)
+	}
 	update := bson.M{
 		"$set": bson.M{
 			"deleted":    false,
+			"path_active": true,
+			"has_unpublished_changes": probe.Published,
 			"updated_at": time.Now(),
 		},
 		"$unset": bson.M{
@@ -707,15 +802,7 @@ func (s *ContentService) RestoreContent(ctx context.Context, id primitive.Object
 		return fmt.Errorf("failed to restore content: %w", err)
 	}
 
-	// Regenerate static page if published
-	var content models.Content
-	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &content); err != nil {
-		return nil // Content restored, just can't regenerate
-	}
-
-	if content.Published {
-		s.GenerateStaticPage(ctx, &content)
-	}
+	// Task 16A: no GenerateStaticPage here.
 
 	// Rebuild search keyword cache
 	s.triggerKeywordRebuild()
@@ -1009,6 +1096,10 @@ func (s *ContentService) GetVersion(ctx context.Context, contentID primitive.Obj
 }
 
 // RevertToVersion reverts content to a previous version with an optional comment
+// Task 16A (spec §13): restore-as-draft only. It recovers edit state via
+// UpdateContent (draft-only, live unchanged) and never touches the active
+// Publication. Restore-and-publish / revert-live are separate explicit actions
+// owned by Generation/PublicationService.
 func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitive.ObjectID, version int, versionComment ...string) error {
 	// Get the version to revert to
 	v, err := s.GetVersion(ctx, contentID, version)
@@ -1022,7 +1113,8 @@ func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitiv
 		return fmt.Errorf("content not found: %w", err)
 	}
 
-	// Update content with version data
+	// Update content with version data (draft only: preserve live projection;
+	// Published/PublishedAt change only through PublicationService).
 	content.TemplateID = v.TemplateID
 	content.TemplateName = v.TemplateName
 	content.Title = v.Title
@@ -1035,8 +1127,6 @@ func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitiv
 	content.MetaDescription = v.MetaDescription
 	content.OGImage = v.OGImage
 	content.Data = v.Data
-	content.Published = v.Published
-	content.PublishedAt = v.PublishedAt
 	content.UseHeader = v.UseHeader
 	content.UseFooter = v.UseFooter
 	content.UseTheme = v.UseTheme
@@ -1047,6 +1137,9 @@ func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitiv
 }
 
 // saveVersion saves a new version of the content with an optional comment
+// Task 16A: honors content.CurrentVersion allocated by the caller (CAS-style)
+// and falls back to Count()+1 for legacy callers. Provenance stamping is
+// preserved (spec §12.5 audit/provenance).
 func (s *ContentService) saveVersion(ctx context.Context, content *models.Content, original *models.Content, comment string) error {
 	// Get the current version count
 	count, err := s.db.Count(ctx, "content_versions", bson.M{"content_id": content.ID})
@@ -1086,6 +1179,17 @@ func (s *ContentService) saveVersion(ctx context.Context, content *models.Conten
 	}
 
 	version := count + 1
+	if content.CurrentVersion > 0 {
+		// Caller-allocated CAS version wins when it advances history;
+		// otherwise fall back to count+1 to avoid duplicate-key writes.
+		if content.CurrentVersion > count {
+			version = content.CurrentVersion
+		} else if count == 0 {
+			version = content.CurrentVersion
+		}
+	}
+	// Keep the row's CurrentVersion convergent with the version we persist.
+	content.CurrentVersion = version
 
 	modifiedByEmail := EditorEmailFromContext(ctx)
 	prov, _ := ProvenanceFromContext(ctx)
@@ -1956,92 +2060,19 @@ func renderSnippet(snippetHTML string, item models.Content) (string, error) {
 
 // RegenerateIndexPages regenerates all published pages whose templates contain lc:query directives.
 // Called after any content mutation so index pages stay in sync.
+// Task 16B: disabled for live writes — V3 index pages update only through
+// explicit Publish (PublicationService). Retained as a no-op so legacy
+// trigger sites keep compiling; the trigger itself is now a no-op for files.
 func (s *ContentService) RegenerateIndexPages(ctx context.Context) {
-	// Find all templates with lc:query directives
-	var templates []models.Template
-	if err := s.db.FindAll(ctx, "templates", bson.M{}, &templates); err != nil {
-		return
-	}
-
-	var indexTemplateIDs []primitive.ObjectID
-	for _, tmpl := range templates {
-		if strings.Contains(tmpl.HTMLLayout, "lc:query") {
-			indexTemplateIDs = append(indexTemplateIDs, tmpl.ID)
-		}
-	}
-	if len(indexTemplateIDs) == 0 {
-		return
-	}
-
-	// Find all published pages using index templates
-	var pages []models.Content
-	if err := s.db.FindAll(ctx, "content", bson.M{
-		"template_id": bson.M{"$in": indexTemplateIDs},
-		"published":   true,
-		"deleted":     bson.M{"$ne": true},
-	}, &pages); err != nil {
-		return
-	}
-
-	var purgedPaths []string
-	for i := range pages {
-		if err := s.GenerateStaticPage(ctx, &pages[i]); err != nil {
-			fmt.Printf("Warning: failed to regenerate index page %s: %v\n", pages[i].FullPath, err)
-		} else {
-			purgedPaths = append(purgedPaths, pages[i].FullPath)
-		}
-	}
-	if s.cfService != nil && len(purgedPaths) > 0 {
-		go s.cfService.PurgeByURLs(context.Background(), purgedPaths)
-	}
+	return
 }
 
 // RegenerateAllContent regenerates all published content.
 // Clears all content hashes first so every page is regenerated (needed when
 // theme/template/snippet changes affect rendered output globally).
+// Task 16B: disabled for live writes — explicit per-page Publish via
+// PublicationService is required. Retained as a no-op returning nil so
+// legacy admin/API entry points fail safe until Task 16C routes them.
 func (s *ContentService) RegenerateAllContent(ctx context.Context) error {
-	// Clear all content hashes to force full regeneration
-	s.db.Collection("content").UpdateMany(ctx,
-		bson.M{"content_hash": bson.M{"$exists": true}},
-		bson.M{"$unset": bson.M{"content_hash": ""}},
-	)
-
-	cursor, err := s.db.FindMany(ctx, "content",
-		bson.M{"published": true, "deleted": bson.M{"$ne": true}}, nil)
-	if err != nil {
-		return fmt.Errorf("failed to list content: %w", err)
-	}
-
-	var contents []models.Content
-	if err := cursor.All(ctx, &contents); err != nil {
-		return fmt.Errorf("failed to decode content: %w", err)
-	}
-
-	// Build the wikilink index once for all pages rather than once per page.
-	wikilinkIdx := s.buildWikilinkIndex(ctx)
-
-	// Parallel regeneration with a bounded worker pool.
-	const maxWorkers = 6
-	sem := make(chan struct{}, maxWorkers)
-	var wg sync.WaitGroup
-
-	for i := range contents {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(c models.Content) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := s.generateStaticPageWithWikilinkIndex(ctx, &c, wikilinkIdx); err != nil {
-				fmt.Printf("Warning: failed to generate page %s: %v\n", c.FullPath, err)
-			}
-		}(contents[i])
-	}
-	wg.Wait()
-
-	// Purge entire Cloudflare cache — every page was just regenerated.
-	if s.cfService != nil {
-		go s.cfService.PurgeEverything(context.Background())
-	}
-
 	return nil
 }

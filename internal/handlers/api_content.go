@@ -3,6 +3,8 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -16,9 +18,11 @@ import (
 
 	"github.com/jonradoff/lightcms/v7/internal/auth"
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/observe"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
+	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -552,14 +556,117 @@ func (a *APIHandler) APIRestoreContent(w http.ResponseWriter, r *http.Request) {
 	a.jsonResponse(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
+// publicationReqFields builds the Task 16F structured log fields for a
+// legacy publish/unpublish request: actor from the API user + agent
+// session header, request ID passthrough, stage and duration.
+func (a *APIHandler) publicationReqFields(r *http.Request, stage string, t0 time.Time) observe.Fields {
+	f := observe.Fields{
+		RequestID:   r.Header.Get("X-Request-ID"),
+		AgentSession: r.Header.Get("X-Agent-Session"),
+		Actor:       "human",
+		Stage:       stage,
+		DurationMS:  time.Since(t0).Milliseconds(),
+	}
+	if f.AgentSession != "" {
+		f.Actor = "agent"
+	}
+	if u := a.getAPIUser(r); u != nil {
+		f.UserID = u.Email
+		if u.ID != "" {
+			f.UserID = u.ID
+		}
+	}
+	return f
+}
+
 func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Task 16F: request duration for the structured publish log.
+	t0 := time.Now()
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
 		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		return
+	}
+
+	// Task 16C: route through PublicationService when wired. External
+	// single publish requires Idempotency-Key (428 when absent); the saga
+	// freezes versions under lock, cuts over atomically and returns the
+	// Publication ID + Public URL. Legacy path preserved when unwired.
+	if a.publicationService != nil {
+		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if key == "" {
+			f := a.publicationReqFields(r, "publish", t0)
+			f.StatusCode, f.ErrorCode = 428, "IDEMPOTENCY_KEY_REQUIRED"
+			observe.LogPublication("publish_rejected", f)
+			a.jsonError(w, 428, "Idempotency-Key is required for publish")
+			return
+		}
+		var opID *primitive.ObjectID
+		var opAttempt int64
+		if a.idempotencyService != nil {
+			owner := ""
+			if u := a.getAPIUser(r); u != nil {
+				owner = u.ID
+				if owner == "" {
+					owner = u.Email
+				}
+			}
+			op, berr := a.idempotencyService.Begin(r.Context(), owner, r.Method, r.URL.Path, key, nil)
+			if berr != nil {
+				f := a.publicationReqFields(r, "publish", t0)
+				f.ContentID = id.Hex()
+				f.StatusCode, f.ErrorCode = idemHTTPStatus(berr), "IDEMPOTENCY_CONFLICT"
+				observe.LogPublication("publish_rejected", f)
+				a.jsonError(w, idemHTTPStatus(berr), sanitizeAPIError(berr))
+				return
+			}
+			if op.Replay && op.Response != nil {
+				f := a.publicationReqFields(r, "publish", t0)
+				f.ContentID = id.Hex()
+				if pid, ok := op.Response["publication_id"].(string); ok {
+					f.PublicationID = pid
+				}
+				f.StatusCode = 200
+				observe.LogPublication("publish_replay", f)
+				a.jsonResponse(w, http.StatusOK, op.Response)
+				return
+			}
+			opID = &op.ID
+			opAttempt = op.Attempt
+		}
+		res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID})
+		if perr != nil {
+			f := a.publicationReqFields(r, "publish", t0)
+			f.ContentID = id.Hex()
+			f.StatusCode, f.ErrorCode = publicationHTTPStatus(perr), publication.CodeOf(perr)
+			observe.LogPublication("publish_failed", f)
+			a.jsonError(w, publicationHTTPStatus(perr), sanitizeAPIError(perr))
+			return
+		}
+		if opID != nil && a.idempotencyService != nil {
+			_, _ = a.idempotencyService.Complete(r.Context(), *opID, opAttempt, 200, map[string]any{
+				"success":        true,
+				"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
+				"content_id": res.ContentID.Hex(), "full_path": res.FullPath,
+			}, false)
+		}
+		a.auditLog(r, "content.publish", "content", id.Hex(), map[string]interface{}{
+			"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
+		})
+		f := a.publicationReqFields(r, "publish", t0)
+		f.ContentID, f.ContentVersion = id.Hex(), res.ContentVersion
+		f.PublicationID, f.FullPath = res.PublicationID.Hex(), res.FullPath
+		f.StatusCode = 200
+		observe.LogPublication("publish", f)
+		a.jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"success": true, "publication_id": res.PublicationID.Hex(),
+			"public_url": res.PublicURL, "full_path": res.FullPath,
+			"content_version": res.ContentVersion,
+		})
 		return
 	}
 
@@ -576,10 +683,30 @@ func (a *APIHandler) APIUnpublishContent(w http.ResponseWriter, r *http.Request)
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Task 16F: request duration for the structured unpublish log.
+	t0 := time.Now()
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
 		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		return
+	}
+
+	// Task 16C: Unpublish is naturally idempotent — no Idempotency-Key.
+	if a.publicationService != nil {
+		if err := a.publicationService.Unpublish(r.Context(), publication.UnpublishRequest{ContentID: id}); err != nil {
+			f := a.publicationReqFields(r, "unpublish", t0)
+			f.ContentID = id.Hex()
+			f.StatusCode, f.ErrorCode = publicationHTTPStatus(err), publication.CodeOf(err)
+			observe.LogPublication("unpublish_failed", f)
+			a.jsonError(w, publicationHTTPStatus(err), sanitizeAPIError(err))
+			return
+		}
+		f := a.publicationReqFields(r, "unpublish", t0)
+		f.ContentID, f.StatusCode = id.Hex(), 200
+		observe.LogPublication("unpublish", f)
+		a.auditLog(r, "content.unpublish", "content", id.Hex(), nil)
+		a.jsonResponse(w, http.StatusOK, map[string]interface{}{"success": true})
 		return
 	}
 
@@ -984,6 +1111,9 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 	ctx, cancel := context.WithTimeout(r.Context(), bulkOpTimeout)
 	defer cancel()
 
+	// Task 16D: stable per-page operation keys for auto-republish.
+	srReqKey := searchReplaceRequestKey(r)
+
 	// Stream documents one-by-one — avoids loading the full collection into memory.
 	cursor, err := a.contentService.StreamContent(ctx, false)
 	if err != nil {
@@ -1050,7 +1180,11 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 			return nil
 		}
 		if req.AutoRepublish && wasPublished {
-			a.contentService.PublishContent(ctx, content.ID)
+			// Task 16D: republish through PublicationService under a stable
+			// per-page key — retries replay, never duplicate.
+			_ = a.contentService.PublishInternal(ctx, content.ID,
+				"search-replace", "/api/v1/search-replace/execute",
+				services.SearchReplaceOpKey(srReqKey, content.ID))
 		}
 		return &UpdatedPage{
 			ID: content.ID.Hex(), Title: newTitle,
@@ -1198,10 +1332,15 @@ func (a *APIHandler) renderContentWithWarnings(r *http.Request, content *models.
 
 // APIBatchPublishContent publishes multiple content items in one call.
 // Body: {"ids": ["id1","id2",...]} or {"publish_all_drafts": true}
+// Task 16C: routes per item through PublicationService when wired (no raw
+// GenerateStaticPage), requires Idempotency-Key (428 when absent), and
+// returns per-item Publication IDs. Legacy path preserved when unwired.
 func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Request) {
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Task 16F: request duration for the structured batch log.
+	t0 := time.Now()
 
 	var req struct {
 		IDs              []string `json:"ids"`
@@ -1237,6 +1376,39 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 
 	var published []string
 	var failed []map[string]string
+	var publications []map[string]string
+	if a.publicationService != nil {
+		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if key == "" {
+			f := a.publicationReqFields(r, "batch_publish", t0)
+			f.StatusCode, f.ErrorCode = 428, "IDEMPOTENCY_KEY_REQUIRED"
+			observe.LogPublication("publish_rejected", f)
+			a.jsonError(w, 428, "Idempotency-Key is required for batch publish")
+			return
+		}
+		for _, id := range ids {
+			res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id})
+			if perr != nil {
+				failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(perr)})
+			} else {
+				published = append(published, id.Hex())
+				publications = append(publications, map[string]string{
+					"id": id.Hex(), "publication_id": res.PublicationID.Hex(),
+					"public_url": res.PublicURL,
+				})
+			}
+		}
+		a.auditLog(r, "content.batch_publish", "content", "", map[string]interface{}{"count": len(published)})
+		f := a.publicationReqFields(r, "batch_publish", t0)
+		f.StatusCode = 200
+		observe.LogPublication("batch_publish", f)
+		a.jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"published":    published,
+			"publications": publications,
+			"failed":       failed,
+		})
+		return
+	}
 	for _, id := range ids {
 		if err := a.contentService.PublishContent(r.Context(), id); err != nil {
 			failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(err)})
@@ -1541,6 +1713,9 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 	ctx, cancel := context.WithTimeout(r.Context(), bulkOpTimeout)
 	defer cancel()
 
+	// Task 16D: stable per-page operation keys for auto-republish.
+	scopedReqKey := searchReplaceRequestKey(r)
+
 	// Push scope filters to MongoDB and stream results to avoid loading the full
 	// scoped set into memory before processing starts.
 	cursor2, err := a.contentService.StreamContentScoped(ctx, scopeToContentScope(req.Scope))
@@ -1594,7 +1769,11 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 			return nil
 		}
 		if req.AutoRepublish && wasPublished {
-			a.contentService.PublishContent(ctx, content.ID)
+			// Task 16D: republish through PublicationService under a stable
+			// per-page key — retries replay, never duplicate.
+			_ = a.contentService.PublishInternal(ctx, content.ID,
+				"search-replace", "/api/v1/search-replace/scoped/execute",
+				services.SearchReplaceOpKey(scopedReqKey, content.ID))
 		}
 		return &UpdatedPage{
 			ID: content.ID.Hex(), Title: newTitle,
@@ -1663,6 +1842,60 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 		resp["warning"] = "operation timed out; results are partial"
 	}
 	a.jsonResponse(w, http.StatusOK, resp)
+}
+
+// publicationHTTPStatus maps saga errors to HTTP statuses (spec §27).
+// Falls back to 500 for unknown internals; never leaks driver detail
+// (sanitizeAPIError handles the body).
+func publicationHTTPStatus(err error) int {
+	code := publication.CodeOf(err)
+	switch code {
+	case publication.CodeNotFound, "CONTENT_NOT_FOUND":
+		return http.StatusNotFound
+	case "FIELD_VALIDATION_FAILED", "PATH_INVALID", "CONTENT_PUBLISH_FAILED":
+		return 422
+	case "TEMPLATE_NOT_ACTIVE", "TEMPLATE_VERSION_CHANGED", "PATH_CONFLICT",
+		"PUBLICATION_CONFLICT", "PAGE_PUBLISH_IN_PROGRESS", "CONTENT_VERSION_CONFLICT":
+		return http.StatusConflict
+	case "PUBLIC_URL_RESOLUTION_FAILED":
+		return http.StatusFailedDependency
+	default:
+		if publication.IsConflict(err) {
+			return http.StatusConflict
+		}
+		return http.StatusInternalServerError
+	}
+}
+
+// idemHTTPStatus maps idempotency Begin errors to HTTP statuses.
+func idemHTTPStatus(err error) int {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "IDEMPOTENCY_CONFLICT"), strings.Contains(msg, "conflict"):
+		return http.StatusConflict
+	case strings.Contains(msg, "STALE_ATTEMPT"), strings.Contains(msg, "stale"):
+		return http.StatusConflict
+	case strings.Contains(msg, "REQUEST_IN_PROGRESS"), strings.Contains(msg, "in progress"):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// searchReplaceRequestKey returns the stable key for one search-replace
+// execute request (Task 16D): the caller's Idempotency-Key header when
+// present, else one fresh random key for this request. Per-page operation
+// keys (sr/<reqkey>/<contentID>) make auto-republish retries replay instead
+// of minting duplicate Publications.
+func searchReplaceRequestKey(r *http.Request) string {
+	if key := strings.TrimSpace(r.Header.Get("Idempotency-Key")); key != "" {
+		return key
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("sr-req-%d", time.Now().UnixNano())
+	}
+	return "sr-req-" + hex.EncodeToString(b[:])
 }
 
 // sanitizeAPIError converts internal errors to safe external messages,

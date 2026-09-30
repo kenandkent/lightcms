@@ -315,22 +315,16 @@ func (s *ApprovalService) Approve(ctx context.Context,
 		if err := s.db.UpdateOne(ctx, "approval_requests", bson.M{"_id": requestID}, update); err != nil {
 			return err
 		}
-		// Publish the content
+		// Task 16B (spec §16.6): approval changes approval state only.
+		// It never publishes, never writes live files, never flips
+		// content.published. Publishing is an explicit follow-up via
+		// PublicationService. Clear the pending flag without touching live.
 		if !req.ContentID.IsZero() {
 			s.db.UpdateOne(ctx, "content", bson.M{"_id": req.ContentID}, //nolint:errcheck
 				bson.M{"$set": bson.M{
-					"published":        true,
 					"pending_approval": false,
-					"published_at":     time.Now(),
 					"updated_at":       time.Now(),
 				}})
-			// Generate static page
-			if s.contentService != nil {
-				var content models.Content
-				if e := s.db.FindOne(ctx, "content", bson.M{"_id": req.ContentID}, &content); e == nil {
-					go s.contentService.GenerateStaticPage(context.Background(), &content)
-				}
-			}
 		}
 		// Approve asset: clear pending_review flag
 		if req.AssetID != nil {

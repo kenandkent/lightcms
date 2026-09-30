@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/database"
+	"github.com/jonradoff/lightcms/v7/internal/observe"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -246,6 +247,11 @@ func (w *OutboxWorker) Run(ctx context.Context) {
 		if didWork {
 			continue // drain backlog without sleeping
 		}
+		// Task 16F: publish the backlog gauge even when idle (one indexed
+		// count per poll interval).
+		if n, err := w.Backlog(ctx); err == nil {
+			observe.Default().SetOutboxBacklog(n)
+		}
 		t := time.NewTimer(w.pollInterval)
 		select {
 		case <-ctx.Done():
@@ -254,6 +260,15 @@ func (w *OutboxWorker) Run(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// Backlog counts pending (undelivered, due or scheduled) outbox rows: the
+// spec §37.2 outbox backlog gauge. Delivery workers and P0 monitors read
+// it; delivery itself never blocks on it.
+func (w *OutboxWorker) Backlog(ctx context.Context) (int64, error) {
+	return w.db.Collection(CollectionOutbox).CountDocuments(ctx, bson.M{
+		"state": bson.M{"$in": []string{OutboxStatePending, OutboxStateDelivering}},
+	})
 }
 
 // ProcessNext claims a single due row, delivers it, and marks it delivered
@@ -278,6 +293,8 @@ func (w *OutboxWorker) ProcessNext(ctx context.Context) (bool, error) {
 		payload = map[string]any{}
 	}
 	if err := w.deliver(ctx, rec.EventType, eventID, payload); err != nil {
+		// Task 16F: delivery failure counter (retry already scheduled).
+		observe.Default().IncOutboxFailed()
 		if rerr := w.scheduleRetry(ctx, rec); rerr != nil {
 			return true, err
 		}
@@ -286,6 +303,8 @@ func (w *OutboxWorker) ProcessNext(ctx context.Context) (bool, error) {
 	if err := w.markDelivered(ctx, rec); err != nil {
 		return true, err
 	}
+	// Task 16F: successful delivery counter.
+	observe.Default().IncOutboxDelivered()
 	return true, nil
 }
 

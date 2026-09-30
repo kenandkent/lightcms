@@ -59,8 +59,10 @@ func TestProductCanonicalPathIndex(t *testing.T) {
 		t.Fatalf("EnsureProductIndexes (second call): %v", err)
 	}
 
-	// Legacy UNIQUE(full_path, fork_id) must still exist (Task 14 drops it
-	// only after the new canonical index is verified).
+	// Task 16E post-migration contract: Connect.createIndexes is DROP-ONLY
+	// for the legacy index (the migration drops it after the canonical
+	// index is verified, and a restart must NOT recreate it). Uniqueness
+	// is enforced by the canonical partial-unique index below.
 	foundLegacy := false
 	cur, err := db.Collection("content").Indexes().List(ctx)
 	if err != nil {
@@ -80,8 +82,8 @@ func TestProductCanonicalPathIndex(t *testing.T) {
 		}
 	}
 	_ = cur.Close(ctx)
-	if !foundLegacy {
-		t.Error("expected legacy index full_path_1_fork_id_1 to still exist (Task 14 owns its removal)")
+	if foundLegacy {
+		t.Error("legacy index full_path_1_fork_id_1 must NOT exist: Connect.createIndexes is drop-only post-migration (Task 16E)")
 	}
 
 	// Concurrent live inserts with casing differences: same canonical key,

@@ -338,8 +338,19 @@ func (h *Handler) executeCopilotTool(ctx context.Context, role, sessionID string
 		}
 		verb := "Published"
 		if name == "publish_content" {
-			err = h.contentService.PublishContent(ctx, id)
+			// Task 16D: publish through PublicationService under a stable
+			// per-session/version operation key — a retried tool call
+			// replays instead of minting a duplicate Publication.
+			var version int64
+			if cur, gerr := h.contentService.GetContent(ctx, id); gerr == nil && cur != nil {
+				version = cur.CurrentVersion
+			}
+			err = h.contentService.PublishInternal(ctx, id,
+				"copilot:"+sessionID, "/cm/copilot/publish",
+				services.CopilotOpKey(sessionID, id, version))
 		} else {
+			// Unpublish is naturally idempotent; the saga delegation in
+			// UnpublishContent needs no operation key.
 			err = h.contentService.UnpublishContent(ctx, id)
 			verb = "Unpublished"
 		}

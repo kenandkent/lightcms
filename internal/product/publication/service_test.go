@@ -280,6 +280,11 @@ func TestPublishSaga_FirstPublish(t *testing.T) {
 	if err != nil || active == nil || active.ID != res.PublicationID {
 		t.Fatalf("active = (%v, %v), want %s", active, err, res.PublicationID.Hex())
 	}
+	// Task 16E: the resolved public URL is persisted on the record so the
+	// activation-transaction outbox insert carries it (no post-commit join).
+	if active.PublicURL != res.PublicURL {
+		t.Fatalf("active public_url = %q, want %q", active.PublicURL, res.PublicURL)
+	}
 	if active.VerificationStatus != publication.VerificationVerified {
 		t.Fatalf("verification = %q, want verified", active.VerificationStatus)
 	}

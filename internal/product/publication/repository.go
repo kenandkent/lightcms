@@ -93,7 +93,7 @@ func NewRepository(db *database.DB, outbox OutboxInserter) *Repository {
 // events. PublicURL is unknown at the records layer (Task 8/13 resolve it
 // after activation); the payload carries the frozen render identity.
 func eventPayload(p *Publication) map[string]any {
-	return map[string]any{
+	payload := map[string]any{
 		"content_id":           p.ContentID.Hex(),
 		"publication_id":       p.ID.Hex(),
 		"content_version":      p.ContentVersion,
@@ -102,6 +102,13 @@ func eventPayload(p *Publication) map[string]any {
 		"content_hash":         p.ContentHash,
 		"logical_published_at": p.LogicalPublishedAt,
 	}
+	// Task 16E: resolved public URL travels with the activation event so
+	// delivery never joins it back (enrichOutboxURL stays as backfill for
+	// rows written before this field existed).
+	if p.PublicURL != "" {
+		payload["public_url"] = p.PublicURL
+	}
+	return payload
 }
 
 // InsertStaged persists a staged candidate. Required: ContentID, FullPath,

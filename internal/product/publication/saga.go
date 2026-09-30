@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/observe"
 	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/pathkey"
 	"github.com/jonradoff/lightcms/v7/internal/product/storage"
@@ -287,6 +288,46 @@ type cutoverPlan struct {
 	opID           *primitive.ObjectID
 	attempt        int64
 	useIdem        bool
+	startedAt      time.Time // plan freeze time for duration_ms logs.
+}
+
+// planFields builds the Task 16F structured log fields for one plan at a
+// lifecycle stage. Actor/provenance are attached by the caller when known
+// (the saga itself is actor-agnostic); duration runs from plan freeze.
+func (plan *cutoverPlan) planFields(stage string, statusCode int, errCode string) observe.Fields {
+	var elapsed int64
+	if !plan.startedAt.IsZero() {
+		elapsed = time.Since(plan.startedAt).Milliseconds()
+	}
+	return observe.Fields{
+		TemplateSlug:    plan.tv.Slug,
+		TemplateVersion: plan.tv.Version,
+		ContentID:       plan.contentID.Hex(),
+		ContentVersion:  plan.contentVersion,
+		PublicationID:   plan.pubID.Hex(),
+		FullPath:        plan.fullPath,
+		StorageProvider: "filesystem",
+		Stage:           stage,
+		DurationMS:      elapsed,
+		StatusCode:      statusCode,
+		ErrorCode:       errCode,
+	}
+}
+
+// observeStageFail records a pre-cutover (stage/verify/record) failure:
+// counter + structured log + failure-rate P0 input.
+func (plan *cutoverPlan) observeStageFail(code string) {
+	observe.Default().IncStageFailed()
+	observe.Default().ObservePublicationOutcome(false)
+	observe.LogPublication("stage_failed", plan.planFields("stage", 500, code))
+}
+
+// observeActivateFail records a cutover/commit failure: counter +
+// structured log + failure-rate P0 input.
+func (plan *cutoverPlan) observeActivateFail(code string) {
+	observe.Default().IncActivateFailed()
+	observe.Default().ObservePublicationOutcome(false)
+	observe.LogPublication("activate_failed", plan.planFields("activate", 500, code))
 }
 
 func contentHashRecord(rawHex string) string { return "sha256:" + strings.ToLower(rawHex) }
@@ -363,6 +404,7 @@ func (s *Service) buildPublishPlan(ctx context.Context, req PublishRequest, cont
 		html: html, verification: VerificationVerified,
 		snapshot: map[string]any{"template_render_hash": tv.RenderHash},
 		opID:     opID, attempt: attempt, useIdem: useIdem,
+		startedAt: s.now(),
 	}
 	sum := sha256.Sum256(html)
 	plan.rawHash = hex.EncodeToString(sum[:])
@@ -428,6 +470,7 @@ func (s *Service) buildRollbackPlan(ctx context.Context, req RollbackRequest, co
 		oldActive: oldActive, pubID: pubID, logicalAt: logicalAt, publicURL: publicURL,
 		html: html, verification: verification, snapshot: snapshot,
 		opID: opID, attempt: attempt, useIdem: useIdem,
+		startedAt: s.now(),
 	}
 	tv, terr := s.templates.GetVersion(ctx, source.TemplateVersionID)
 	if terr != nil {
@@ -575,6 +618,7 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		// exact rollback bytes inherited from a legacy_unverified source —
 		// which must NOT go live through the business path.
 		s.markTerminal(ctx, plan.opID, plan.attempt, CodeActivateFailed)
+		plan.observeActivateFail(CodeActivateFailed)
 		return fail(CodeActivateFailed,
 			"refusing to activate "+string(plan.verification)+" output through ordinary publish (migration approval required)", nil)
 	}
@@ -583,6 +627,10 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		ContentID: plan.contentID, ContentVersion: plan.contentVersion,
 		TemplateID: plan.tv.TemplateID, TemplateVersionID: plan.tv.ID, TemplateVersion: plan.tv.Version,
 		FullPath: plan.fullPath, ContentHash: plan.recordHash,
+		// Task 16E: persist the resolved public URL on the record so the
+		// activation-transaction outbox insert carries it (no post-commit
+		// join required for delivery).
+		PublicURL:          plan.publicURL,
 		StorageProvider:    "filesystem",
 		StoragePath:        s.store.ImmutablePath(plan.contentID, plan.pubID),
 		LogicalPublishedAt: plan.logicalAt,
@@ -592,6 +640,7 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 	rec.ID = plan.pubID
 	if err := s.repo.InsertStaged(ctx, rec); err != nil {
 		s.markTerminal(ctx, plan.opID, plan.attempt, CodeStageFailed)
+		plan.observeStageFail(CodeOf(err))
 		return fail(CodeOf(err), "persist staged publication", err)
 	}
 
@@ -602,18 +651,21 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 	if err != nil {
 		_ = s.repo.MarkFailed(ctx, plan.pubID, "stage: "+err.Error())
 		s.markTerminal(ctx, plan.opID, plan.attempt, CodeStageFailed)
+		plan.observeStageFail(CodeStageFailed)
 		return fail(CodeStageFailed, "stage immutable publication object", err)
 	}
 	if err := s.store.Verify(ctx, staged); err != nil {
 		_ = s.store.Abort(ctx, staged)
 		_ = s.repo.MarkFailed(ctx, plan.pubID, "verify: "+err.Error())
 		s.markTerminal(ctx, plan.opID, plan.attempt, CodeVerifyFailed)
+		plan.observeStageFail(CodeVerifyFailed)
 		return fail(CodeVerifyFailed, "verify staged publication object", err)
 	}
 	if err := s.markVerifiedPresent(ctx, plan.pubID); err != nil {
 		_ = s.store.Abort(ctx, staged)
 		_ = s.repo.MarkFailed(ctx, plan.pubID, "verify-commit: "+err.Error())
 		s.markTerminal(ctx, plan.opID, plan.attempt, CodeVerifyFailed)
+		plan.observeStageFail(CodeVerifyFailed)
 		return fail(CodeVerifyFailed, "record staged verification", err)
 	}
 
@@ -675,6 +727,7 @@ func (s *Service) failCutover(ctx context.Context, plan *cutoverPlan, staged sto
 	_ = s.store.Abort(ctx, staged)
 	_ = s.repo.MarkFailed(ctx, plan.pubID, "cutover: "+message)
 	s.markTerminal(ctx, plan.opID, plan.attempt, code)
+	plan.observeActivateFail(code)
 	return PublicationResult{}, sagaErr(code, message, err)
 }
 
@@ -689,6 +742,7 @@ func (s *Service) failCommitted(ctx context.Context, plan *cutoverPlan, staged s
 	cerr := s.compensateCutover(ctx, plan, staged, oldID)
 	_ = s.repo.MarkFailed(ctx, plan.pubID, message+": "+err.Error())
 	s.markTerminal(ctx, plan.opID, plan.attempt, code)
+	plan.observeActivateFail(code)
 	if cerr != nil {
 		return PublicationResult{}, sagaErr(code,
 			message+" failed AND file compensation failed (P0: scanner repair required)", errors.Join(err, cerr))
@@ -743,6 +797,9 @@ func (s *Service) finishCommit(ctx context.Context, plan *cutoverPlan, oldID *pr
 		"full_path": plan.fullPath, "content_hash": plan.recordHash,
 		"renamed": plan.renamed,
 	})
+	// Task 16F: structured activation log + failure-rate denominator.
+	observe.Default().ObservePublicationOutcome(true)
+	observe.LogPublication("activated", plan.planFields("activate", 200, ""))
 	return PublicationResult{
 		PublicationID: plan.pubID, ContentID: plan.contentID,
 		ContentVersion: plan.contentVersion, TemplateVersionID: plan.tv.ID,

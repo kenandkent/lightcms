@@ -6,15 +6,16 @@
 //   - templatecontract.ValidateData for field errors (Task 4);
 //   - templatecontract.TemplateVersion / models.TemplateField shapes (Task 3);
 //   - generation.UpgradePreview/UpgradeJob + RestoreAndPublish/RevertLive
-//     service methods (Task 12) via the generation.Service constructed here;
+//     service methods (Task 12) via the shared generation.Service wired
+//     once in cmd/server/main.go (Task 16C);
 //   - publication.Publish/Rollback via the Task 8 saga (Admin publish goes
 //     through PublicationService, never GenerateStaticPage).
 //
 // No SPA and no second frontend: all output is server-rendered HTML using the
 // existing Admin layout constants, and all mutations go through the
-// in-process product services. Route registration stays with the integration
-// owner (Task 16); the handlers below are additive methods on *Handler so
-// shared wiring in handlers.go/cmd/server/main.go is untouched.
+// in-process product services. Routes are registered in cmd/server/main.go
+// (Task 16C); the handlers below are additive methods on *Handler sharing
+// the runtime in handlers.go.
 package handlers
 
 import (
@@ -541,14 +542,22 @@ func (h *Handler) adminActor(r *http.Request) generation.Actor {
 }
 
 // adminGenerationService builds the same orchestrator REST uses (Task 12).
+// Task 16C: prefer the shared runtime wired once in main.go; the local
+// construction below is the unwired (unit-test) fallback only.
 func (h *Handler) adminGenerationService() *generation.Service {
+	if h.generationService != nil {
+		return h.generationService
+	}
 	return generation.NewService(h.db, generation.Options{})
 }
 
 // adminPublicationService builds the Task 8 saga over the MVP filesystem
-// store (spec §17.2). Task 16 may replace construction with the shared wired
-// runtime; the call sites below already target the saga interface.
+// store (spec §17.2). Task 16C wires the shared runtime in main.go via
+// SetPublicationRuntime; the local construction is the unwired fallback.
 func (h *Handler) adminPublicationService() *publication.Service {
+	if h.publicationService != nil {
+		return h.publicationService
+	}
 	repo := publication.NewRepository(h.db, nil)
 	store := storage.NewFilesystemStore("content")
 	return publication.NewService(h.db, repo, store, publication.Options{BuildSHA: "admin"})

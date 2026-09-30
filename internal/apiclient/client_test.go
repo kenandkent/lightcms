@@ -334,13 +334,26 @@ func TestPublishContent(t *testing.T) {
 		if !strings.HasSuffix(r.URL.Path, "/publish") {
 			t.Errorf("expected /publish suffix, got %s", r.URL.Path)
 		}
+		// Task 16C: single publish requires Idempotency-Key (428 otherwise).
+		if strings.TrimSpace(r.Header.Get("Idempotency-Key")) == "" {
+			t.Errorf("expected Idempotency-Key header on publish")
+		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true,"publication_id":"pub1","public_url":"http://x/p","full_path":"/p","content_id":"p1","content_version":2}`))
 	}))
 	t.Cleanup(srv.Close)
 
 	c := New(srv.URL, "tok")
 	if err := c.PublishContent(context.Background(), "p1"); err != nil {
 		t.Fatalf("PublishContent: %v", err)
+	}
+	res, err := c.PublishContentResult(context.Background(), "p1")
+	if err != nil {
+		t.Fatalf("PublishContentResult: %v", err)
+	}
+	if res.PublicationID != "pub1" || res.PublicURL != "http://x/p" {
+		t.Fatalf("unexpected publish result: %+v", res)
 	}
 }
 

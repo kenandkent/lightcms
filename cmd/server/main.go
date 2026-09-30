@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -72,6 +73,13 @@ func main() {
 	defer db.Disconnect(context.Background())
 
 	log.Println("Connected to MongoDB successfully")
+
+	// Task 16E: `lightcms migrate-publications --dry-run|--apply` (Task 14
+	// contract) runs inside this same binary — no second migration binary.
+	if len(os.Args) > 1 && os.Args[1] == "migrate-publications" {
+		runMigrationCommand(cfg, db)
+		return
+	}
 
 	// Initialize session store with secure settings
 	sessionStore := sessions.NewCookieStore([]byte(cfg.SessionSecret))
@@ -396,6 +404,17 @@ func main() {
 	admin.HandleFunc("/forks/{id}/archive", h.ArchiveFork).Methods("POST")
 	admin.HandleFunc("/forks/{id}/delete", h.DeleteForkHandler).Methods("POST")
 
+	// Task 16C: Task 15 Admin publication UX (admin_publications.go). All
+	// seven handlers publish through the shared PublicationService wired
+	// above — never a locally constructed store-rooted service.
+	admin.HandleFunc("/content/{id}/publish", h.AdminProductPublish).Methods("POST")
+	admin.HandleFunc("/content/{id}/publications", h.AdminProductPublications).Methods("GET")
+	admin.HandleFunc("/content/{id}/versions/{version}/restore_and_publish", h.AdminProductRestoreAndPublish).Methods("POST")
+	admin.HandleFunc("/content/{id}/publications/{publicationID}/revert_live", h.AdminProductRevertLive).Methods("POST")
+	admin.HandleFunc("/templates/{id}/upgrade-preview", h.AdminProductUpgradePreview).Methods("GET")
+	admin.HandleFunc("/templates/{id}/upgrade-start", h.AdminProductUpgradeStart).Methods("POST")
+	admin.HandleFunc("/upgrade-jobs/{jobID}/run", h.AdminProductUpgradeRun).Methods("POST")
+
 	// REST API v1 routes (API key authenticated, JSON only)
 	apiKeyService := services.NewAPIKeyService(db)
 	linkCheckerService := services.NewLinkCheckerService(db)
@@ -421,6 +440,34 @@ func main() {
 	apiHandler.SetUserService(userService)
 	apiHandler.SetAgentSessionService(services.NewAgentSessionService(auditService, contentService))
 	apiHandler.SetMaintenanceService(maintenanceService)
+
+	// Task 16E: ONE server construction function owns the entire V3
+	// publication runtime (saga, idempotency, URLs, generation, product
+	// HTTP handlers, scanner, outbox worker). Guards reject unsupported
+	// storage and production standalone Mongo before serving.
+	rt, err := buildPublicationRuntime(context.Background(), db, cfg, runtimeDeps{
+		Cloudflare: cfService, Audit: auditService, Webhooks: webhookService,
+	})
+	if err != nil {
+		log.Fatalf("Failed to build publication runtime: %v", err)
+	}
+	// Ensure the full product index set (idempotency unique key, active
+	// publication pointer, outbox, template versions). Fatal: without
+	// these, same-key retries cannot replay and double-publish.
+	if err := db.EnsureProductIndexes(context.Background()); err != nil {
+		log.Fatalf("Failed to ensure product indexes (run `lightcms migrate-publications --dry-run` for blockers): %v", err)
+	}
+	// Legacy ContentService.PublishContent/UnpublishContent delegate to the
+	// saga; background jobs publish under stable operation keys (16D).
+	services.SetPublicationPublisher(rt.Pubs)
+	services.SetInternalIdempotency(rt.Idem)
+	apiHandler.SetPublicationRuntime(rt.Pubs, rt.Idem, rt.Gen)
+	h.SetPublicationRuntime(rt.Pubs, rt.Idem, rt.Gen)
+	productAPI := rt.ProductAPI
+	// Durable workers run in this same process and stop with bgCtx:
+	// outbox delivery (webhook retries) and the recovery/GC scanner.
+	go rt.Outbox.Run(bgCtx)
+	go rt.Scanner.Run(bgCtx)
 	apiAuthMiddleware := middleware.NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
 		apiKey, err := apiKeyService.ValidateAPIKey(ctx, rawKey)
 		if err != nil {
@@ -531,6 +578,16 @@ func main() {
 		})
 	})
 
+	// Task 16C: Task 12 product routes. Specific publication/schema paths
+	// MUST stay above the generic /content/{id} and /templates/{id}
+	// routes below so old publish URLs and new publication URLs share
+	// one auth/rate/body/provenance chain with V3 semantics.
+	apiv1.HandleFunc("/page-generation", productAPI.HandleGenerate).Methods("POST")
+	apiv1.HandleFunc("/content/{id}/publications", productAPI.HandleListPublications).Methods("GET")
+	apiv1.HandleFunc("/content/{id}/publications/{publication_id}/rollback", productAPI.HandleRollback).Methods("POST")
+	apiv1.HandleFunc("/content/{id}/publications/{publication_id}", productAPI.HandleGetPublication).Methods("GET")
+	apiv1.HandleFunc("/content/{id}/restore-and-publish", productAPI.HandleRestoreAndPublish).Methods("POST")
+	apiv1.HandleFunc("/content/{id}/revert-live", productAPI.HandleRevertLive).Methods("POST")
 	// Content
 	apiv1.HandleFunc("/content", apiHandler.APIListContent).Methods("GET")
 	apiv1.HandleFunc("/content", apiHandler.APICreateContent).Methods("POST")
@@ -554,6 +611,14 @@ func main() {
 	apiv1.HandleFunc("/content/{id}/versions/{version}/revert", apiHandler.APIRevertContentVersion).Methods("POST")
 
 	// Templates
+	// Task 16C: Task 12 template schema/upgrade routes before generic
+	// /templates/{id} so slug-scoped schema reads never collide with IDs.
+	apiv1.HandleFunc("/templates/upgrade-jobs/{job_id}/run", productAPI.HandleRunUpgradeJob).Methods("POST")
+	apiv1.HandleFunc("/templates/upgrade-jobs/{job_id}", productAPI.HandleGetUpgradeJob).Methods("GET")
+	apiv1.HandleFunc("/templates/{slug}/schema", productAPI.HandleTemplateSchema).Methods("GET")
+	apiv1.HandleFunc("/templates/{slug}/upgrade-preview", productAPI.HandleUpgradePreview).Methods("GET")
+	apiv1.HandleFunc("/templates/{slug}/upgrade-jobs", productAPI.HandleStartUpgradeJob).Methods("POST")
+	apiv1.HandleFunc("/templates/{id}/migrate-slug", productAPI.HandleMigrateSlug).Methods("POST")
 	apiv1.HandleFunc("/templates", apiHandler.APIListTemplates).Methods("GET")
 	apiv1.HandleFunc("/templates", apiHandler.APICreateTemplate).Methods("POST")
 	apiv1.HandleFunc("/templates/{id}", apiHandler.APIGetTemplate).Methods("GET")
@@ -836,6 +901,22 @@ func main() {
 	}
 
 	log.Println("Server stopped")
+}
+
+// publicationBuildSHA reports the build identifier stamped into Publication
+// records (spec §15 renderer/build provenance). Task 16E overrides it with
+// the git SHA via ldflags (-X main.ProductBuildSHA=...); until then it
+// defaults to the build version string (Task 7 contract).
+var ProductBuildSHA string
+
+func publicationBuildSHA() string {
+	if strings.TrimSpace(ProductBuildSHA) != "" {
+		return strings.TrimSpace(ProductBuildSHA)
+	}
+	if v := build.GetVersion(); v != "" {
+		return v
+	}
+	return "dev"
 }
 
 // checkVersionMigration checks if the software version has changed and performs migration tasks

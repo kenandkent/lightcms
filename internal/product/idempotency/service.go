@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/database"
+	"github.com/jonradoff/lightcms/v7/internal/observe"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -127,9 +128,13 @@ func (s *Service) Begin(ctx context.Context, owner, method, path, key string, ca
 // resolveExisting applies the replay/conflict/lease/terminal matrix.
 func (s *Service) resolveExisting(ctx context.Context, existing *Operation, hash string, now time.Time) (Operation, error) {
 	if existing.RequestHash != hash {
+		// Task 16F: same key + changed body.
+		observe.Default().IncIdemConflict()
 		return Operation{}, idemErr(CodeConflict, "same Idempotency-Key with a different request body: use a new key for a new operation")
 	}
 	if existing.State == StateCompleted {
+		// Task 16F: cached-response replay (no duplicate side effect).
+		observe.Default().IncIdemReplay()
 		hit := *existing
 		hit.Replay = true
 		return hit, nil
@@ -138,6 +143,8 @@ func (s *Service) resolveExisting(ctx context.Context, existing *Operation, hash
 		return s.advanceAttempt(ctx, existing, now)
 	}
 	if existing.LeaseExpiresAt.After(now) {
+		// Task 16F: parallel worker holds the lease.
+		observe.Default().IncIdemConflict()
 		return Operation{}, idemErr(CodeInProgress, "operation is already being executed; retry after the lease lapses")
 	}
 	return Operation{}, idemErr(CodeLeaseExpired, "worker lease expired; take over the same attempt before proceeding")
@@ -178,6 +185,29 @@ func (s *Service) advanceAttempt(ctx context.Context, existing *Operation, now t
 		return Operation{}, idemErr(CodeNotFound, "operation vanished (TTL expiry); retry as a new operation")
 	}
 	return *next, nil
+}
+
+// TakeOverByKey finds the operation for (owner, method, path, key) and
+// takes over its expired lease (Task 16D: crashed-worker resume for
+// background jobs with stable operation keys). It returns the live record:
+// a concurrently completed operation reports StateCompleted (replay, do not
+// republish). A live lease or a missing record is an error — retry later.
+func (s *Service) TakeOverByKey(ctx context.Context, owner, method, path, key string) (Operation, error) {
+	existing, err := s.repo.FindByKey(ctx,
+		strings.TrimSpace(owner), strings.ToUpper(strings.TrimSpace(method)),
+		strings.TrimSpace(path), strings.TrimSpace(key))
+	if err != nil {
+		return Operation{}, err
+	}
+	if existing == nil {
+		return Operation{}, idemErr(CodeNotFound, "no such operation")
+	}
+	if existing.State == StateCompleted {
+		hit := *existing
+		hit.Replay = true
+		return hit, nil
+	}
+	return s.TakeOver(ctx, existing.ID, existing.LeaseGeneration)
 }
 
 // Get loads an operation by ID for takeover/resume reads.

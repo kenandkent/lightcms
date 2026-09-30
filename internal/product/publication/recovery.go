@@ -27,6 +27,7 @@ package publication
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,6 +36,7 @@ import (
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/database"
+	"github.com/jonradoff/lightcms/v7/internal/observe"
 	"github.com/jonradoff/lightcms/v7/internal/product/storage"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -394,8 +396,10 @@ func (s *Scanner) Run(ctx context.Context) {
 		return
 	}
 	defer s.running.Store(false)
-	if _, err := s.ScanOnce(ctx); err != nil {
+	if rep, err := s.ScanOnce(ctx); err != nil {
 		s.auditf(ctx, AuditCanonicalRebuilt, map[string]any{"startup_scan_error": err.Error()})
+	} else {
+		s.observeScan(rep)
 	}
 	t := time.NewTicker(s.scanInterval())
 	defer t.Stop()
@@ -404,8 +408,36 @@ func (s *Scanner) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_, _ = s.ScanOnce(ctx)
+			if rep, err := s.ScanOnce(ctx); err != nil {
+				s.auditf(ctx, AuditCanonicalRebuilt, map[string]any{"scan_error": err.Error()})
+			} else {
+				s.observeScan(rep)
+			}
 		}
+	}
+}
+
+// observeScan feeds one scan report into the Task 16F counters and P0
+// alerts: every repair increments scanner_repairs_total, every alert
+// increments scanner_alerts_total, and any P0-coded finding pages the
+// existing operational log surface immediately.
+func (s *Scanner) observeScan(rep ScanReport) {
+	repairs := int64(rep.CanonicalRebuilt + rep.CanonicalMismatchRepaired +
+		rep.PreviousRestored + rep.PreviousCleaned + rep.BackupRestored +
+		rep.BackupCleaned + rep.StaleNextCleaned + rep.StaleStagedFailed +
+		rep.OrphanQuarantined)
+	if repairs > 0 {
+		observe.Default().AddScannerRepairs(repairs)
+	}
+	if len(rep.Alerts) > 0 {
+		observe.Default().AddScannerAlerts(int64(len(rep.Alerts)))
+	}
+	p0 := int64(rep.ImmutableMissingP0 + rep.ImmutableCorruptP0 + rep.MultipleActiveP0)
+	if p0 > 0 {
+		observe.AlertP0("scanner_active_pointer_inconsistency",
+			fmt.Sprintf("scanner found %d P0 inconsistencies (missing=%d corrupt=%d multi-active=%d)",
+				p0, rep.ImmutableMissingP0, rep.ImmutableCorruptP0, rep.MultipleActiveP0),
+			observe.Fields{Stage: "scanner"})
 	}
 }
 

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/jonradoff/lightcms/v7/internal/observe"
 	"github.com/jonradoff/lightcms/v7/internal/product/generation"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -107,11 +109,24 @@ func (h *Handlers) HandleRollback(w http.ResponseWriter, r *http.Request) {
 			Owner: actor.Owner(), Method: r.Method, Path: r.URL.Path, Key: key, Body: nil,
 		})
 	}
+	// Task 16F: structured rollback request log with duration.
+	t0 := time.Now()
 	res, err := h.Gen.RollbackPublication(ctx, actor, cid, pid, expected)
+	f := observe.Fields{
+		RequestID: requestID(r), Actor: actor.ActorKind,
+		UserID: actor.Owner(), AgentSession: actor.AgentSession,
+		ContentID: cid.Hex(), PublicationID: pid.Hex(),
+		Stage: "rollback", DurationMS: time.Since(t0).Milliseconds(),
+	}
 	if err != nil {
+		f.ErrorCode = generation.CodeOf(err)
+		f.StatusCode = generation.StatusForCode(f.ErrorCode)
+		observe.LogPublication("rollback_failed", f)
 		WriteError(w, r, err)
 		return
 	}
+	f.StatusCode = 200
+	observe.LogPublication("rollback", f)
 	WriteJSON(w, http.StatusOK, res)
 }
 

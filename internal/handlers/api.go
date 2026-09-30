@@ -8,6 +8,9 @@ import (
 
 	"github.com/jonradoff/lightcms/v7/internal/auth"
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/product/generation"
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
+	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -33,6 +36,21 @@ type APIHandler struct {
 	userService         *services.UserService
 	agentSessionService *services.AgentSessionService
 	maintenanceService  *services.MaintenanceService
+	// Task 16C: shared publication runtime (wired in main.go; nil in unit
+	// tests preserves legacy behavior). When set, single/batch publish,
+	// rollback and unpublish route through PublicationService with
+	// Idempotency-Key handling; old URLs return Publication IDs and no raw
+	// GenerateStaticPage call occurs.
+	publicationService *publication.Service
+	idempotencyService *idempotency.Service
+	generationService  *generation.Service
+}
+
+// SetPublicationRuntime wires the shared V3 publication runtime (Task 16C/E).
+func (a *APIHandler) SetPublicationRuntime(pubs *publication.Service, idem *idempotency.Service, gen *generation.Service) {
+	a.publicationService = pubs
+	a.idempotencyService = idem
+	a.generationService = gen
 }
 
 // SetCommentService wires in the comment service.
