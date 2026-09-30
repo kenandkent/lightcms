@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,9 @@ func TestDisconnect(t *testing.T) {
 	dbName := lookupEnv("DATABASE_NAME")
 	if dbName == "" {
 		dbName = "lightcms-test"
+	}
+	if !strings.Contains(strings.ToLower(dbName), "test") {
+		t.Fatalf("testutil: REFUSING to run tests — database name %q does not contain 'test'", dbName)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

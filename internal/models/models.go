@@ -15,20 +15,39 @@ type TemplateField struct {
 	Placeholder string `bson:"placeholder,omitempty" json:"placeholder,omitempty"`
 	Options     string `bson:"options,omitempty" json:"options,omitempty"` // comma-separated for select type
 	Default     string `bson:"default,omitempty" json:"default,omitempty"`
+
+	Description string          `bson:"description,omitempty" json:"description,omitempty"`
+	Example     string          `bson:"example,omitempty" json:"example,omitempty"`
+	Validation  FieldValidation `bson:"validation,omitempty" json:"validation,omitempty"`
+}
+
+// FieldValidation holds optional validation constraints for a TemplateField.
+// Defined in models (not templatecontract): templatecontract may import
+// models, but models must never import templatecontract.
+type FieldValidation struct {
+	MinLength        *int     `bson:"min_length,omitempty" json:"min_length,omitempty"`
+	MaxLength        *int     `bson:"max_length,omitempty" json:"max_length,omitempty"`
+	Pattern          string   `bson:"pattern,omitempty" json:"pattern,omitempty"`
+	Min              *float64 `bson:"min,omitempty" json:"min,omitempty"`
+	Max              *float64 `bson:"max,omitempty" json:"max,omitempty"`
+	AllowedProtocols []string `bson:"allowed_protocols,omitempty" json:"allowed_protocols,omitempty"`
+	MaxItems         *int     `bson:"max_items,omitempty" json:"max_items,omitempty"`
 }
 
 // Template defines a content structure template
 type Template struct {
-	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	Name        string             `bson:"name" json:"name"`
-	Slug        string             `bson:"slug" json:"slug"`
-	Description string             `bson:"description" json:"description"`
-	Fields      []TemplateField    `bson:"fields" json:"fields"`
-	HTMLLayout  string             `bson:"html_layout" json:"html_layout"` // HTML template with {{.FieldName}} placeholders
-	Category    string             `bson:"category" json:"category"`       // For grouping content
-	IsSystem    bool               `bson:"is_system" json:"is_system"`     // Built-in templates can't be deleted
-	CreatedAt   time.Time          `bson:"created_at" json:"created_at"`
-	UpdatedAt   time.Time          `bson:"updated_at" json:"updated_at"`
+	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Name           string             `bson:"name" json:"name"`
+	Slug           string             `bson:"slug" json:"slug"`
+	Description    string             `bson:"description" json:"description"`
+	Fields         []TemplateField    `bson:"fields" json:"fields"`
+	HTMLLayout     string             `bson:"html_layout" json:"html_layout"` // HTML template with {{.FieldName}} placeholders
+	Category       string             `bson:"category" json:"category"`       // For grouping content
+	IsSystem       bool               `bson:"is_system" json:"is_system"`     // Built-in templates can't be deleted
+	CurrentVersion int64              `bson:"current_version,omitempty" json:"current_version"`
+	Status         string             `bson:"status,omitempty" json:"status"` // draft | active | deprecated
+	CreatedAt      time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt      time.Time          `bson:"updated_at" json:"updated_at"`
 }
 
 // Content represents a content item created from a template
@@ -61,6 +80,21 @@ type Content struct {
 	Deleted         bool                   `bson:"deleted" json:"deleted"`                                   // Soft delete flag
 	DeletedAt       *time.Time             `bson:"deleted_at,omitempty" json:"deleted_at,omitempty"`
 	SourceURL       string                 `bson:"source_url,omitempty" json:"source_url,omitempty"` // Original URL for imported content (RSS dedup key)
+	// Canonical path primitives (Task 2 / spec §12.8). FullPath keeps the
+	// author's canonical casing; CanonicalFullPath is the lowercased,
+	// Unicode NFC-normalized business key enforced by the
+	// UNIQUE(canonical_full_path, path_scope) partial index. Live content
+	// uses PathScope "live"; fork copies use their fork ObjectID hex.
+	// PathActive=false releases the path for reuse (soft delete path).
+	CanonicalFullPath string `bson:"canonical_full_path,omitempty" json:"-"`
+	PathScope         string `bson:"path_scope,omitempty" json:"-"`
+	PathActive        bool   `bson:"path_active,omitempty" json:"-"`
+	// CurrentVersion tracks the latest ContentVersion number for CAS
+	// allocation (replaces Count()+1 under concurrency). int64 to match
+	// ContentVersion.Version and the publication interfaces.
+	CurrentVersion int64 `bson:"current_version,omitempty" json:"current_version"`
+	// HasUnpublishedChanges marks a live page with draft edits awaiting Publish.
+	HasUnpublishedChanges bool `bson:"has_unpublished_changes,omitempty" json:"has_unpublished_changes"`
 	// Fork fields — set when this content item belongs to a fork workspace
 	ForkID        *primitive.ObjectID `bson:"fork_id,omitempty" json:"fork_id,omitempty"`                 // nil for live content
 	BaseUpdatedAt *time.Time          `bson:"base_updated_at,omitempty" json:"base_updated_at,omitempty"` // updated_at of the live page at fork time (for conflict detection)
@@ -89,8 +123,8 @@ type ContentFork struct {
 // ContentVersion represents a historical version of content
 type ContentVersion struct {
 	ID              primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
-	ContentID       primitive.ObjectID  `bson:"content_id" json:"content_id"`                                   // Reference to the content item
-	Version         int                 `bson:"version" json:"version"`                                         // Version number (1, 2, 3...)
+	ContentID       primitive.ObjectID  `bson:"content_id" json:"content_id"` // Reference to the content item
+	Version         int64               `bson:"version" json:"version"`       // Version number (1, 2, 3...)
 	Comment         string              `bson:"comment,omitempty" json:"comment,omitempty"`                     // Optional version comment
 	ModifiedBy      *primitive.ObjectID `bson:"modified_by,omitempty" json:"modified_by,omitempty"`             // User who made this version
 	ModifiedByEmail string              `bson:"modified_by_email,omitempty" json:"modified_by_email,omitempty"` // Denormalized email

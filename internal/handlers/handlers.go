@@ -1888,7 +1888,7 @@ func (h *Handler) ConfirmChangeTemplate(w http.ResponseWriter, r *http.Request) 
 
 	// Save current version before making changes
 	cursor, err := h.db.FindMany(ctx, "content_versions", bson.M{"content_id": contentID}, options.Find().SetSort(bson.D{{Key: "version", Value: -1}}).SetLimit(1))
-	nextVersion := 1
+	nextVersion := int64(1)
 	if err == nil {
 		var versions []models.ContentVersion
 		if cursor.All(ctx, &versions) == nil && len(versions) > 0 {
@@ -4157,7 +4157,7 @@ func (h *Handler) saveContentVersionWithOriginal(ctx context.Context, content *m
 		count = 1
 	}
 
-	version := int(count) + 1
+	version := count + 1
 
 	modifiedByEmail := services.EditorEmailFromContext(ctx)
 	contentVersion := models.ContentVersion{

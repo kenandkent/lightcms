@@ -65,8 +65,8 @@ func TestContentService_FullLifecycle(t *testing.T) {
 	}
 	if len(versions) > 0 {
 		v := versions[len(versions)-1].Version
-		_, _ = cs.GetVersion(ctx, c.ID, v)
-		_ = cs.RevertToVersion(ctx, c.ID, v, "revert")
+		_, _ = cs.GetVersion(ctx, c.ID, int(v))
+		_ = cs.RevertToVersion(ctx, c.ID, int(v), "revert")
 	}
 
 	// Queries.

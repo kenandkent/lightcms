@@ -210,6 +210,9 @@ func FailOp(op string) func(string, string) error {
 // duplicate key errors when MigrateToMultiUser runs in subsequent tests.
 func CleanupCollections(t *testing.T, db *database.DB) {
 	t.Helper()
+	if name := db.DatabaseName(); !strings.Contains(strings.ToLower(name), "test") {
+		t.Fatalf("testutil: REFUSING cleanup — database name %q does not contain 'test'", name)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -223,6 +226,8 @@ func CleanupCollections(t *testing.T, db *database.DB) {
 		"content_forks", "approval_workflows", "approval_requests",
 		"import_sources", "import_jobs", "link_check_jobs", "regen_jobs",
 		"maintenance_reports", "agent_digests",
+		"template_versions", "content_publications", "idempotency_records",
+		"webhook_outbox", "system_migrations",
 	}
 	for _, name := range collections {
 		db.Collection(name).Drop(ctx) //nolint:errcheck

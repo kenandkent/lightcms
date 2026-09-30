@@ -1054,7 +1054,7 @@ func (s *ContentService) saveVersion(ctx context.Context, content *models.Conten
 		count = 1
 	}
 
-	version := int(count) + 1
+	version := count + 1
 
 	modifiedByEmail := EditorEmailFromContext(ctx)
 	prov, _ := ProvenanceFromContext(ctx)
