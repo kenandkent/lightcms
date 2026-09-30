@@ -18,6 +18,7 @@ import (
 
 	"github.com/jonradoff/lightcms/v7/internal/auth"
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/observe"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
@@ -555,10 +556,35 @@ func (a *APIHandler) APIRestoreContent(w http.ResponseWriter, r *http.Request) {
 	a.jsonResponse(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
+// publicationReqFields builds the Task 16F structured log fields for a
+// legacy publish/unpublish request: actor from the API user + agent
+// session header, request ID passthrough, stage and duration.
+func (a *APIHandler) publicationReqFields(r *http.Request, stage string, t0 time.Time) observe.Fields {
+	f := observe.Fields{
+		RequestID:   r.Header.Get("X-Request-ID"),
+		AgentSession: r.Header.Get("X-Agent-Session"),
+		Actor:       "human",
+		Stage:       stage,
+		DurationMS:  time.Since(t0).Milliseconds(),
+	}
+	if f.AgentSession != "" {
+		f.Actor = "agent"
+	}
+	if u := a.getAPIUser(r); u != nil {
+		f.UserID = u.Email
+		if u.ID != "" {
+			f.UserID = u.ID
+		}
+	}
+	return f
+}
+
 func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Task 16F: request duration for the structured publish log.
+	t0 := time.Now()
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
@@ -573,6 +599,9 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 	if a.publicationService != nil {
 		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 		if key == "" {
+			f := a.publicationReqFields(r, "publish", t0)
+			f.StatusCode, f.ErrorCode = 428, "IDEMPOTENCY_KEY_REQUIRED"
+			observe.LogPublication("publish_rejected", f)
 			a.jsonError(w, 428, "Idempotency-Key is required for publish")
 			return
 		}
@@ -588,10 +617,21 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 			}
 			op, berr := a.idempotencyService.Begin(r.Context(), owner, r.Method, r.URL.Path, key, nil)
 			if berr != nil {
+				f := a.publicationReqFields(r, "publish", t0)
+				f.ContentID = id.Hex()
+				f.StatusCode, f.ErrorCode = idemHTTPStatus(berr), "IDEMPOTENCY_CONFLICT"
+				observe.LogPublication("publish_rejected", f)
 				a.jsonError(w, idemHTTPStatus(berr), sanitizeAPIError(berr))
 				return
 			}
 			if op.Replay && op.Response != nil {
+				f := a.publicationReqFields(r, "publish", t0)
+				f.ContentID = id.Hex()
+				if pid, ok := op.Response["publication_id"].(string); ok {
+					f.PublicationID = pid
+				}
+				f.StatusCode = 200
+				observe.LogPublication("publish_replay", f)
 				a.jsonResponse(w, http.StatusOK, op.Response)
 				return
 			}
@@ -600,6 +640,10 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 		}
 		res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID})
 		if perr != nil {
+			f := a.publicationReqFields(r, "publish", t0)
+			f.ContentID = id.Hex()
+			f.StatusCode, f.ErrorCode = publicationHTTPStatus(perr), publication.CodeOf(perr)
+			observe.LogPublication("publish_failed", f)
 			a.jsonError(w, publicationHTTPStatus(perr), sanitizeAPIError(perr))
 			return
 		}
@@ -613,6 +657,11 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 		a.auditLog(r, "content.publish", "content", id.Hex(), map[string]interface{}{
 			"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
 		})
+		f := a.publicationReqFields(r, "publish", t0)
+		f.ContentID, f.ContentVersion = id.Hex(), res.ContentVersion
+		f.PublicationID, f.FullPath = res.PublicationID.Hex(), res.FullPath
+		f.StatusCode = 200
+		observe.LogPublication("publish", f)
 		a.jsonResponse(w, http.StatusOK, map[string]interface{}{
 			"success": true, "publication_id": res.PublicationID.Hex(),
 			"public_url": res.PublicURL, "full_path": res.FullPath,
@@ -634,6 +683,8 @@ func (a *APIHandler) APIUnpublishContent(w http.ResponseWriter, r *http.Request)
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Task 16F: request duration for the structured unpublish log.
+	t0 := time.Now()
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
@@ -644,9 +695,16 @@ func (a *APIHandler) APIUnpublishContent(w http.ResponseWriter, r *http.Request)
 	// Task 16C: Unpublish is naturally idempotent — no Idempotency-Key.
 	if a.publicationService != nil {
 		if err := a.publicationService.Unpublish(r.Context(), publication.UnpublishRequest{ContentID: id}); err != nil {
+			f := a.publicationReqFields(r, "unpublish", t0)
+			f.ContentID = id.Hex()
+			f.StatusCode, f.ErrorCode = publicationHTTPStatus(err), publication.CodeOf(err)
+			observe.LogPublication("unpublish_failed", f)
 			a.jsonError(w, publicationHTTPStatus(err), sanitizeAPIError(err))
 			return
 		}
+		f := a.publicationReqFields(r, "unpublish", t0)
+		f.ContentID, f.StatusCode = id.Hex(), 200
+		observe.LogPublication("unpublish", f)
 		a.auditLog(r, "content.unpublish", "content", id.Hex(), nil)
 		a.jsonResponse(w, http.StatusOK, map[string]interface{}{"success": true})
 		return
@@ -1281,6 +1339,8 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Task 16F: request duration for the structured batch log.
+	t0 := time.Now()
 
 	var req struct {
 		IDs              []string `json:"ids"`
@@ -1320,6 +1380,9 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 	if a.publicationService != nil {
 		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 		if key == "" {
+			f := a.publicationReqFields(r, "batch_publish", t0)
+			f.StatusCode, f.ErrorCode = 428, "IDEMPOTENCY_KEY_REQUIRED"
+			observe.LogPublication("publish_rejected", f)
 			a.jsonError(w, 428, "Idempotency-Key is required for batch publish")
 			return
 		}
@@ -1336,6 +1399,9 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		a.auditLog(r, "content.batch_publish", "content", "", map[string]interface{}{"count": len(published)})
+		f := a.publicationReqFields(r, "batch_publish", t0)
+		f.StatusCode = 200
+		observe.LogPublication("batch_publish", f)
 		a.jsonResponse(w, http.StatusOK, map[string]interface{}{
 			"published":    published,
 			"publications": publications,

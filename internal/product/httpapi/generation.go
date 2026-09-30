@@ -5,8 +5,10 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/jonradoff/lightcms/v7/internal/observe"
 	"github.com/jonradoff/lightcms/v7/internal/product/generation"
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 
@@ -69,6 +71,30 @@ func (h *Handlers) HandleGenerate(w http.ResponseWriter, r *http.Request) {
 	actor, ok := h.actorOf(w, r)
 	if !ok {
 		return
+	}
+	// Task 16F: generation request counter + duration log.
+	t0 := time.Now()
+	observe.Default().IncGenerationRequests()
+	logGen := func(template string, resp *generation.GenerateResponse, status int, code string) {
+		f := observe.Fields{
+			RequestID: requestID(r), Actor: actor.ActorKind,
+			UserID: actor.Owner(), AgentSession: actor.AgentSession,
+			TemplateSlug: template, DurationMS: time.Since(t0).Milliseconds(),
+			StatusCode: status, ErrorCode: code, Stage: "generate",
+		}
+		if resp != nil {
+			f.ContentID = resp.ID
+			f.ContentVersion = resp.ContentVersion
+			f.TemplateVersion = resp.TemplateVersion
+			f.FullPath = resp.FullPath
+			if resp.PublicationID != nil {
+				f.PublicationID = *resp.PublicationID
+			}
+		}
+		if code != "" {
+			observe.Default().IncGenerationErrors()
+		}
+		observe.LogGeneration("request", f)
 	}
 	if r.Body != nil {
 		r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // existing 10 MiB body limit
@@ -161,6 +187,7 @@ func (h *Handlers) HandleGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.Gen.Generate(ctx, actor, req)
 	if err != nil {
+		logGen(req.Template, nil, generation.StatusForCode(generation.CodeOf(err)), generation.CodeOf(err))
 		WriteError(w, r, err)
 		return
 	}
@@ -173,6 +200,7 @@ func (h *Handlers) HandleGenerate(w http.ResponseWriter, r *http.Request) {
 	default:
 		status = 200
 	}
+	logGen(req.Template, &resp, status, "")
 	WriteJSON(w, status, generationResponseWire(resp))
 }
 
