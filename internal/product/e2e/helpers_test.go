@@ -43,11 +43,147 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/product/storage"
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 	"github.com/jonradoff/lightcms/v7/internal/services"
-	"github.com/jonradoff/lightcms/v7/internal/testutil"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 )
+
+// e2eDBName is the DEDICATED e2e database (Task 17A isolation hardening).
+// It MUST contain "test" per the safety guard in internal/testutil/testutil.go
+// (MustConnectTestDB / CleanupCollections refuse non-test names). The e2e
+// package previously shared `lightcms-test` with every other DB suite and
+// left data behind (e.g. the `financial-news` slug), breaking suites run
+// after it (TEMPLATE_SLUG_CONFLICT) and causing IndexBuildAborted flakiness
+// from concurrent index builds. A dedicated DB makes the package hermetic.
+//
+// Resolution order (mirrors testutil.loadEnvTest + DATABASE_NAME override):
+// MONGODB_URI comes from the environment or the repo-root .env.test walk
+// (stock .env.test works unchanged); the DB NAME is always forced to
+// e2eDBName and never taken from .env.test/DATABASE_NAME, so CI with a stock
+// .env.test (DATABASE_NAME=lightcms-test) still isolates e2e writes.
+const e2eDBName = "lightcms-test-e2e"
+
+var (
+	e2eOnce sync.Once
+	e2eDB   *database.DB
+	e2eErr  error
+)
+
+// TestMain forces the dedicated DB name process-wide (defense in depth: any
+// code path that still reads DATABASE_NAME, including a future
+// testutil.MustConnectTestDB call, lands in the e2e database) before running
+// the package. NOTE: testutil.loadEnvTest overwrites DATABASE_NAME from
+// .env.test on first connect, so the name is ALSO forced inside
+// mustConnectE2EDB; TestMain alone would not survive a stock .env.test.
+func TestMain(m *testing.M) {
+	_ = os.Setenv("DATABASE_NAME", e2eDBName)
+	os.Exit(m.Run())
+}
+
+// resolveE2EMongoURI returns the test replica-set URI from the environment,
+// falling back to the .env.test walk (same search as requireLiveMongo and
+// testutil.loadEnvTest: cwd up to 6 levels). It never touches DATABASE_NAME.
+func resolveE2EMongoURI() string {
+	if uri := strings.TrimSpace(os.Getenv("MONGODB_URI")); uri != "" {
+		return uri
+	}
+	dir, _ := os.Getwd()
+	for i := 0; i < 6; i++ {
+		data, err := os.ReadFile(filepath.Join(dir, ".env.test"))
+		if err == nil {
+			sc := bufio.NewScanner(strings.NewReader(string(data)))
+			for sc.Scan() {
+				line := strings.TrimSpace(sc.Text())
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				if idx := strings.IndexByte(line, '='); idx > 0 {
+					key := strings.TrimSpace(line[:idx])
+					val := strings.TrimSpace(line[idx+1:])
+					if key == "MONGODB_URI" && val != "" {
+						return val
+					}
+				}
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+// wipeE2EDB drops the ENTIRE dedicated database (single round-trip). The
+// guard refuses anything but e2eDBName so a wiring bug can never wipe the
+// shared `lightcms-test` DB or production. A full drop (rather than
+// testutil.CleanupCollections' per-collection drops) is hermetic against
+// collections missing from that list (e.g. template_upgrade_jobs,
+// import_logs) and any future product collections.
+func wipeE2EDB(t *testing.T, db *database.DB) {
+	t.Helper()
+	if got := db.DatabaseName(); got != e2eDBName {
+		t.Fatalf("e2e: refusing to wipe unexpected database %q (want %q)", got, e2eDBName)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := db.Collection("content").Database().Drop(ctx); err != nil {
+		t.Fatalf("e2e: drop database %q: %v", e2eDBName, err)
+	}
+}
+
+// mustConnectE2EDB returns the shared connection to the DEDICATED e2e
+// database, wiped BEFORE the test runs, and registers a t.Cleanup wipe so
+// each test also LEAVES the DB clean. Every test therefore starts clean AND
+// leaves clean; no test may depend on execution order or assume an
+// empty/full shared DB.
+func mustConnectE2EDB(t *testing.T) *database.DB {
+	t.Helper()
+	requireLiveMongo(t)
+	e2eOnce.Do(func() {
+		uri := resolveE2EMongoURI()
+		if uri == "" {
+			return // e2eDB stays nil; caller fails via requireLiveMongo below
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		wc := writeconcern.New(writeconcern.WMajority())
+		db, err := database.Connect(ctx, uri, e2eDBName, options.Client().SetWriteConcern(wc))
+		if err != nil {
+			e2eErr = fmt.Errorf("e2e: failed to connect to dedicated database %q: %w", e2eDBName, err)
+			return
+		}
+		e2eDB = db
+	})
+	if e2eErr != nil {
+		t.Fatalf("e2e: %v", e2eErr)
+	}
+	if e2eDB == nil {
+		t.Fatalf("E2E requires a replica-set test MongoDB: set MONGODB_URI or create .env.test (see docs/implementation/test-environment.md section 2). Refusing to record skipped-DB evidence.")
+	}
+	// Start-clean: each test (including a second newEnv within one test)
+	// begins from an empty dedicated DB.
+	wipeE2EDB(t, e2eDB)
+	// End-clean: leave the dedicated DB empty for the next test AND for any
+	// suite run after this package. DB drops are idempotent, so double-wipes
+	// (start of next test + cleanup of previous) are harmless. A single Drop
+	// covers every collection (no allow-list to drift out of sync).
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if e2eDB == nil {
+			return
+		}
+		if got := e2eDB.DatabaseName(); got != e2eDBName {
+			return
+		}
+		_ = e2eDB.Collection("content").Database().Drop(ctx)
+	})
+	return e2eDB
+}
 
 // sharedLayout is the deterministic template layout used by most E2E pages.
 // It renders the frozen render snapshot (title, headline, publication_id,
@@ -160,12 +296,14 @@ func defaultActor() generation.Actor {
 	}
 }
 
-// newEnv builds one application instance with a wiped test database and a
-// fresh temporary store root.
+// newEnv builds one application instance with a wiped DEDICATED e2e database
+// (lightcms-test-e2e, never the shared lightcms-test) and a fresh temporary
+// store root. mustConnectE2EDB wipes before AND registers a wipe-after via
+// t.Cleanup, so each test starts clean and leaves clean with no ordering
+// dependency.
 func newEnv(t *testing.T, opts envOpts) *testEnv {
 	t.Helper()
-	requireLiveMongo(t)
-	db, _ := testutil.MustConnectTestDB(t)
+	db := mustConnectE2EDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := db.EnsureProductIndexes(ctx); err != nil {
