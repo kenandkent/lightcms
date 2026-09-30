@@ -779,7 +779,10 @@ func (m *Migrator) backfillTemplates(ctx context.Context, a *analysis) {
 		if _, ok := a.v1ByTmpl[t.ID]; ok {
 			if t.CurrentVersion <= 0 {
 				_, _ = m.db.Collection("templates").UpdateOne(ctx,
-					bson.M{"_id": t.ID, "current_version": bson.M{"$lte": int64(0)}},
+					bson.M{"_id": t.ID, "$or": []bson.M{
+						{"current_version": bson.M{"$lte": int64(0)}},
+						{"current_version": bson.M{"$exists": false}},
+					}},
 					bson.M{"$set": bson.M{"current_version": int64(1)}})
 			}
 			continue
@@ -807,7 +810,10 @@ func (m *Migrator) backfillTemplates(ctx context.Context, a *analysis) {
 		a.v1ByTmpl[t.ID] = ver
 		if t.CurrentVersion <= 0 {
 			_, _ = m.db.Collection("templates").UpdateOne(ctx,
-				bson.M{"_id": t.ID, "current_version": bson.M{"$lte": int64(0)}},
+				bson.M{"_id": t.ID, "$or": []bson.M{
+					{"current_version": bson.M{"$lte": int64(0)}},
+					{"current_version": bson.M{"$exists": false}},
+				}},
 				bson.M{"$set": bson.M{"current_version": int64(1)}})
 		}
 	}

@@ -43,12 +43,19 @@ func TestCoverGapMapSagaErr(t *testing.T) {
 		{pubErrGap(publication.CodeInternal, "internal"), CodeInternal},
 		{pubErrGap("PUBLICATION_CONFLICT", "raw"), CodePublicationConflict},
 		{pubErrGap("SOMETHING_ELSE", "other"), CodeInternal},
-		// Non-publication codes fall through the publication-code switch to
-		// the default INTERNAL mapping (their mapSagaCode branches serve
-		// completePublishError's status computation, asserted below).
-		{&templatecontract.Error{Code: templatecontract.CodeNotFound, Message: "t"}, CodeInternal},
-		{&idempotency.Error{Code: idempotency.CodeConflict, Message: "c"}, CodeInternal},
+		// Task 19: not-found codes are preserved (spec §27), not collapsed
+		// to INTERNAL — see TestMapSagaErrPreservesNotFound for the full
+		// 404/409/503 table.
+		{pubErrGap(publication.CodeNotFound, "gone"), CodePublicationNotFound},
+		{&templatecontract.Error{Code: templatecontract.CodeNotFound, Message: "t"}, CodeTemplateNotFound},
+		{&templatecontract.Error{Code: templatecontract.CodeVersionNotFound, Message: "tv"}, CodeTemplateVersionNotFound},
+		{&templatecontract.Error{Code: templatecontract.CodeVersionConflict, Message: "tc"}, CodeTemplateVersionConflict},
+		// Bare storage errors stay INTERNAL: mapSagaCode's
+		// templatecontract.CodeOf fallthrough (never "") swallows them
+		// before the storage branch (accepted risk, Task 19 — reordering
+		// mapSagaCode belongs to the generation owner).
 		{&storage.Error{Code: storage.CodeIO, Message: "io"}, CodeInternal},
+		{&idempotency.Error{Code: idempotency.CodeConflict, Message: "c"}, CodeInternal},
 		{&Error{Code: CodePathInvalid, Message: "g"}, CodeInternal},
 		{errors.New("plain"), CodeInternal},
 	}
@@ -88,10 +95,12 @@ func TestCoverGapMapSagaErr(t *testing.T) {
 	if templatecontract.CodeInternal != "INTERNAL_ERROR" {
 		t.Fatalf("templatecontract.CodeInternal = %q", templatecontract.CodeInternal)
 	}
-	// storage.CodeOf maps every error (unknown → CodeIO), so isStoreErr is
-	// always true; assert the call shape.
-	if !isStoreErr(errors.New("x")) || !isStoreErr(&storage.Error{Code: storage.CodeIO, Message: "io"}) {
-		t.Fatalf("isStoreErr branches")
+	// Task 19: the isStoreErr tautology (storage.CodeOf maps every non-nil
+	// error, so the store-condition could never be false) was removed; the
+	// stage-failure branch unconditionally returns the retryable 503.
+	// storage.CodeOf shape is still pinned here.
+	if storage.CodeOf(nil) != "" || storage.CodeOf(errors.New("x")) == "" {
+		t.Fatalf("storage.CodeOf shape")
 	}
 }
 
