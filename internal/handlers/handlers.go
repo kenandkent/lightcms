@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"html"
 	"html/template"
 	"io"
 	"log"
@@ -948,8 +949,15 @@ func (h *Handler) NewContentWithTemplate(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	// Wave 4B RBAC gate (same pattern as CreateTemplate): viewers may not
+	// create content; contributor/editor/admin may (content.create).
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermContentCreate) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -1021,6 +1029,10 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Spec §16.6: the checkbox is a submit INTENT, never a state write. The
+	// row always lands as a draft and the live transition happens after the
+	// insert (publication saga when the V3 runtime is wired, legacy direct
+	// flag write when it is not).
 	published := r.FormValue("published") == "on"
 
 	// Contributor intercept: if a contributor attempts to create published content,
@@ -1031,12 +1043,6 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 			published = false
 			createContributorApproval = true
 		}
-	}
-
-	var publishedAt *time.Time
-	if published {
-		now := time.Now()
-		publishedAt = &now
 	}
 
 	// For blank pages, check if raw mode is enabled
@@ -1119,8 +1125,8 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 		MetaDescription: metaDescription,
 		OGImage:         ogImage,
 		Data:            data,
-		Published:       published,
-		PublishedAt:     publishedAt,
+		Published:       false,
+		PublishedAt:     nil,
 		PendingApproval: createContributorApproval,
 		UseHeader:       useHeader,
 		UseFooter:       useFooter,
@@ -1142,8 +1148,9 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 	content.PathActive = true
 	content.CurrentVersion = 1
 	content.HasUnpublishedChanges = false
-	// Transient projection for the Admin response cycle.
-	content.RequiresPublish = !content.Published
+	// Transient projection for the Admin response cycle: the row is a fresh
+	// draft, so a publish action is always pending after insert.
+	content.RequiresPublish = true
 
 	id, err := h.db.InsertOne(ctx, "content", content)
 	if err != nil {
@@ -1158,9 +1165,57 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 
 	content.ID = id
 
+	// Spec §16.6: perform the requested live transition only AFTER the draft
+	// insert, and only through PublicationService. Contributors were already
+	// filtered above (createContributorApproval) and content.publish is
+	// editor/admin only, so `published` here is a publish intent from a
+	// role allowed to go live.
+	publishFailed := false
+	publishFailureCode := ""
+	if published && auth.HasPermission(user.Role, auth.PermContentPublish) {
+		if h.publicationService != nil {
+			res, perr := h.publicationService.Publish(ctx, publication.PublishRequest{
+				ContentID: id,
+				Reason:    "admin form save",
+			})
+			if perr != nil {
+				// Draft stays draft; report the publication code below.
+				publishFailed = true
+				publishFailureCode = publication.CodeOf(perr)
+			} else {
+				content.Published = true
+				content.PublishedAt = &res.LogicalPublishedAt
+			}
+		} else {
+			// Unwired runtime (unit tests / legacy installs): keep the pre-V3
+			// direct flag write. UpdateOne on the just-inserted doc — a
+			// re-read + service UpdateContent would bump a second version.
+			now := time.Now()
+			content.Published = true
+			content.PublishedAt = &now
+			if uerr := h.db.UpdateOne(ctx, "content", bson.M{"_id": id}, bson.M{"$set": bson.M{
+				"published":    true,
+				"published_at": now,
+			}}); uerr != nil {
+				fmt.Printf("Warning: Failed to mark content published: %v\n", uerr)
+				content.Published = false
+				content.PublishedAt = nil
+			}
+		}
+	}
+
 	// Save the initial version (v1)
 	if err := h.saveContentVersion(ctx, &content); err != nil {
 		fmt.Printf("Warning: Failed to save initial content version: %v\n", err)
+	}
+
+	// Saga rejected the publish: the draft exists (v1 saved above) with
+	// published=false — hand the operator back to the edit page.
+	if publishFailed {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, formPublishFailureHTML(
+			h.adminPriorURL(r, id, content.FullPath), "/cm/content/"+id.Hex(), publishFailureCode))
+		return
 	}
 
 	// Task 16B: draft-only — no h.generateStaticPage here. Publishing is an
@@ -1286,28 +1341,46 @@ func (h *Handler) EditContent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Wave 4C publish-form contract: expose the active publication ID so the
+	// template can post expected_active_id (CAS guard, spec §16.6). Empty
+	// when the page has never been published or the lookup fails.
+	activePublicationID := ""
+	if active, aerr := publication.NewRepository(h.db, nil).GetActive(ctx, content.ID); aerr == nil && active != nil {
+		activePublicationID = active.ID.Hex()
+	}
+
 	h.renderAdmin(w, r, "content_form", map[string]interface{}{
-		"IsNew":             false,
-		"Template":          tmpl,
-		"Content":           content,
-		"Folders":           folders,
-		"Versions":          versions,
-		"SameSlugPages":     sameSlugPages,
-		"AllTemplates":      allTemplates,
-		"Error":             errorMsg,
-		"ForkPageID":        forkPageID,
-		"Comments":          comments,
-		"CurrentUserRole":   currentUserRole,
-		"CurrentUserEmail":  currentUserEmail,
-		"PageViews30d":      pageViews30d,
-		"PageViews7d":       pageViews7d,
-		"PageReferrersJSON": pageReferrersJSON,
+		"IsNew":               false,
+		"Template":            tmpl,
+		"Content":             content,
+		"Folders":             folders,
+		"Versions":            versions,
+		"SameSlugPages":       sameSlugPages,
+		"AllTemplates":        allTemplates,
+		"Error":               errorMsg,
+		"ForkPageID":          forkPageID,
+		"Comments":            comments,
+		"CurrentUserRole":     currentUserRole,
+		"CurrentUserEmail":    currentUserEmail,
+		"PageViews30d":        pageViews30d,
+		"PageViews7d":         pageViews7d,
+		"PageReferrersJSON":   pageReferrersJSON,
+		"ActivePublicationID": activePublicationID,
 	})
 }
 
 func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	// Wave 4B RBAC gate (Wave 1A pattern). Contributors hold no content.edit
+	// but must REACH this handler to submit for approval — hence the OR with
+	// content.submit_approval. Viewers hold neither → 403.
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermContentEdit) &&
+		!auth.HasPermission(user.Role, auth.PermContentSubmitApproval) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -1322,9 +1395,7 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	// Inject editor identity + provenance into context for version history
-	if user, ok := h.auth.GetCurrentUser(r); ok {
-		ctx = services.WithEditorEmail(ctx, user.Email)
-	}
+	ctx = services.WithEditorEmail(ctx, user.Email)
 	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
 	var existingContent models.Content
 	if err := h.db.FindOne(ctx, "content", bson.M{"_id": id}, &existingContent); err != nil {
@@ -1406,17 +1477,33 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Spec §16.6: the checkbox is a submit INTENT, never a state write —
+	// PublicationService is the only module allowed to change live page
+	// state. With the shared V3 runtime wired the draft save keeps the live
+	// flag/time untouched and the transition is delegated after the version
+	// pin; an unwired runtime (unit tests / legacy installs) keeps the pre-V3
+	// direct write verbatim.
+	sagaWired := h.publicationService != nil
+
 	published := r.FormValue("published") == "on"
 
 	// Contributor intercept: contributors cannot publish directly.
 	// If they attempt to publish, save as draft and submit for approval instead.
 	contributorSubmittedForApproval := false
 	if published {
-		if u, ok := h.auth.GetCurrentUser(r); ok && u.Role == models.RoleContributor {
+		if user.Role == models.RoleContributor {
 			published = false // keep as draft
 			contributorSubmittedForApproval = true
 		}
 	}
+
+	// Live transitions require content.edit: a contributor "unchecking" a live
+	// page must not unpublish it (their save is draft-only), and a fork copy
+	// never owns the live path (ForkID content must never write live bytes).
+	canTransition := sagaWired && existingContent.ForkID == nil &&
+		auth.HasPermission(user.Role, auth.PermContentEdit)
+	intentPublish := canTransition && published && !existingContent.Published
+	intentUnpublish := canTransition && !published && existingContent.Published
 
 	var publishedAt *time.Time
 	if published && existingContent.PublishedAt == nil {
@@ -1424,6 +1511,21 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 		publishedAt = &now
 	} else {
 		publishedAt = existingContent.PublishedAt
+	}
+
+	// What the draft save persists for the live fields. Under the saga they
+	// pass through unchanged (the saga owns published/published_at); the
+	// unwired path writes the submitted values exactly as before.
+	savedPublished := published
+	savedPublishedAt := publishedAt
+	// A save against a live page creates a draft diff (has_unpublished_changes)
+	// even though the live flag itself does not move; the unwired path keeps
+	// the pre-V3 formula.
+	hasUnpublished := published || originalContent.Published
+	if sagaWired {
+		savedPublished = existingContent.Published
+		savedPublishedAt = existingContent.PublishedAt
+		hasUnpublished = originalContent.Published
 	}
 
 	// Track old full path for dependency updates and file cleanup
@@ -1545,7 +1647,6 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	if newVersion < 1 {
 		newVersion = 1
 	}
-	hasUnpublished := published || originalContent.Published
 
 	update := bson.M{
 		"$set": bson.M{
@@ -1563,8 +1664,8 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 			"meta_description":        metaDescription,
 			"og_image":                ogImage,
 			"data":                    data,
-			"published":               published,
-			"published_at":            publishedAt,
+			"published":               savedPublished,
+			"published_at":            savedPublishedAt,
 			"pending_approval":        contributorSubmittedForApproval,
 			"use_header":              useHeader,
 			"use_footer":              useFooter,
@@ -1632,8 +1733,8 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	existingContent.MetaDescription = metaDescription
 	existingContent.OGImage = ogImage
 	existingContent.Data = data
-	existingContent.Published = published
-	existingContent.PublishedAt = publishedAt
+	existingContent.Published = savedPublished
+	existingContent.PublishedAt = savedPublishedAt
 	existingContent.UseTheme = useTheme
 	existingContent.RawMode = rawMode
 	existingContent.UseHeader = useHeader
@@ -1647,6 +1748,29 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 
 	// Task 16B: draft-only — no h.generateStaticPage / os.Remove here.
 	// Live bytes change only via PublicationService.Publish.
+
+	// Spec §16.6: the checkbox intent runs NOW, after the draft save and the
+	// version pin. Zero-value versions resolve to what was just saved
+	// (content.CurrentVersion under the page lock). On failure the row keeps
+	// its pre-save live state and the operator gets the publication code.
+	publishFailed := false
+	publishFailureCode := ""
+	if intentPublish {
+		if _, perr := h.publicationService.Publish(r.Context(), publication.PublishRequest{
+			ContentID: id,
+			Reason:    "admin form save",
+		}); perr != nil {
+			publishFailed = true
+			publishFailureCode = publication.CodeOf(perr)
+		}
+	} else if intentUnpublish {
+		if perr := h.publicationService.Unpublish(r.Context(), publication.UnpublishRequest{
+			ContentID: id,
+		}); perr != nil {
+			publishFailed = true
+			publishFailureCode = publication.CodeOf(perr)
+		}
+	}
 
 	// Regenerate sitemap after content update
 	go h.RegenerateSitemap(context.Background())
@@ -1665,7 +1789,37 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 		}(oldTitleForWikilinks, title, oldFullPath, fullPath)
 	}
 
+	// HTTP 200 + failure page (not a redirect): the draft save above stands,
+	// the live transition did not happen, and the page reports why.
+	if publishFailed {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, formPublishFailureHTML(
+			h.adminPriorURL(r, id, fullPath), "/cm/content/"+id.Hex(), publishFailureCode))
+		return
+	}
+
 	http.Redirect(w, r, "/cm/content", http.StatusSeeOther)
+}
+
+// formPublishFailureHTML renders the standalone failure page returned (HTTP
+// 200) when a form-driven publish/unpublish is rejected by PublicationService
+// (spec §16.6). The draft is already saved — only the live transition failed —
+// so the page shows the publication error code, links the prior live URL
+// (best effort) and returns the operator to the content editor. Deliberately
+// self-contained: FailedPublishHTML belongs to the product publish page.
+func formPublishFailureHTML(priorURL, backHref, code string) template.HTML {
+	if code == "" {
+		code = "PUBLISH_FAILED"
+	}
+	return template.HTML(`<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>发布失败</title></head>
+<body>
+<h1>发布失败</h1>
+<p>错误代码：<code>` + html.EscapeString(code) + `</code></p>
+<p>草稿已保存；线上页面保持原状态。</p>
+<p>当前线上页面：<a href="` + html.EscapeString(priorURL) + `">` + html.EscapeString(priorURL) + `</a></p>
+<p><a href="` + html.EscapeString(backHref) + `">返回编辑</a></p>
+</body></html>`)
 }
 
 func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
@@ -2203,8 +2357,17 @@ func (h *Handler) DiffContentVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RevertContentVersion(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	// Wave 4B RBAC gate: same permission set as UpdateContent — a revert is a
+	// draft edit (content.edit), contributors may revert their own work only
+	// as an approval submission (content.submit_approval); viewers → 403.
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermContentEdit) &&
+		!auth.HasPermission(user.Role, auth.PermContentSubmitApproval) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
