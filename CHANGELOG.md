@@ -21,6 +21,31 @@ All notable changes to LightCMS are documented here, organized by version.
 - Publish/rollback error mapping preserves spec §27 not-found codes: unknown rollback source → 404 `PUBLICATION_NOT_FOUND`, unknown template/version → 404, template version conflict → 409 (previously all collapsed to 500 `INTERNAL_ERROR`).
 - Removed the dead `isStoreErr` tautology in the saga error mapper (both branches returned the same retryable 503).
 
+### Added — post-rehearsal waves 1–4 (i18n, contracts, admin UX)
+- **Bilingual UI (zh/en)**: full Chinese/English internationalization of the admin console and public site — ~986 dictionary keys behind per-string `i18n` template calls, language switcher, and the root-scope `Lang` fix so layout partials resolve translations.
+- **Edit-page publish controls**: a 发布上线 (Publish) button posting to the saga-backed `/cm/content/{id}/publish` with an `expected_active_id` lost-update precondition, a 发布历史 (Publications) link into the restore/rollback history, and help text explaining the published checkbox flow.
+- **Typed API client errors**: `apiclient` auto-mints `Idempotency-Key` headers on search-replace executes and parses both error envelope shapes into `APIError{Status, Code, Message, Retryable, RequestID}`.
+- **Machine-readable legacy error codes**: session/CSRF JSON errors now emit `{"error":"<message>","code":"<CODE>"}` — the `error` field stays a string for existing clients, codes documented in docs/API.md §12.
+- **MCP publish transparency**: `publish_content` / `publish_multiple` return `publication_id` + `public_url` JSON, and tool descriptions state the exact permissions required (`content.edit` + `content.publish`).
+
+### Changed — post-rehearsal waves 1–4 (scope, control plane, RBAC)
+- **Publish scope enforcement**: REST publish and batch-publish require `content.edit` + `content.publish`; publish, batch-publish, and search-replace execute reject missing idempotency keys with 428 `IDEMPOTENCY_KEY_REQUIRED`.
+- **Batch publish is per-item idempotent**: replaying a batch under the same key returns the original per-item outcomes instead of minting duplicate publications; bulk create rejects `published:true` (it would bypass publication records, outbox delivery, and idempotency) with an actionable 400.
+- **Admin form saves route through the publication control plane**: checking 已发布 on create or update runs the PublicationService saga (Publication record, static bytes, audit/outbox owned by the saga); unchecking runs the saga unpublish; unwired installs keep the legacy flag behavior byte-for-byte.
+- **Admin RBAC**: granular permission gates on destructive admin POSTs (delete content/template/snippet), on all seven publication endpoints (publish, restore-and-publish, revert-live, upgrade start/run, publications, upgrade preview), and on content create/update/revert (viewer → 403; contributor keeps the submit-for-approval flow).
+
+### Fixed — post-rehearsal waves 1–4 (correctness)
+- Serving-layer safety filters and served-truth alignment: path/case/asset canonical guards so redirects, slugs, and generated-file lookups agree on one canonical form.
+- Outbox durability: webhook outbox idempotency, delivery payload race, and embedding search-index pinning under concurrent publish.
+- Asset-canonical collision guard shared with the admin upload form (uploads could claim a path the canonical index already owned).
+- Saga error mapping with spec §27 codes plus comment attribution provenance, template rename race, and the theme-writer path.
+- Version concurrency: `saveVersion` inserts the CAS-allocated version number and heals only when that version already exists — a slower concurrent writer can no longer jump history and skip its version (`UNIQUE(content_id, version)` holds under load).
+- **Admin publication forms work end-to-end**: restore/revert buttons always failed because forms never emitted the required `idempotency_key`, and 恢复为草稿 posted to an unregistered route (404); forms now carry render-time idempotency keys + `expected_active_id`, retry preserves both, and 恢复为草稿 targets the registered revert route.
+- Upgrade UI: the preview page's start form posted to a GET-only route (405) and the job retry form re-created jobs instead of running them — now targeting `/upgrade-start` and `/upgrade-jobs/{id}/run`.
+- Admin product pages parse and execute the admin layout (raw `{{i18n}}`/CSRF placeholders previously shipped as literal page text) and stamp CSRF tokens on their POST forms (they were unpostable behind `csrf.Protect`).
+- Delete-page button is a top-level form again: the previously nested `<form>` start tag was dropped by HTML parsers, silently turning 删除页面 into a save.
+- Merge result lists `requires_publish` entries as links to their edit pages, so the merge → publish flow is reachable.
+
 ---
 
 ## [7.2.2] - 2026-07-07

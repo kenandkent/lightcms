@@ -74,7 +74,7 @@ LightCMS is a Go-powered content management system built for the AI era. It's si
 **Lightweight**: A clean, focused codebase that's easy to understand, modify, and extend. No bloated frameworks or complex abstractions.
 
 **AI-Native**: Built from the ground up for the AI era:
-- **MCP Integration**: Full Model Context Protocol server with 106 tools and 3 prompt resources for website management. Supports both local stdio and HTTP streamable transports — connect from Claude Code, Claude Desktop, or any MCP-compatible client.
+- **MCP Integration**: Full Model Context Protocol server with 122 tools and 3 prompt resources for website management. Supports both local stdio and HTTP streamable transports — connect from Claude Code, Claude Desktop, or any MCP-compatible client.
 - **OAuth 2.1 for Remote Agents**: Sandboxed desktop apps like Claude's Cowork can securely connect over HTTP using OAuth 2.1 with PKCE. No embedded passwords — just authorize once and the agent manages your site.
 - **Fork-Friendly**: Designed to be forked and customized by Claude Code. Ask Claude to add new content types, modify templates, or build custom features — the codebase is structured for AI-assisted development.
 - **Natural Language Website Management**: Skip the admin UI entirely. Create pages, manage assets, customize themes, and publish content through conversation.
@@ -156,7 +156,7 @@ Recommended agent pattern for large updates: `list_content` → transform in par
 
 ### Developer & Integration
 - **REST API**: Full `/api/v1/` JSON API with API key and OAuth token authentication, RBAC-enforced
-- **MCP Server**: 106 tools + 3 prompt resources for agentic website management (stdio + HTTP streamable)
+- **MCP Server**: 122 tools + 3 prompt resources for agentic website management (stdio + HTTP streamable)
 - **OAuth 2.1**: Authorization code flow with PKCE for remote MCP clients — no embedded passwords
 - **CLI Tool**: Command-line interface for all content management operations
 - **URL Redirects**: 301/302 redirect rules managed from the admin panel
@@ -919,7 +919,7 @@ Run `lightcms --help` for full usage.
 
 [![lightcms MCP server](https://glama.ai/mcp/servers/jonradoff/lightcms/badges/card.svg)](https://glama.ai/mcp/servers/jonradoff/lightcms)
 
-LightCMS includes a full MCP (Model Context Protocol) server with 92 tools and 3 prompt resources for managing your entire website through AI agents. It supports two transport modes:
+LightCMS includes a full MCP (Model Context Protocol) server with 122 tools and 3 prompt resources for managing your entire website through AI agents. It supports two transport modes:
 
 - **Stdio** — for local tools like Claude Code
 - **HTTP Streamable** — for remote/sandboxed clients like Claude's Cowork, Claude Desktop, or any MCP-compatible app
@@ -978,10 +978,10 @@ The MCP HTTP endpoint accepts both authentication methods:
 
 Both methods enforce RBAC based on the authenticated user's role.
 
-### Available Tools (106 total) + 3 Prompt Resources
+### Available Tools (122 total) + 3 Prompt Resources
 
-- **Content** (20): create, read, update, delete, publish, unpublish, restore, versioning, revert, preview, bulk update, bulk field operation, export, backlinks, update by path, publish multiple
-- **Templates** (5): create, read, update, delete, list
+- **Content** (19): create, read, update, delete, publish, unpublish, restore, versioning, revert, preview, bulk update, bulk field operation, export, backlinks, update by path, publish multiple
+- **Templates** (6): create, read, update, delete, list, schema
 - **Snippets** (5): create, read, update, delete, list
 - **Assets** (6): upload, upload from URL, read, delete, list files and folders
 - **Search** (7): full-text search, end-user search, search-and-replace (global + scoped, preview + execute), reindex embeddings
@@ -993,6 +993,7 @@ Both methods enforce RBAC based on the authenticated user's role.
 - **Scheduled Publishing** (3, v4.5+): schedule publish, list scheduled, cancel scheduled
 - **Audit & Link Check** (3, v4.5+): get audit log, check links, list broken links
 - **Comments** (3, v6.0+): list comments, post comment, delete comment
+- **Agent Sandbox & Governance** (8, v7.0+): start/get/end sandbox, fork diff, session changes, rollback, maintenance report/scan
 - **Approvals** (11, v6.0+): list/get/create/update/delete approval workflows; list/get/submit/approve/reject/cancel approval requests
 - **Prompt Resources** (3, v4.5+): `lightcms://site/structure`, `lightcms://content/recent`, `lightcms://theme/config`
 

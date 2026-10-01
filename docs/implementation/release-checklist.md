@@ -5,14 +5,14 @@ Branch: `task/19-release`. Version: `build.json` → `7.3.0`, CHANGELOG entry ad
 
 ## Preconditions (all must be checked with evidence pointers)
 
-- [x] **Full regression green**: `go test -p 1 ./... -count=1` → exit 0, 27 packages ok, 0 FAIL (release-report §1; log `/tmp/19-final2.log`, verbose `/tmp/19-final-verbose.log`).
+- [x] **Full regression green**: `go test -p 1 ./... -count=1` → exit 0, 27 packages ok, 0 FAIL (release-report §1; log `/tmp/19-final2.log`, verbose `/tmp/19-final-verbose.log`). **Re-validated 2026-10-02 after waves 1–4 + i18n merged (main `6e0d8d1`; later deltas are docs, example pages, and a `theme-vars.css` `--primary` default tweak that no test reads or embeds): exit 0, 29 packages ok, 0 FAIL, `go vet ./...` clean — log `/tmp/wave5-regression-20261002-020908.log`; scope note in release-report §11.**
 - [x] **Vet + builds**: `go vet ./...` exit 0; `cmd/server`, `cmd/mcp`, `cmd/cli` all build (release-report §1).
-- [x] **MCP inventory**: rebuilt `bin/lightcms-mcp` (gitignored, local only); runtime `tools/list` = **122 tools** incl. `get_template_schema` (release-report §2). Doc drift noted: `MCP.md` says 92, `CLAUDE.md` says 115 — docs follow-up, not blocking.
+- [x] **MCP inventory**: rebuilt `bin/lightcms-mcp` (gitignored, local only); runtime `tools/list` = **122 tools** incl. `get_template_schema` (release-report §2). Doc drift resolved 2026-10-02: `MCP.md` and `CLAUDE.md` both document 122 (wave 3C); rebuilt again 2026-10-02 on post-wave-4 main — count unchanged.
 - [x] **Migration rehearsal** on representative fixtures (verified / mismatch / missing-static / deleted / fork / case-collision / empty-path): dry-run → blocked apply → admin repair → completed apply → scanner pass; no serving URL lost (release-report §3).
 - [x] **Crash rehearsal**: real `kill -9` mid-publish AND mid-unpublish cutover (separate OS process, post-rename/pre-commit), same-data restart, scanner repair, outbox delivery (release-report §4).
 - [x] **One binary / one UI**: single `lightcms` binary serves admin UI + API + MCP + public site (335 routes, one fly process group); only MongoDB + filesystem volume required (release-report §5).
 - [x] **Gap triage a–g closed as fixed / workflow / accepted-risk** (release-report §6). No open BLOCKER from Task 19 scope except the external signoffs below.
-- [x] **Version + changelog**: `build.json` 7.2.2 → 7.3.0, CHANGELOG `## [7.3.0]` entry (this commit).
+- [x] **Version + changelog**: `build.json` 7.2.2 → 7.3.0, CHANGELOG `## [7.3.0]` entry (this commit); extended 2026-10-02 with the waves 1–4 / i18n / saveVersion / admin UX sections (everything unreleased since `v7.2.2` now sits in the 7.3.0 entry — `v7.3.0` still untagged).
 - [x] **Tree hygiene**: no `.env.test` created/committed; no binaries committed (`bin/` gitignored); test-polluted `internal/handlers/static/sitemap.xml` restored; temp rehearsal harnesses retired after green (evidence retained in release-report).
 
 ## Release conditions (owner must clear before calling 7.3.0 fully-gated)

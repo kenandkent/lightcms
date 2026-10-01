@@ -28,7 +28,7 @@ Coverage spot-check on touched packages (17D method: isolated runs, unique DB na
 - `go build -o bin/lightcms-mcp ./cmd/mcp` per CLAUDE.md → ok (`bin/` is gitignored; local verification only, nothing committed).
 - Runtime `tools/list` via in-memory MCP session: **122 tools**, including `get_template_schema` — matches the Task 16 documented inventory (122).
 - Full runtime tool list retained at `/tmp/19-mcptools.txt`.
-- **Doc drift (non-blocking, docs owner):** `MCP.md` claims "92 tools total", `CLAUDE.md` claims 115. Both predate V3 additions. Refresh deferred; runtime is authoritative.
+- **Doc drift (non-blocking, docs owner):** `MCP.md` claims "92 tools total", `CLAUDE.md` claims 115. Both predate V3 additions. Refresh deferred; runtime is authoritative. *(Resolved 2026-10-02: `MCP.md`/`CLAUDE.md` → 122 via wave 3C; `README.md` counts + tool breakdown refreshed with waves 1–4 evidence — see §9/§11.)*
 
 ## 3. Migration rehearsal on representative fixtures (rehearsal 3)
 
@@ -118,7 +118,7 @@ The rehearsals above verify behavior against the spec on disposable data. They d
 - [ ] **Security review.** Evidence: e2e security table (`TestE2E_SecuritySandbox/Scopes/StoredXSS/AssetSSRF/InputHardening`), §39.8; sandbox/scopes enforcement unchanged by this commit (no auth-path files touched — verify via `git diff --stat`). Focus: 500→404/409 changes don't leak existence info beyond policy; quarantine-preservation (never delete) holds for the new fork path.
 - [ ] **Operations review.** Evidence: §3/§4 rehearsal logs, `docs/BACKUP-RESTORE.md`, `docs/DEPLOYMENT-PRODUCTION.md`, `docs/PUBLICATION-RUNBOOK.md`, `docs/UPGRADE.md`. Focus: production migration drill on a COPY (dry-run report as audit record), backup/restore drill, deploy.sh run, post-deploy `/healthz` + scanner clean pass + flag `completed`.
 - [ ] **CI gate.** `.github/` is absent in this tree — the release cannot be called fully-gated without CI. Owner must restore CI (or confirm the canonical repo runs it) and attach a green CI run for the release commit. **This is a release condition, not a waiver.**
-- [ ] **Docs follow-up (non-blocking):** refresh `MCP.md` (92) and `CLAUDE.md` (115) tool counts to the runtime 122; schedule R1 (regenerate) and R2 (scheduler lease) decisions.
+- [ ] **Docs follow-up (non-blocking):** ~~refresh `MCP.md` (92) and `CLAUDE.md` (115) tool counts~~ — **resolved 2026-10-02**: both now document the runtime-verified 122 (wave 3C); schedule R1 (regenerate) and R2 (scheduler lease) decisions.
 
 ## 10. Conflicts / out-of-scope observations
 
@@ -126,3 +126,43 @@ The rehearsals above verify behavior against the spec on disposable data. They d
 - Mongo container reused healthy throughout; never stopped/removed/wiped. Test DBs used: shared `lightcms-test` (established pattern + `CleanupCollections`), dedicated `lightcms-test-e2e` (e2e package), `lightcms-test-t19` (kill-9 rehearsal, retired). Production data never touched.
 - Pre-existing conditional SKIP unchanged (`TestHomepage_WebsiteJSONLD`).
 - No `.env.test` or binaries committed. `bin/lightcms-mcp` rebuilt locally only (gitignored).
+
+## 11. Post-rehearsal addendum — waves 1–4 merged before the tag (2026-10-02)
+
+The `v7.3.0` tag was not cut after §9; integration continued on main through four
+hardening waves plus the bilingual UI program. 7.3.0 therefore now includes, on top
+of §1–§10:
+
+- **i18n (ui-a–d)**: full zh/en admin + site UI, ~986 dictionary keys, root-scope `Lang` fix.
+- **Wave 1**: granular RBAC on destructive admin POSTs; serving-layer safety filters and
+  served-truth alignment; outbox idempotency, delivery payload race, search-index pinning.
+- **Wave 2**: publish/batch scope enforcement (`content.edit` + `content.publish`);
+  428 `IDEMPOTENCY_KEY_REQUIRED` on publish, batch-publish, and search-replace execute;
+  per-item batch replay (same-key replay returns original outcomes, no duplicate
+  publications); bulk create rejects `published:true`; migration boot + version/actor
+  attribution fixes; saga error mapping, comment provenance, template rename race,
+  theme writer.
+- **Wave 3**: `apiclient` auto-mints idempotency keys and parses both error envelopes
+  into `APIError`; legacy JSON errors carry a sibling machine-readable `code`
+  (docs/API.md §12); MCP `publish_content`/`publish_multiple` return
+  `publication_id`/`public_url` (tool count unchanged at 122).
+- **saveVersion CAS fix** (`e596177`): the CAS-allocated version number is inserted and
+  heals only when that version already exists — concurrent writers can no longer jump
+  history (`UNIQUE(content_id, version)` holds under load).
+- **Wave 4 (admin UI ↔ control plane)**: admin form checkbox publish/unpublish now runs
+  the PublicationService saga (legacy byte-for-byte fallback when unwired); RBAC gates on
+  all seven publication endpoints and content create/update/revert; restore/revert/upgrade
+  forms fixed end-to-end (render-time `idempotency_key`, `expected_active_id` CAS,
+  registered route targets, CSRF stamping + real layout execution on product pages);
+  edit-page 发布上线 button + 发布历史 link; nested delete-form fix; merge-result
+  `requires_publish` links.
+
+Evidence refresh (waves 1–4 scope): full regression `go test -p 1 ./... -count=1` on main
+at `6e0d8d1` (later deltas: docs, example pages, and a `theme-vars.css` `--primary` default
+tweak that no test reads or embeds) → **exit 0, 29 packages ok, 0 FAIL**; `go vet ./...`
+clean; `bin/lightcms-mcp` rebuilt (122 tools unchanged — verified by source count: 122
+`mcp.AddTool` registrations on the main server, plus the separate 4-tool read-only
+`/mcp-public` subset). Log:
+`/tmp/wave5-regression-20261002-020908.log`. The §9 external reviews should treat the
+wave 1–4 deltas as in-scope additions — security review in particular now covers the new
+RBAC gates and saga-delegated form saves.

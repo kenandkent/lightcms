@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en" prefix="og: https://ogp.me/ns# article: https://ogp.me/ns/article#">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101c29">
+  <title>{{.headline}} | Chain Lens</title>
+  <meta name="description" content="{{.summary}}">
+  <meta name="author" content="{{.author}}">
+  {{if .public_url}}<link rel="canonical" href="{{.public_url}}">
+  <meta property="og:url" content="{{.public_url}}">{{end}}
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Chain Lens">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:title" content="{{.headline}}">
+  <meta property="og:description" content="{{.summary}}">
+  <meta property="article:section" content="{{.category}}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{.headline}}">
+  <meta name="twitter:description" content="{{.summary}}">
+  {{if .share_image_url}}<meta property="og:image" content="{{.share_image_url}}">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="{{if .share_image_alt}}{{.share_image_alt}}{{else}}Chain Lens crypto market analysis{{end}}">
+  <meta name="twitter:image" content="{{.share_image_url}}">
+  <meta name="twitter:image:alt" content="{{if .share_image_alt}}{{.share_image_alt}}{{else}}Chain Lens crypto market analysis{{end}}">{{end}}
+  <link rel="icon" href="{{if .favicon_url}}{{.favicon_url}}{{else}}/static/images/chain-lens-icon.svg{{end}}">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/images/chain-lens-touch.png">
+  <style>
+    :root { color-scheme:dark; --page:#101c29; --surface:#172635; --ink:#eef3f5; --body:#c8d5dc; --muted:#9bb0bd; --line:#304555; --teal:#7acdc0; --gold:#e0bb79; --loading-duration:500ms; }
+    *,*::before,*::after { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; background:var(--page); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; -webkit-font-smoothing:antialiased; }
+    a { color:inherit; }
+    button { font:inherit; }
+    :focus-visible { outline:2px solid var(--gold); outline-offset:4px; }
+    .page-content { visibility:hidden; animation:reveal-content 0s linear var(--loading-duration) forwards; }
+    .loading-screen { position:fixed; inset:0; z-index:50; display:grid; place-items:center; background:var(--page); animation:hide-loading 0s linear var(--loading-duration) forwards; }
+    .loading-inner { display:grid; justify-items:center; gap:16px; }
+    .loading-mark { font-size:34px; color:var(--teal); }
+    .loading-label { color:var(--muted); font-size:14px; }
+    .loading-track { display:block; width:112px; height:2px; overflow:hidden; background:var(--line); }
+    .loading-line { display:block; width:44px; height:100%; background:var(--teal); animation:loading-sweep 500ms ease-in-out infinite alternate; }
+    @keyframes reveal-content { to { visibility:visible; } }
+    @keyframes hide-loading { to { visibility:hidden; } }
+    @keyframes loading-sweep { to { transform:translateX(68px); } }
+    .skip-link { position:absolute; top:-60px; left:16px; z-index:20; padding:12px 16px; background:var(--gold); color:var(--page); }
+    .skip-link:focus { top:16px; }
+    .reading-progress { position:fixed; inset:0 auto auto 0; z-index:30; width:0; height:3px; background:var(--teal); pointer-events:none; }
+    .shell { width:min(100% - 40px,1160px); margin-inline:auto; }
+    .site-header { border-bottom:1px solid var(--line); }
+    .header-inner { min-height:76px; display:flex; align-items:center; justify-content:space-between; gap:24px; }
+    .brand { display:flex; align-items:center; gap:12px; font-size:18px; font-weight:700; }
+    .brand-mark { color:var(--teal); font-size:28px; }
+    .header-note { color:var(--muted); font-size:13px; }
+    .article-header { padding-block:clamp(56px,8vw,108px) 52px; }
+    .topic { display:inline-block; margin-bottom:24px; padding-bottom:9px; border-bottom:2px solid var(--teal); color:var(--teal); font-size:14px; }
+    h1 { max-width:22ch; margin:0; font-size:clamp(34px,5.4vw,68px); font-weight:700; letter-spacing:-.045em; line-height:1.15; overflow-wrap:anywhere; }
+    .summary { max-width:62ch; margin:28px 0 0; color:var(--body); font-size:clamp(17px,1.6vw,20px); line-height:1.75; }
+    .article-meta { display:flex; flex-wrap:wrap; gap:8px 20px; margin-top:32px; color:var(--muted); font-size:14px; font-variant-numeric:tabular-nums; }
+    .article-meta strong { color:var(--ink); font-weight:600; }
+    .article-grid { display:grid; grid-template-columns:minmax(0,72ch) minmax(190px,1fr); gap:clamp(40px,7vw,100px); align-items:start; border-top:1px solid var(--line); padding-block:48px 96px; }
+    .story { min-width:0; color:var(--body); font-size:17px; line-height:1.9; overflow-wrap:anywhere; }
+    .story > :first-child { margin-top:0; }
+    .story h2,.story h3 { color:var(--ink); line-height:1.35; letter-spacing:-.025em; }
+    .story h2 { margin:2.4em 0 .7em; font-size:clamp(24px,2.6vw,32px); }
+    .story h3 { margin:2em 0 .6em; font-size:21px; }
+    .story p,.story ul,.story ol,.story blockquote { margin-block:0 1.35em; }
+    .story a { color:var(--teal); text-underline-offset:4px; }
+    .story strong { color:var(--ink); }
+    .story blockquote { margin-inline:0; border-left:3px solid var(--teal); padding-left:22px; color:var(--ink); }
+    .story img { display:block; max-width:100%; height:auto; margin-block:32px; border-radius:5px; }
+    .story pre { max-width:100%; overflow-x:auto; padding:20px; background:var(--surface); font-size:14px; }
+    .story table { display:block; max-width:100%; overflow-x:auto; border-collapse:collapse; font-size:14px; line-height:1.6; margin-block:24px 32px; }
+    .story th,.story td { min-width:130px; border-bottom:1px solid var(--line); padding:12px 18px 12px 0; text-align:left; vertical-align:top; }
+    .story th { color:var(--ink); }
+    .side-note { position:sticky; top:32px; border-top:2px solid var(--gold); padding-top:22px; }
+    .side-note h2 { margin:0 0 14px; color:var(--gold); font-size:16px; }
+    .side-note p { margin:0; color:var(--muted); font-size:14px; line-height:1.8; }
+    .side-note .divider { height:1px; margin-block:22px; background:var(--line); }
+    .article-actions { display:flex; flex-wrap:wrap; gap:12px; margin-top:48px; }
+    .action-button { min-height:44px; padding:10px 16px; border:1px solid var(--line); border-radius:5px; background:var(--surface); color:var(--ink); cursor:pointer; }
+    .action-button:hover { border-color:var(--teal); }
+    .site-footer { border-top:1px solid var(--line); }
+    .footer-inner { display:flex; flex-wrap:wrap; justify-content:space-between; gap:16px; padding-block:28px 40px; color:var(--muted); font-size:13px; line-height:1.7; }
+    .footer-inner p { margin:0; }
+    @media(max-width:800px) { .article-grid { grid-template-columns:minmax(0,1fr); gap:48px; } .side-note { position:static; } }
+    @media(max-width:600px) { .shell { width:calc(100% - 32px); } .header-inner { min-height:64px; } .header-note { display:none; } .article-header { padding-block:52px 40px; } h1 { max-width:none; } .article-grid { padding-block:36px 64px; } .story { font-size:16px; line-height:1.85; } }
+    @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } .loading-line { animation:none; width:100%; } }
+    @media print { :root { color-scheme:light; } body { background:white; color:#1b2630; } .loading-screen,.site-header,.side-note,.article-actions,.reading-progress { display:none; } .page-content { visibility:visible; animation:none; } .article-grid { display:block; } .story,.summary { color:#1b2630; } }
+  </style>
+</head>
+<body>
+  <div class="loading-screen" role="status" aria-live="polite"><div class="loading-inner"><span class="loading-mark" aria-hidden="true">◇</span><span class="loading-label" data-i18n="loading">Loading</span><span class="loading-track" aria-hidden="true"><span class="loading-line"></span></span></div></div>
+  <div class="page-content">
+    <a class="skip-link" href="#article-content" data-i18n="skip_link">Skip to article</a>
+    <div class="reading-progress" id="reading-progress" aria-hidden="true"></div>
+    <header class="site-header"><div class="shell header-inner"><div class="brand"><span class="brand-mark" aria-hidden="true">◇</span><span data-i18n="site_name">Chain Lens</span></div><span class="header-note" data-i18n="header_note">Crypto market analysis · Independent perspective</span></div></header>
+    <main><article class="shell">
+      <header class="article-header"><span class="topic">{{.category}}</span><h1>{{.headline}}</h1><p class="summary">{{.summary}}</p><div class="article-meta"><span><span data-i18n="author_label">By</span> <strong>{{.author}}</strong></span><span><span data-i18n="published_label">Published</span> <time>{{.published_at}}</time></span></div></header>
+      <div class="article-grid"><div><div class="story" id="article-content">{{.body}}</div><div class="article-actions"><button class="action-button" id="copy-link" type="button" data-i18n="copy_link">Copy article link</button><button class="action-button" id="back-to-top" type="button" data-i18n="back_to_top">Back to top</button></div></div>
+        <aside class="side-note"><h2 data-i18n="reading_tip">Reading note</h2><p data-i18n="risk_note">This article discusses market information and analytical frameworks, not investment advice. Crypto assets are volatile; make decisions based on your own risk tolerance.</p><div class="divider"></div><p data-i18n="method_note">Our analysis examines sources, market structure, and risk. Short-term price forecasts are no substitute for verified facts.</p></aside>
+      </div>
+    </article></main>
+    <footer class="site-footer"><div class="shell footer-inner"><p data-i18n="footer_about">Chain Lens · Crypto markets and digital assets</p><p data-i18n="footer_disclaimer">For information only. Not investment advice.</p></div></footer>
+  </div>
+  <script>
+    (function () {
+      var preferredLanguage = (navigator.languages && navigator.languages[0]) || navigator.language || 'en';
+      var language = /^zh(?:-|$)/i.test(preferredLanguage) ? 'zh-CN' : 'en';
+      var translations = {
+        en: { loading:'Loading', site_name:'Chain Lens', skip_link:'Skip to article', header_note:'Crypto market analysis · Independent perspective', author_label:'By', published_label:'Published', copy_link:'Copy article link', back_to_top:'Back to top', reading_tip:'Reading note', risk_note:'This article discusses market information and analytical frameworks, not investment advice. Crypto assets are volatile; make decisions based on your own risk tolerance.', method_note:'Our analysis examines sources, market structure, and risk. Short-term price forecasts are no substitute for verified facts.', footer_about:'Chain Lens · Crypto markets and digital assets', footer_disclaimer:'For information only. Not investment advice.', copied:'Link copied', copy_failed:'Could not copy. Use the address bar.' },
+        zh: { loading:'加载中', site_name:'链上观察', skip_link:'跳转到正文', header_note:'加密市场分析 · 保持独立判断', author_label:'作者', published_label:'发布时间', copy_link:'复制文章链接', back_to_top:'返回顶部', reading_tip:'阅读提示', risk_note:'本文讨论市场信息与分析框架，并非投资建议。加密资产波动较大，请结合自身风险承受能力独立判断。', method_note:'分析关注信息来源、市场结构与风险边界，不以短期价格预测代替事实核查。', footer_about:'链上观察 · 聚焦加密市场与数字资产', footer_disclaimer:'内容仅供参考，不构成投资建议。', copied:'链接已复制', copy_failed:'复制失败，请使用地址栏' }
+      };
+      var messages = language === 'zh-CN' ? translations.zh : translations.en;
+      document.documentElement.lang = language;
+      document.title = document.title.replace(/\s\|\s[^|]*$/, ' | ' + messages.site_name);
+      document.querySelectorAll('[data-i18n]').forEach(function (element) { element.textContent = messages[element.getAttribute('data-i18n')]; });
+      var progress = document.getElementById('reading-progress');
+      var copyButton = document.getElementById('copy-link');
+      var resetLabelTimer;
+      function updateProgress() { var range = document.documentElement.scrollHeight - window.innerHeight; progress.style.width = Math.max(0,Math.min(100,range > 0 ? window.scrollY / range * 100 : 100)) + '%'; }
+      copyButton.addEventListener('click',async function () {
+        try { await navigator.clipboard.writeText(window.location.href); copyButton.textContent = messages.copied; }
+        catch (error) { copyButton.textContent = messages.copy_failed; }
+        window.clearTimeout(resetLabelTimer);
+        resetLabelTimer = window.setTimeout(function () { copyButton.textContent = messages.copy_link; },3000);
+      });
+      document.getElementById('back-to-top').addEventListener('click',function () { window.scrollTo({top:0,behavior:window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'}); });
+      window.addEventListener('scroll',updateProgress,{passive:true});
+      window.addEventListener('resize',updateProgress);
+      updateProgress();
+    }());
+  </script>
+</body>
+</html>
