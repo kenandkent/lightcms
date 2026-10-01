@@ -583,6 +583,13 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Lane 2A: publish-by-ID targets always exist, and the generation scope
+	// matrix requires edit+publish for existing targets — a publish-only
+	// scoped key gets 403 here with zero mutation (before ID parsing,
+	// idempotency Begin, and any saga call).
+	if !a.requirePermission(w, r, auth.PermContentEdit) {
+		return
+	}
 	// Task 16F: request duration for the structured publish log.
 	t0 := time.Now()
 
@@ -1077,6 +1084,14 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Lane 2A: execute requires Idempotency-Key (428 when absent) with zero
+	// mutation — before the bulk slot, body parsing, scanning, or writes.
+	// The stable per-page auto-republish keys below derive from this header.
+	if strings.TrimSpace(r.Header.Get("Idempotency-Key")) == "" {
+		a.jsonError(w, 428, "Idempotency-Key is required for search-replace execute")
+		return
+	}
+
 	if !acquireBulkOp() {
 		a.jsonError(w, http.StatusTooManyRequests, "a bulk operation is already in progress, please retry shortly")
 		return
@@ -1339,6 +1354,12 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Lane 2A: batch items are existing pages by ID — require edit in
+	// addition to publish (generation scope matrix), 403 with zero mutation
+	// before body parsing or any publish call.
+	if !a.requirePermission(w, r, auth.PermContentEdit) {
+		return
+	}
 	// Task 16F: request duration for the structured batch log.
 	t0 := time.Now()
 
@@ -1387,10 +1408,51 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		for _, id := range ids {
-			res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id})
+			// Lane 2A: per-item idempotency under the batch key. The
+			// UNIQUE(owner, method, path, key) index (EnsureProductIndexes)
+			// isolates each item via its path suffix, so a same-key retry
+			// replays cached per-item responses instead of minting
+			// duplicate publications. Mirrors the single-publish
+			// Begin/Publish/Complete shape.
+			var opID *primitive.ObjectID
+			var opAttempt int64
+			if a.idempotencyService != nil {
+				owner := ""
+				if u := a.getAPIUser(r); u != nil {
+					owner = u.ID
+					if owner == "" {
+						owner = u.Email
+					}
+				}
+				itemPath := strings.TrimSuffix(strings.TrimSpace(r.URL.Path), "/") + "/items/" + id.Hex()
+				op, berr := a.idempotencyService.Begin(r.Context(), owner, r.Method, itemPath, key, nil)
+				if berr != nil {
+					failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(berr)})
+					continue
+				}
+				if op.Replay && op.Response != nil {
+					pid, _ := op.Response["publication_id"].(string)
+					purl, _ := op.Response["public_url"].(string)
+					published = append(published, id.Hex())
+					publications = append(publications, map[string]string{
+						"id": id.Hex(), "publication_id": pid, "public_url": purl,
+					})
+					continue
+				}
+				opID = &op.ID
+				opAttempt = op.Attempt
+			}
+			res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID})
 			if perr != nil {
 				failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(perr)})
 			} else {
+				if opID != nil && a.idempotencyService != nil {
+					_, _ = a.idempotencyService.Complete(r.Context(), *opID, opAttempt, 200, map[string]any{
+						"success": true,
+						"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
+						"content_id": res.ContentID.Hex(), "full_path": res.FullPath,
+					}, false)
+				}
 				published = append(published, id.Hex())
 				publications = append(publications, map[string]string{
 					"id": id.Hex(), "publication_id": res.PublicationID.Hex(),
@@ -1673,6 +1735,13 @@ func (a *APIHandler) APIScopedSearchReplacePreview(w http.ResponseWriter, r *htt
 // APIScopedSearchReplaceExecute executes a scoped search-and-replace.
 func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *http.Request) {
 	if !a.requirePermission(w, r, auth.PermSearchReplace) {
+		return
+	}
+
+	// Lane 2A: scoped execute requires Idempotency-Key (428 when absent)
+	// with zero mutation — mirrors the global execute path.
+	if strings.TrimSpace(r.Header.Get("Idempotency-Key")) == "" {
+		a.jsonError(w, 428, "Idempotency-Key is required for search-replace execute")
 		return
 	}
 
