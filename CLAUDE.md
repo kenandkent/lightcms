@@ -91,11 +91,11 @@ Once connected, you can ask Claude to manage your content naturally:
 Binary: `bin/lightcms-mcp`
 Config: Uses same `config.dev.json` or environment variables as main server
 
-### Available MCP Tools (115 total):
+### Available MCP Tools (122 total, verified 2026-10-01 via live `tools/list`):
 
-**Content (23 tools):** list_content, get_content, create_content, update_content, update_content_by_path, publish_content, publish_multiple, unpublish_content, delete_content, restore_content, preview_content, get_content_versions, get_content_version, revert_to_version, bulk_create_content, bulk_update_content, bulk_field_operation, export_content, get_backlinks
+**Content (19 tools):** list_content, get_content, create_content, update_content, update_content_by_path, publish_content, publish_multiple, unpublish_content, delete_content, restore_content, preview_content, get_content_versions, get_content_version, revert_to_version, bulk_create_content, bulk_update_content, bulk_field_operation, export_content, get_backlinks
 
-**Templates (5 tools):** list_templates, get_template, create_template, update_template, delete_template
+**Templates (6 tools):** list_templates, get_template, create_template, update_template, delete_template, get_template_schema
 
 **Snippets (5 tools):** list_snippets, get_snippet, create_snippet, update_snippet, delete_snippet
 
@@ -103,9 +103,19 @@ Config: Uses same `config.dev.json` or environment variables as main server
 
 **Search (7 tools):** search_content, search_replace_preview, search_replace_execute, scoped_search_replace_preview, scoped_search_replace_execute, end_user_search, reindex_embeddings
 
-**Settings (18 tools):** get_theme, update_theme, get_theme_versions, get_theme_version, revert_theme_to_version, pin_theme_version, unpin_theme_version, get_site_config, update_site_config, list_redirects, create_redirect, update_redirect, delete_redirect, list_folders, create_folder, get_folder, delete_folder, list_collections, create_collection, get_collection, update_collection, delete_collection, regenerate_all_content
+**Settings (23 tools):** get_theme, update_theme, get_theme_versions, get_theme_version, revert_theme_to_version, pin_theme_version, unpin_theme_version, get_site_config, update_site_config, list_redirects, create_redirect, update_redirect, delete_redirect, list_folders, create_folder, get_folder, delete_folder, list_collections, create_collection, get_collection, update_collection, delete_collection, regenerate_all_content
+
+**Import (10 tools):** list_import_sources, create_import_source, update_import_source, delete_import_source, trigger_import_source, import_markdown, import_csv, list_import_jobs, get_import_job, cancel_import_job
+
+**Webhooks (6 tools):** list_webhooks, create_webhook, get_webhook, update_webhook, delete_webhook, list_webhook_deliveries, regenerate_webhook_secret
 
 **Forks (8 tools):** list_forks, create_fork, get_fork, fork_page, remove_fork_page, merge_fork, archive_fork, delete_fork
+
+**Content Locking (4 tools):** get_content_lock, acquire_content_lock, release_content_lock, force_unlock_content
+
+**Scheduled Publishing (3 tools):** schedule_content_publish, list_scheduled_content, cancel_scheduled_publish
+
+**Audit & Link Check (3 tools):** list_audit_logs, start_link_check, get_link_check_results
 
 **Comments (3 tools, v6.0+):** list_comments, create_comment, delete_comment
 
