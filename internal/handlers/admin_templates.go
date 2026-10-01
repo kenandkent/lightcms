@@ -80,11 +80,11 @@ var adminTemplates = map[string]string{
 ` + adminLayoutEnd,
 
 	"login": `<!DOCTYPE html>
-<html lang="en">
+<html lang="{{.Lang}}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login - LightCMS</title>
+    <title>{{i18n "login.title" "登录" .Lang}} - LightCMS</title>
     <link rel="icon" type="image/x-icon" href="/static/images/favicon.ico">
     <link rel="icon" type="image/png" sizes="16x16" href="/static/images/favicon-16x16.png">
     <link rel="icon" type="image/png" sizes="32x32" href="/static/images/favicon-32x32.png">
@@ -176,22 +176,91 @@ var adminTemplates = map[string]string{
             transform: translateY(-2px);
             box-shadow: 0 10px 20px -10px rgba(99, 102, 241, 0.5);
         }
+        /* UI-A: macOS-style overlay scrollbars (thin, transparent until
+           hover/scroll) + top-right language switch, matching admin shell. */
+        html {
+            scrollbar-width: thin;
+            scrollbar-color: transparent transparent;
+        }
+        html:hover, html.is-scrolling {
+            scrollbar-color: rgba(99, 102, 241, 0.45) transparent;
+        }
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: transparent;
+            border-radius: 8px;
+        }
+        html:hover::-webkit-scrollbar-thumb, html.is-scrolling::-webkit-scrollbar-thumb {
+            background: rgba(99, 102, 241, 0.45);
+        }
+        .lang-switch {
+            position: fixed;
+            top: 14px;
+            right: 16px;
+            z-index: 9000;
+            display: flex;
+            gap: 2px;
+            padding: 3px;
+            background: rgba(30, 27, 75, 0.85);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            border-radius: 9999px;
+            backdrop-filter: blur(10px);
+        }
+        .lang-switch a {
+            padding: 4px 12px;
+            border-radius: 9999px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            color: #94a3b8;
+            text-decoration: none;
+        }
+        .lang-switch a:hover {
+            color: #f1f5f9;
+            text-decoration: none;
+        }
+        .lang-switch a.active {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: white;
+        }
     </style>
 </head>
 <body>
+    <div class="lang-switch" title="{{i18n "switch.label" "语言" .Lang}}">
+        <a href="/cm/lang?lang=zh" class="{{if eq .Lang "zh"}}active{{end}}">{{i18n "switch.zh" "中文" .Lang}}</a>
+        <a href="/cm/lang?lang=en" class="{{if eq .Lang "en"}}active{{end}}">{{i18n "switch.en" "EN" .Lang}}</a>
+    </div>
     <div class="login-card">
-        <h1 class="logo"><img src="/static/images/lightcms-logo.png" alt="LightCMS"></h1>
-        <p class="subtitle">Content Management System</p>
+        <h1 class="logo"><img src="/static/images/lightcms-logo.png" alt="{{i18n "login.logo.alt" "LightCMS" .Lang}}"></h1>
+        <p class="subtitle">{{i18n "login.subtitle" "内容管理系统" .Lang}}</p>
         {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
         <form method="POST" action="/cm/login" autocomplete="off">
             {{.CSRFField}}
-            <label for="email">Email</label>
-            <input type="email" id="email" name="email" placeholder="Enter email" value="{{.Email}}" required autofocus autocomplete="username" {{if .RateLimited}}disabled{{end}}>
-            <label for="password">Password</label>
-            <input type="password" id="password" name="password" placeholder="Enter password" required autocomplete="current-password" {{if .RateLimited}}disabled{{end}}>
-            <button type="submit" {{if .RateLimited}}disabled style="opacity: 0.5; cursor: not-allowed;"{{end}}>Sign In</button>
+            <label for="email">{{i18n "login.email" "邮箱" .Lang}}</label>
+            <input type="email" id="email" name="email" placeholder="{{i18n "login.email.ph" "输入邮箱" .Lang}}" value="{{.Email}}" required autofocus autocomplete="username" {{if .RateLimited}}disabled{{end}}>
+            <label for="password">{{i18n "login.password" "密码" .Lang}}</label>
+            <input type="password" id="password" name="password" placeholder="{{i18n "login.password.ph" "输入密码" .Lang}}" required autocomplete="current-password" {{if .RateLimited}}disabled{{end}}>
+            <button type="submit" {{if .RateLimited}}disabled style="opacity: 0.5; cursor: not-allowed;"{{end}}>{{i18n "login.submit" "登录" .Lang}}</button>
         </form>
     </div>
+    <script>
+    // UI-A: overlay scrollbar visibility while scrolling (800ms idle).
+    (function() {
+        var idleTimer = null;
+        function markScrolling() {
+            document.documentElement.classList.add('is-scrolling');
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(function() { document.documentElement.classList.remove('is-scrolling'); }, 800);
+        }
+        window.addEventListener('scroll', markScrolling, {passive: true});
+        window.addEventListener('touchmove', markScrolling, {passive: true});
+    })();
+    </script>
 </body>
 </html>`,
 
@@ -8667,7 +8736,7 @@ function verify(secret, signature, body) {
 }
 
 const adminLayoutStart = `<!DOCTYPE html>
-<html lang="en">
+<html lang="{{.Lang}}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -8718,6 +8787,65 @@ const adminLayoutStart = `<!DOCTYPE html>
             top: 0;
             height: 100vh;
             overflow-y: auto;
+        }
+        /* UI-A: macOS-style overlay scrollbars for shell scroll containers.
+           Thin with transparent track/thumb by default; the thumb appears on
+           hover AND while scrolling (.is-scrolling, toggled by JS). Gutter is
+           stable so showing the thumb never shifts layout. */
+        .sidebar, #cp-sessions, #cp-log {
+            scrollbar-width: thin;
+            scrollbar-color: transparent transparent;
+            scrollbar-gutter: stable;
+        }
+        .sidebar:hover, #cp-sessions:hover, #cp-log:hover,
+        .sidebar.is-scrolling, #cp-sessions.is-scrolling, #cp-log.is-scrolling {
+            scrollbar-color: rgba(99, 102, 241, 0.45) transparent;
+        }
+        .sidebar::-webkit-scrollbar, #cp-sessions::-webkit-scrollbar, #cp-log::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        .sidebar::-webkit-scrollbar-track, #cp-sessions::-webkit-scrollbar-track, #cp-log::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .sidebar::-webkit-scrollbar-thumb, #cp-sessions::-webkit-scrollbar-thumb, #cp-log::-webkit-scrollbar-thumb {
+            background: transparent;
+            border-radius: 8px;
+            border: none;
+        }
+        .sidebar:hover::-webkit-scrollbar-thumb, #cp-sessions:hover::-webkit-scrollbar-thumb, #cp-log:hover::-webkit-scrollbar-thumb,
+        .sidebar.is-scrolling::-webkit-scrollbar-thumb, #cp-sessions.is-scrolling::-webkit-scrollbar-thumb, #cp-log.is-scrolling::-webkit-scrollbar-thumb {
+            background: rgba(99, 102, 241, 0.45);
+        }
+        /* UI-A: language switch, fixed top-right dark pill. */
+        .lang-switch {
+            position: fixed;
+            top: 14px;
+            right: 16px;
+            z-index: 9000;
+            display: flex;
+            gap: 2px;
+            padding: 3px;
+            background: rgba(30, 27, 75, 0.85);
+            border: 1px solid var(--border);
+            border-radius: 9999px;
+            backdrop-filter: blur(10px);
+        }
+        .lang-switch a {
+            padding: 4px 12px;
+            border-radius: 9999px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-decoration: none;
+        }
+        .lang-switch a:hover {
+            color: var(--text);
+            text-decoration: none;
+        }
+        .lang-switch a.active {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
         }
         .sidebar-logo {
             display: block;
@@ -9235,7 +9363,7 @@ const adminLayoutStart = `<!DOCTYPE html>
         var titleEl = document.getElementById('info-modal-title');
         var okBtn = document.getElementById('info-ok-btn');
 
-        titleEl.textContent = title || 'Information';
+        titleEl.textContent = title || '{{i18n "modal.info.title" "提示信息" .Lang}}';
         msgEl.innerHTML = message;
         modal.style.display = 'flex';
 
@@ -9261,7 +9389,7 @@ const adminLayoutStart = `<!DOCTYPE html>
             var okBtn = document.getElementById('confirm-ok-btn');
             var cancelBtn = document.getElementById('confirm-cancel-btn');
 
-            titleEl.textContent = title || 'Confirm';
+            titleEl.textContent = title || '{{i18n "modal.confirm.title" "请确认" .Lang}}';
             msgEl.innerHTML = message;
             modal.style.display = 'flex';
 
@@ -9285,62 +9413,82 @@ const adminLayoutStart = `<!DOCTYPE html>
             cancelBtn.addEventListener('click', onCancel);
         });
     }
+
+    // UI-A: overlay scrollbar visibility while scrolling. Adds .is-scrolling
+    // on scroll/touchmove, removes it after 800ms idle.
+    document.addEventListener('DOMContentLoaded', function() {
+        var scrollEls = document.querySelectorAll('.sidebar, #cp-sessions, #cp-log');
+        scrollEls.forEach(function(el) {
+            var idleTimer = null;
+            function markScrolling() {
+                el.classList.add('is-scrolling');
+                if (idleTimer) clearTimeout(idleTimer);
+                idleTimer = setTimeout(function() { el.classList.remove('is-scrolling'); }, 800);
+            }
+            el.addEventListener('scroll', markScrolling, {passive: true});
+            el.addEventListener('touchmove', markScrolling, {passive: true});
+        });
+    });
     </script>
 </head>
 <body>
+    <div class="lang-switch" title="{{i18n "switch.label" "语言" .Lang}}">
+        <a href="/cm/lang?lang=zh" class="{{if eq .Lang "zh"}}active{{end}}">{{i18n "switch.zh" "中文" .Lang}}</a>
+        <a href="/cm/lang?lang=en" class="{{if eq .Lang "en"}}active{{end}}">{{i18n "switch.en" "EN" .Lang}}</a>
+    </div>
     <div class="admin-layout">
         <aside class="sidebar">
-            <a href="/cm" class="sidebar-logo"><img src="/static/images/lightcms-logo.png" alt="LightCMS"></a>
+            <a href="/cm" class="sidebar-logo"><img src="/static/images/lightcms-logo.png" alt="{{i18n "shell.logo.alt" "LightCMS" .Lang}}"></a>
             {{if .AppVersion}}<div class="sidebar-version">v{{.AppVersion}}</div>{{end}}
             <nav>
                 <div class="nav-section">
-                    <div class="nav-section-title">Content</div>
-                    <a href="/cm" class="nav-link">📊 Dashboard</a>
-                    <a href="/cm/content" class="nav-link">📄 Content</a>
-                    <a href="/cm/templates" class="nav-link">📋 Templates</a>
-                    <a href="/cm/snippets" class="nav-link">✂️ Snippets</a>
-                    <a href="/cm/collections" class="nav-link">📁 Collections</a>
-                    <a href="/cm/folders" class="nav-link">🗂️ Folders</a>
-                    <a href="/cm/forks" class="nav-link">🌿 Forks</a>
-                    <a href="/cm/imports" class="nav-link">📥 Imports</a>
-                    <a href="/cm/approvals" class="nav-link">✅ Approvals{{if .PendingApprovalCount}} <span class="nav-badge">{{.PendingApprovalCount}}</span>{{end}}</a>
+                    <div class="nav-section-title">{{i18n "section.content" "内容" .Lang}}</div>
+                    <a href="/cm" class="nav-link">📊 {{i18n "nav.dashboard" "仪表盘" .Lang}}</a>
+                    <a href="/cm/content" class="nav-link">📄 {{i18n "nav.content" "内容管理" .Lang}}</a>
+                    <a href="/cm/templates" class="nav-link">📋 {{i18n "nav.templates" "模板" .Lang}}</a>
+                    <a href="/cm/snippets" class="nav-link">✂️ {{i18n "nav.snippets" "代码片段" .Lang}}</a>
+                    <a href="/cm/collections" class="nav-link">📁 {{i18n "nav.collections" "合集" .Lang}}</a>
+                    <a href="/cm/folders" class="nav-link">🗂️ {{i18n "nav.folders" "文件夹" .Lang}}</a>
+                    <a href="/cm/forks" class="nav-link">🌿 {{i18n "nav.forks" "内容分支" .Lang}}</a>
+                    <a href="/cm/imports" class="nav-link">📥 {{i18n "nav.imports" "导入" .Lang}}</a>
+                    <a href="/cm/approvals" class="nav-link">✅ {{i18n "nav.approvals" "审批" .Lang}}{{if .PendingApprovalCount}} <span class="nav-badge">{{.PendingApprovalCount}}</span>{{end}}</a>
                 </div>
                 <div class="nav-section">
-                    <div class="nav-section-title">Media</div>
-                    <a href="/cm/assets" class="nav-link">🖼️ Asset Library</a>
+                    <div class="nav-section-title">{{i18n "section.media" "媒体" .Lang}}</div>
+                    <a href="/cm/assets" class="nav-link">🖼️ {{i18n "nav.assets" "素材库" .Lang}}</a>
                 </div>
                 <div class="nav-section">
-                    <div class="nav-section-title">Settings</div>
-                    <a href="/cm/theme" class="nav-link">🎨 Theme</a>
-                    <a href="/cm/redirects" class="nav-link">↪️ Redirects</a>
-                    <a href="/cm/config" class="nav-link">⚙️ Configuration</a>
-                    <a href="/cm/api-keys" class="nav-link">🔑 API Keys</a>
-                    <a href="/cm/security" class="nav-link">🔒 Security</a>
-                    <a href="/cm/webhooks" class="nav-link">🔔 Webhooks</a>
+                    <div class="nav-section-title">{{i18n "section.settings" "设置" .Lang}}</div>
+                    <a href="/cm/theme" class="nav-link">🎨 {{i18n "nav.theme" "主题" .Lang}}</a>
+                    <a href="/cm/redirects" class="nav-link">↪️ {{i18n "nav.redirects" "重定向" .Lang}}</a>
+                    <a href="/cm/config" class="nav-link">⚙️ {{i18n "nav.config" "站点配置" .Lang}}</a>
+                    <a href="/cm/api-keys" class="nav-link">🔑 {{i18n "nav.apikeys" "API 密钥" .Lang}}</a>
+                    <a href="/cm/security" class="nav-link">🔒 {{i18n "nav.security" "安全" .Lang}}</a>
+                    <a href="/cm/webhooks" class="nav-link">🔔 {{i18n "nav.webhooks" "Webhook" .Lang}}</a>
                     {{if and .CurrentUser (eq .CurrentUser.Role "admin")}}
-                    <a href="/cm/users" class="nav-link">👥 Users</a>
-                    <a href="/cm/audit" class="nav-link">📜 Audit Log</a>
-                    <a href="/cm/analytics" class="nav-link">📊 Analytics</a>
+                    <a href="/cm/users" class="nav-link">👥 {{i18n "nav.users" "用户" .Lang}}</a>
+                    <a href="/cm/audit" class="nav-link">📜 {{i18n "nav.audit" "审计日志" .Lang}}</a>
+                    <a href="/cm/analytics" class="nav-link">📊 {{i18n "nav.analytics" "数据分析" .Lang}}</a>
                     {{end}}
                 </div>
                 <div class="nav-section">
-                    <div class="nav-section-title">Tools</div>
-                    <a href="#" onclick="if(window.cpOpen){cpOpen();return false;}" class="nav-link">🤖 Copilot</a>
-                    <a href="/cm/tools/agent" class="nav-link">🤵 CMS Agent</a>
-                    <a href="/cm/tools/search" class="nav-link">🔍 End User Search</a>
-                    <a href="/cm/tools/chat" class="nav-link">💬 Chat Widget</a>
-                    <a href="/cm/tools/broken-links" class="nav-link">🔗 Broken Link Finder</a>
+                    <div class="nav-section-title">{{i18n "section.tools" "工具" .Lang}}</div>
+                    <a href="#" onclick="if(window.cpOpen){cpOpen();return false;}" class="nav-link">🤖 {{i18n "nav.copilot" "智能助手" .Lang}}</a>
+                    <a href="/cm/tools/agent" class="nav-link">🤵 {{i18n "nav.agent" "CMS 助手" .Lang}}</a>
+                    <a href="/cm/tools/search" class="nav-link">🔍 {{i18n "nav.search" "用户搜索" .Lang}}</a>
+                    <a href="/cm/tools/chat" class="nav-link">💬 {{i18n "nav.chat" "聊天组件" .Lang}}</a>
+                    <a href="/cm/tools/broken-links" class="nav-link">🔗 {{i18n "nav.brokenlinks" "死链检查" .Lang}}</a>
                 </div>
                 <div class="nav-section">
-                    <div class="nav-section-title">Inbox</div>
-                    <a href="/cm/messages" class="nav-link">📬 Messages{{if .UnreadMessageCount}} <span class="nav-badge">{{.UnreadMessageCount}}</span>{{end}}</a>
+                    <div class="nav-section-title">{{i18n "section.inbox" "收件箱" .Lang}}</div>
+                    <a href="/cm/messages" class="nav-link">📬 {{i18n "nav.messages" "消息" .Lang}}{{if .UnreadMessageCount}} <span class="nav-badge">{{.UnreadMessageCount}}</span>{{end}}</a>
                 </div>
                 <div class="nav-section">
-                    <a href="/" target="_blank" class="nav-link">🌐 View Site</a>
+                    <a href="/" target="_blank" class="nav-link">🌐 {{i18n "nav.viewsite" "查看站点" .Lang}}</a>
                     {{if .CurrentUser}}<div style="color: #94a3b8; font-size: 0.75rem; padding: 0.25rem 0.75rem; word-break: break-all;">{{.CurrentUser.Email}}</div>{{end}}
                     <form method="POST" action="/cm/logout" style="margin: 0;">
                         {{.CSRFField}}
-                        <button type="submit" class="nav-link logout-btn">🚪 Logout</button>
+                        <button type="submit" class="nav-link logout-btn">🚪 {{i18n "nav.logout" "退出登录" .Lang}}</button>
                     </form>
                 </div>
             </nav>
@@ -9355,14 +9503,14 @@ const adminLayoutEnd = `
     <div id="delete-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.7); z-index: 10000; align-items: center; justify-content: center;">
         <div style="background: #1e293b; border-radius: var(--radius); max-width: 450px; width: 90%; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8); border: 1px solid rgba(239, 68, 68, 0.3);">
             <div style="padding: 1.5rem; border-bottom: 1px solid rgba(239, 68, 68, 0.2); background: #1a2332;">
-                <h3 style="margin: 0; color: var(--danger);">Confirm Delete</h3>
+                <h3 style="margin: 0; color: var(--danger);">{{i18n "modal.delete.title" "确认删除" .Lang}}</h3>
             </div>
             <div style="padding: 1.5rem; background: #1e293b;">
-                <p id="delete-modal-message" style="margin: 0;">Are you sure you want to delete this item?</p>
+                <p id="delete-modal-message" style="margin: 0;">{{i18n "modal.delete.body" "确定要删除此项吗？" .Lang}}</p>
             </div>
             <div style="padding: 1rem 1.5rem; border-top: 1px solid rgba(239, 68, 68, 0.2); display: flex; gap: 0.75rem; justify-content: flex-end; background: #1a2332;">
-                <button type="button" class="btn btn-outline" id="delete-cancel-btn">Cancel</button>
-                <button type="button" class="btn" id="delete-confirm-btn" style="background: var(--danger); color: white;">Delete</button>
+                <button type="button" class="btn btn-outline" id="delete-cancel-btn">{{i18n "modal.delete.cancel" "取消" .Lang}}</button>
+                <button type="button" class="btn" id="delete-confirm-btn" style="background: var(--danger); color: white;">{{i18n "modal.delete.confirm" "删除" .Lang}}</button>
             </div>
         </div>
     </div>
@@ -9371,13 +9519,13 @@ const adminLayoutEnd = `
     <div id="info-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.7); z-index: 10000; align-items: center; justify-content: center;">
         <div style="background: #1e293b; border-radius: var(--radius); max-width: 450px; width: 90%; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8); border: 1px solid rgba(99, 102, 241, 0.3);">
             <div style="padding: 1.5rem; border-bottom: 1px solid rgba(99, 102, 241, 0.2); background: #1a2332;">
-                <h3 id="info-modal-title" style="margin: 0; color: var(--primary);">Information</h3>
+                <h3 id="info-modal-title" style="margin: 0; color: var(--primary);">{{i18n "modal.info.title" "提示信息" .Lang}}</h3>
             </div>
             <div style="padding: 1.5rem; background: #1e293b;">
                 <p id="info-modal-message" style="margin: 0;"></p>
             </div>
             <div style="padding: 1rem 1.5rem; border-top: 1px solid rgba(99, 102, 241, 0.2); display: flex; gap: 0.75rem; justify-content: flex-end; background: #1a2332;">
-                <button type="button" class="btn" id="info-ok-btn" style="background: var(--primary); color: white;">OK</button>
+                <button type="button" class="btn" id="info-ok-btn" style="background: var(--primary); color: white;">{{i18n "modal.info.ok" "确定" .Lang}}</button>
             </div>
         </div>
     </div>
@@ -9386,14 +9534,14 @@ const adminLayoutEnd = `
     <div id="confirm-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.7); z-index: 10000; align-items: center; justify-content: center;">
         <div style="background: #1e293b; border-radius: var(--radius); max-width: 500px; width: 90%; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8); border: 1px solid rgba(99, 102, 241, 0.3);">
             <div style="padding: 1.5rem; border-bottom: 1px solid rgba(99, 102, 241, 0.2); background: #1a2332;">
-                <h3 id="confirm-modal-title" style="margin: 0; color: var(--primary);">Confirm</h3>
+                <h3 id="confirm-modal-title" style="margin: 0; color: var(--primary);">{{i18n "modal.confirm.title" "请确认" .Lang}}</h3>
             </div>
             <div style="padding: 1.5rem; background: #1e293b;">
                 <p id="confirm-modal-message" style="margin: 0;"></p>
             </div>
             <div style="padding: 1rem 1.5rem; border-top: 1px solid rgba(99, 102, 241, 0.2); display: flex; gap: 0.75rem; justify-content: flex-end; background: #1a2332;">
-                <button type="button" class="btn btn-outline" id="confirm-cancel-btn">Cancel</button>
-                <button type="button" class="btn" id="confirm-ok-btn" style="background: var(--primary); color: white;">Confirm</button>
+                <button type="button" class="btn btn-outline" id="confirm-cancel-btn">{{i18n "modal.confirm.cancel" "取消" .Lang}}</button>
+                <button type="button" class="btn" id="confirm-ok-btn" style="background: var(--primary); color: white;">{{i18n "modal.confirm.confirm" "确认" .Lang}}</button>
             </div>
         </div>
     </div>
@@ -9402,14 +9550,14 @@ const adminLayoutEnd = `
     <div id="revert-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.7); z-index: 10000; align-items: center; justify-content: center;">
         <div style="background: #1e293b; border-radius: var(--radius); max-width: 450px; width: 90%; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8); border: 1px solid rgba(245, 158, 11, 0.3);">
             <div style="padding: 1.5rem; border-bottom: 1px solid rgba(245, 158, 11, 0.2); background: #1a2332;">
-                <h3 style="margin: 0; color: var(--warning);">Confirm Revert</h3>
+                <h3 style="margin: 0; color: var(--warning);">{{i18n "modal.revert.title" "确认还原" .Lang}}</h3>
             </div>
             <div style="padding: 1.5rem; background: #1e293b;">
                 <p id="revert-modal-message" style="margin: 0;"></p>
             </div>
             <div style="padding: 1rem 1.5rem; border-top: 1px solid rgba(245, 158, 11, 0.2); display: flex; gap: 0.75rem; justify-content: flex-end; background: #1a2332;">
-                <button type="button" class="btn btn-outline" id="revert-cancel-btn">Cancel</button>
-                <button type="button" class="btn" id="revert-confirm-btn" style="background: var(--warning); color: white;">Revert</button>
+                <button type="button" class="btn btn-outline" id="revert-cancel-btn">{{i18n "modal.revert.cancel" "取消" .Lang}}</button>
+                <button type="button" class="btn" id="revert-confirm-btn" style="background: var(--warning); color: white;">{{i18n "modal.revert.confirm" "还原" .Lang}}</button>
             </div>
         </div>
     </div>
@@ -9547,25 +9695,25 @@ const adminLayoutEnd = `
     .cp-table th { background: rgba(128,128,128,.12); font-weight: 600; }
     .cp-table tr:nth-child(even) td { background: rgba(128,128,128,.05); }
     </style>
-    <button id="cp-fab" title="Copilot">🤖</button>
+    <button id="cp-fab" title="{{i18n "nav.copilot" "智能助手" .Lang}}">🤖</button>
     <div id="cp-drawer" aria-label="Copilot panel">
         <div id="cp-side">
-            <input id="cp-search" type="search" placeholder="Search chats…">
+            <input id="cp-search" type="search" placeholder="{{i18n "drawer.search.ph" "搜索历史会话…" .Lang}}">
             <div id="cp-sessions"></div>
         </div>
         <div class="cp-main">
             <div style="display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--border,#333);">
                 <button id="cp-side-toggle" class="cp-hbtn" title="Chat history">☰</button>
-                <strong style="flex:1;">🤖 Copilot</strong>
-                <button id="cp-new" class="cp-hbtn" title="New chat">＋ New</button>
+                <strong style="flex:1;">🤖 {{i18n "drawer.copilot" "智能助手" .Lang}}</strong>
+                <button id="cp-new" class="cp-hbtn" title="New chat">{{i18n "drawer.new" "＋ 新建" .Lang}}</button>
                 <button id="cp-full" class="cp-hbtn" title="Toggle fullscreen">⛶</button>
                 <button id="cp-close" class="cp-hbtn" title="Close">✕</button>
             </div>
             <div id="cp-log" style="flex:1; overflow-y:auto; padding:16px;"></div>
             <div style="border-top:1px solid var(--border,#333); padding:10px; display:flex; gap:8px;">
-                <textarea id="cp-input" rows="2" placeholder="Ask the copilot…"
+                <textarea id="cp-input" rows="2" placeholder="{{i18n "drawer.input.ph" "询问智能助手…" .Lang}}"
                     style="flex:1; resize:none; padding:9px; border:1px solid var(--border,#444); border-radius:8px; background:var(--bg,#111); color:var(--text,#eee); font:inherit; font-size:13px;"></textarea>
-                <button id="cp-send" class="btn btn-primary" style="align-self:flex-end;">Send</button>
+                <button id="cp-send" class="btn btn-primary" style="align-self:flex-end;">{{i18n "drawer.send" "发送" .Lang}}</button>
             </div>
         </div>
     </div>
