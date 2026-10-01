@@ -974,10 +974,16 @@ func splitSidecarName(name string) (base, kind string, ok bool) {
 // sweepOrphans walks the generated tree for canonical files no content or
 // active record owns. Migration-completed quarantines them; otherwise they
 // are reported. Families whose path lock is held by a publisher are skipped.
+//
+// Lane 1B fix 5b: families whose path is present in the assets collection
+// are skipped — a *.html asset shares the generated tree with page
+// canonicals by design (storage dirs are NOT moved) and must never read
+// as an orphan canonical.
 func (s *Scanner) sweepOrphans(ctx context.Context, st *scanState) {
 	if st.genRoot == "" {
 		return
 	}
+	assetPaths := s.lane1BAssetPaths(ctx)
 	qdir := s.quarantineDir()
 	families := map[string]*orphanFamily{}
 	_ = filepath.WalkDir(st.genRoot, func(abs string, d os.DirEntry, err error) error {
@@ -1049,6 +1055,10 @@ func (s *Scanner) sweepOrphans(ctx context.Context, st *scanState) {
 		if st.serving[fam.fullPath] {
 			continue
 		}
+		// Lane 1B fix 5b: asset-owned paths are never orphans.
+		if assetPaths[fam.fullPath] {
+			continue
+		}
 		release, ok := acquireSagaLocks(primitive.NilObjectID, lockPathsFor(fam.fullPath))
 		if !ok {
 			st.rpt.ContentsSkippedLocked++
@@ -1112,6 +1122,63 @@ func (s *Scanner) sweepOrphans(ctx context.Context, st *scanState) {
 			}
 		}()
 	}
+}
+
+// lane1BAssetPaths returns the scanner-fullPath equivalents of every asset
+// file so sweepOrphans can skip them. Mapping mirrors the walk above:
+// "<rel>.html" -> "/<rel-without-.html>", with "<dir>/index" -> "/<dir>"
+// and "/index" -> "/". Both full_path and serve_path are indexed (legacy
+// rows may carry the /assets prefix in serve_path). Best-effort: on DB
+// error returns an empty set (fail-open to pre-fix behavior, never hides
+// real orphans silently across retries — the next pass reloads).
+func (s *Scanner) lane1BAssetPaths(ctx context.Context) map[string]bool {
+	out := map[string]bool{}
+	cur, err := s.db.Collection("assets").Find(ctx, bson.M{},
+		options.Find().SetProjection(bson.M{"full_path": 1, "serve_path": 1}))
+	if err != nil {
+		return out
+	}
+	defer cur.Close(ctx)
+	var docs []struct {
+		FullPath  string `bson:"full_path"`
+		ServePath string `bson:"serve_path"`
+	}
+	if err := cur.All(ctx, &docs); err != nil {
+		return out
+	}
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+		if len(p) < len(".html") || !strings.HasSuffix(strings.ToLower(p), ".html") {
+			return
+		}
+		fp := p[:len(p)-len(".html")]
+		if fp == "" {
+			fp = "/"
+		}
+		if !strings.HasPrefix(fp, "/") {
+			fp = "/" + fp
+		}
+		if strings.HasSuffix(fp, "/index") && fp != "/index" {
+			fp = strings.TrimSuffix(fp, "/index")
+			if fp == "" {
+				fp = "/"
+			}
+		}
+		if fp == "/index" {
+			fp = "/"
+		}
+		out[fp] = true
+	}
+	for _, d := range docs {
+		add(d.FullPath)
+		add(d.ServePath)
+	}
+	return out
 }
 
 // renameFile moves a sidecar back to its canonical name and fsyncs the

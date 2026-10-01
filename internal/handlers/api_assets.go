@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/auth"
+	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -316,6 +318,10 @@ func (a *APIHandler) APIUploadAsset(w http.ResponseWriter, r *http.Request) {
 
 	asset, err := a.assetService.UploadAsset(r.Context(), data, req.Filename, req.ServePath, req.Description)
 	if err != nil {
+		if errors.Is(err, services.ErrAssetCanonicalCollision) {
+			a.jsonError(w, http.StatusConflict, err.Error())
+			return
+		}
 		a.jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -440,6 +446,10 @@ func (a *APIHandler) APIUploadAssetFromURL(w http.ResponseWriter, r *http.Reques
 
 	asset, err := a.assetService.UploadAsset(r.Context(), data, filename, servePath, req.Description)
 	if err != nil {
+		if errors.Is(err, services.ErrAssetCanonicalCollision) {
+			a.jsonError(w, http.StatusConflict, err.Error())
+			return
+		}
 		a.jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}

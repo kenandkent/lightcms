@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -2769,13 +2770,78 @@ func (h *Handler) updateContentFolderPaths(ctx context.Context, oldFolderPath, n
 }
 
 // Get the static file path for a content item's full path
+// Lane 1B: traversal guard. Returns "" when fullPath escapes
+// content/generated (.., encoded %2e/%2f vectors, null bytes,
+// backslashes). Dotted slugs (/my.page/about) and nested paths pass:
+// only exact ".." segments (raw or single-URL-decoded) and Abs escapes
+// are rejected, mirroring the upload-side ValidateFilePath+Abs+HasPrefix
+// checks in services/asset.go.
 func (h *Handler) getStaticFilePath(fullPath string) string {
 	if fullPath == "" || fullPath == "/" {
 		return "content/generated/index.html"
 	}
+	if !w1bSafeServeRel(fullPath) {
+		return ""
+	}
 	// Remove leading slash and add .html
 	path := strings.TrimPrefix(fullPath, "/")
-	return filepath.Join("content/generated", path+".html")
+	candidate := filepath.Join("content/generated", path+".html")
+	if !w1bPathWithinGenerated(candidate) {
+		return ""
+	}
+	return candidate
+}
+
+// w1bSafeServeRel rejects traversal vectors in a URL path while allowing
+// legit nested paths, dotted slugs and encoded sequences such as %20.
+// It checks the raw and single-URL-decoded forms for null bytes,
+// backslashes, %00 and exact ".." segments.
+func w1bSafeServeRel(p string) bool {
+	if strings.Contains(p, "\x00") || strings.Contains(p, "\\") {
+		return false
+	}
+	if strings.Contains(strings.ToLower(p), "%00") {
+		return false
+	}
+	for _, form := range [2]string{p, w1bSingleDecode(p)} {
+		for _, seg := range strings.Split(form, "/") {
+			if seg == ".." {
+				return false
+			}
+		}
+		if strings.Contains(form, "\x00") || strings.Contains(form, "\\") {
+			return false
+		}
+	}
+	return true
+}
+
+// w1bSingleDecode URL-decodes p once; on error it returns p unchanged so
+// the raw-form checks still apply.
+func w1bSingleDecode(p string) string {
+	if dec, err := url.PathUnescape(p); err == nil {
+		return dec
+	}
+	return p
+}
+
+// w1bPathWithinGenerated reports whether candidate (a relative filesystem
+// path) resolves inside content/generated. It mirrors the upload-side
+// Abs+HasPrefix check so read paths cannot escape via filepath.Join
+// cleaning (e.g. /a/../../etc/passwd).
+func w1bPathWithinGenerated(candidate string) bool {
+	base, err := filepath.Abs("content/generated")
+	if err != nil {
+		return false
+	}
+	abs, err := filepath.Abs(candidate)
+	if err != nil {
+		return false
+	}
+	if abs == base {
+		return false
+	}
+	return strings.HasPrefix(abs, base+string(filepath.Separator))
 }
 
 // Theme handlers
@@ -3515,10 +3581,21 @@ func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check for static asset first (for files uploaded via Asset Library)
-	// These are served from content/generated at any path
+	// These are served from content/generated at any path.
+	// Lane 1B: validate before touching the filesystem; traversal vectors
+	// (../, %2e/%2f, null bytes, backslashes) are rejected 400 and never
+	// reach os.Stat/http.ServeFile. Dotted slugs (a.page/b) pass.
 	if slug != "" && strings.Contains(slug, ".") {
 		// Looks like a file (has extension) - check if it exists as a static asset
+		if !w1bSafeServeRel(fullPath) {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
 		assetPath := filepath.Join("content/generated", fullPath)
+		if !w1bPathWithinGenerated(assetPath) {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
 		if info, err := os.Stat(assetPath); err == nil && !info.IsDir() {
 			// Serve the static file with proper MIME type
 			ext := strings.ToLower(filepath.Ext(slug))
@@ -5051,8 +5128,23 @@ func (h *Handler) AssetUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 // ServeAsset serves an asset file by path (legacy /assets/ path support)
+// Lane 1B: both filesystem candidates are validated (raw + decoded ".."
+// segments, null bytes, backslashes, Abs+HasPrefix) before os.Stat, mirroring
+// the upload-side checks. Traversal vectors yield 400 and never reach
+// ServeFile; legit nested asset paths keep serving.
+//
+// Cache-header story (Lane 1B fix 5c): the two static-file branches here
+// intentionally use "Cache-Control: no-cache" (assets are mutable library
+// files; browsers must revalidate), while ServePage's dotted-slug asset
+// shortcut uses "public, max-age=31536000" (immutable hashed page-adjacent
+// files served as page fallbacks). The collision guard in
+// AssetService.UploadAsset (reject *.html canonical collisions) plus the
+// scanner asset-skip ensures a *.html asset never masquerades as a page
+// canonical, so the divergent headers cannot cause a stale page to be
+// cached as an asset or vice versa.
 func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
-	// Get full path from URL
+	// Get full path from URL (decoded form drives filesystem lookups so
+	// legit %20 files resolve to their space-named files on disk).
 	fullPath := r.URL.Path
 	if !strings.HasPrefix(fullPath, "/assets") {
 		http.NotFound(w, r)
@@ -5064,16 +5156,35 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 		assetPath = "/"
 	}
 
+	// Lane 1B: reject traversal before any filesystem or DB lookup.
+	// Inspect both the decoded Path and the raw EscapedPath so %2e/%2f
+	// vectors are caught whether Go decoded them or the caller set
+	// URL.Path explicitly (as traversal tests do).
+	escaped := r.URL.EscapedPath()
+	if !w1bSafeServeRel(assetPath) || !w1bSafeServeRel(fullPath) ||
+		(escaped != "" && (!w1bSafeServeRel(escaped) || !w1bSafeServeRel(strings.TrimPrefix(escaped, "/assets")))) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
 	// First check for static file (new style)
 	// Try without /assets prefix first, then with it (handles assets
 	// uploaded before the prefix-stripping normalization was added)
 	staticFilePath := filepath.Join("content/generated", assetPath)
+	if !w1bPathWithinGenerated(staticFilePath) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
 	if info, err := os.Stat(staticFilePath); err == nil && !info.IsDir() {
 		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, staticFilePath)
 		return
 	}
 	staticFilePathFull := filepath.Join("content/generated", fullPath)
+	if !w1bPathWithinGenerated(staticFilePathFull) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
 	if info, err := os.Stat(staticFilePathFull); err == nil && !info.IsDir() {
 		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, staticFilePathFull)
@@ -5149,8 +5260,14 @@ func (h *Handler) DeleteAsset(w http.ResponseWriter, r *http.Request) {
 
 // GenerateSitemap creates/updates the sitemap.xml file
 func (h *Handler) GenerateSitemap(ctx context.Context, baseURL string) error {
-	// Get all published content
-	cursor, err := h.db.FindMany(ctx, "content", bson.M{"published": true})
+	// Lane 1B: match the live ServePage/llms filters — soft-deleted rows
+	// and fork copies (which share full_path with live pages) must never
+	// appear as servable URLs.
+	cursor, err := h.db.FindMany(ctx, "content", bson.M{
+		"published": true,
+		"deleted":   bson.M{"$ne": true},
+		"fork_id":   bson.M{"$exists": false},
+	})
 	if err != nil {
 		return err
 	}

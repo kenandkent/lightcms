@@ -822,7 +822,10 @@ func (s *ContentService) GetContent(ctx context.Context, id primitive.ObjectID) 
 // GetContentByPath retrieves content by full path
 func (s *ContentService) GetContentByPath(ctx context.Context, path string) (*models.Content, error) {
 	var content models.Content
-	if err := s.db.FindOne(ctx, "content", bson.M{"full_path": path, "deleted": bson.M{"$ne": true}}, &content); err == nil {
+	// Lane 1B: the exact lookup must exclude fork rows (they share
+	// full_path with the live page); otherwise UpsertContent may update
+	// the sandbox copy thinking it is live.
+	if err := s.db.FindOne(ctx, "content", bson.M{"full_path": path, "deleted": bson.M{"$ne": true}, "fork_id": bson.M{"$exists": false}}, &content); err == nil {
 		return &content, nil
 	}
 	// Paths are case-insensitive: fall back to a case-insensitive exact
