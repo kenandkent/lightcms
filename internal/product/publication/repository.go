@@ -42,6 +42,19 @@ type OutboxInserter interface {
 // wires its delivery worker. Insert-only is sufficient for Task 5: the
 // exactly-once creation guarantee comes from the unique index + shared
 // transaction, not from delivery.
+//
+// Idempotency (spec §28.1: "Idempotency retry ...不会创建第二个 publish
+// event"): the UNIQUE(event_type, aggregate_id) index is the arbiter and a
+// duplicate insert is a silent success (nil, no second row) — identical to
+// Outbox.InsertUnique. Mechanism matters: a plain InsertOne that swallows the
+// duplicate-key error is UNSAFE inside a multi-document transaction — the
+// failed insert aborts the server-side transaction, so the later commit dies
+// with NoSuchTransaction (observed) and the saga falls into failCommitted
+// compensation, which can delete a just-cut live canonical whose bytes match
+// the replayed attempt (deterministic render ⇒ identical SHA). The atomic
+// upsert below never raises duplicate-key at all: concurrent upserts
+// serialize on the unique index, exactly one wins the insert, the rest are
+// no-op matches — the transaction always stays alive to commit.
 type mongoOutbox struct {
 	db *database.DB
 }
@@ -53,18 +66,17 @@ func (m *mongoOutbox) InsertUnique(ctx context.Context, eventType string, public
 		"aggregate_type":  "publication",
 		"aggregate_id":    publicationID,
 		"payload":         payload,
-		"state":           "pending",
+		"state":           OutboxStatePending,
 		"attempt":         0,
 		"next_attempt_at": now,
 		"created_at":      now,
 	}
-	if _, err := m.db.Collection(CollectionOutbox).InsertOne(ctx, doc); err != nil {
-		if isDupKey(err) {
-			return pubErr(CodeConflict, "duplicate outbox event "+eventType+" for publication "+publicationID.Hex(), err)
-		}
-		return err
-	}
-	return nil
+	_, err := m.db.Collection(CollectionOutbox).UpdateOne(ctx,
+		bson.M{"event_type": eventType, "aggregate_id": publicationID},
+		bson.M{"$setOnInsert": doc},
+		options.Update().SetUpsert(true),
+	)
+	return err
 }
 
 // Repository owns publication records and their transactional lifecycle

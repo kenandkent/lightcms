@@ -75,6 +75,15 @@ type ContentService struct {
 	indexRegenCh     chan struct{} // coalescing trigger for RegenerateIndexPages
 	keywordRebuildCh chan struct{} // coalescing trigger for RebuildKeywords
 
+	// embedSem bounds concurrent async embedding generations (provider HTTP
+	// calls + Mongo writes). Capacity is embeddingMaxInFlight; excess
+	// triggers wait on the semaphore as cheap goroutines — provider load
+	// stays flat no matter the bulk size. Lazily initialized (zero-value
+	// safe via embedMu) so tests and forgotten constructors can't deadlock
+	// on a nil channel.
+	embedMu  sync.Mutex
+	embedSem chan struct{}
+
 	// Cached wikilink index (title→path / path→title).
 	// Rebuilt at most once per wikilinkCacheTTL to avoid a full collection scan
 	// on every page publish/regenerate.
@@ -168,15 +177,45 @@ func (s *ContentService) keywordRebuildWorker() {
 	}
 }
 
-// triggerEmbedding asynchronously generates an embedding for the given content
-func (s *ContentService) triggerEmbedding(contentID primitive.ObjectID) {
+// embeddingMaxInFlight caps concurrent async embedding generations per
+// ContentService. Rationale: each generation is one provider HTTP call
+// (Voyage/Ollama, seconds of latency) plus a Mongo write. Unbounded, a
+// 2000-page bulk import would fire 2000 concurrent provider calls —
+// rate-limit/blacklist territory and file-descriptor exhaustion. 8 keeps a
+// steady pipeline (provider p99 ~2s ⇒ ~4 pages/s drain) without hammering a
+// local Ollama or the Voyage quota, while bulk-callers never block: excess
+// triggers queue on embedSem. Stale queued jobs self-skip via their version
+// pin (UpdateContentEmbeddingForVersion), so a bulk storm converges instead
+// of stampeding.
+const embeddingMaxInFlight = 8
+
+// embedSlot returns the service's embedding semaphore, initializing it once.
+func (s *ContentService) embedSlot() chan struct{} {
+	s.embedMu.Lock()
+	defer s.embedMu.Unlock()
+	if s.embedSem == nil {
+		s.embedSem = make(chan struct{}, embeddingMaxInFlight)
+	}
+	return s.embedSem
+}
+
+// triggerEmbedding asynchronously generates an embedding for the given content,
+// pinned to the caller's mutation-time content version. The pin travels with
+// the job so a slow job carrying older text can never overwrite a newer
+// version's index (see UpdateContentEmbeddingForVersion). Concurrency is
+// bounded by embeddingMaxInFlight; stale queued jobs skip before consuming a
+// slot whenever the skip is already visible.
+func (s *ContentService) triggerEmbedding(contentID primitive.ObjectID, version int64) {
 	if s.searchService == nil || !s.searchService.EmbeddingsEnabled() {
 		return
 	}
+	sem := s.embedSlot()
 	go func() {
+		sem <- struct{}{}
+		defer func() { <-sem }()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := s.searchService.UpdateContentEmbedding(ctx, contentID); err != nil {
+		if _, err := s.searchService.UpdateContentEmbeddingForVersion(ctx, contentID, version); err != nil {
 			fmt.Printf("Warning: failed to update embedding for %s: %v\n", contentID.Hex(), err)
 		}
 	}()
@@ -302,7 +341,7 @@ func (s *ContentService) CreateContent(ctx context.Context, content *models.Cont
 	// Task 16A: draft-only — never GenerateStaticPage/removeStaticPage here.
 	// Embedding/keyword/index work is search-index maintenance, not live files.
 	if content.ForkID == nil {
-		s.triggerEmbedding(content.ID)
+		s.triggerEmbedding(content.ID, content.CurrentVersion)
 	}
 
 	// Fire webhook event
@@ -462,7 +501,7 @@ func (s *ContentService) BulkCreateContent(ctx context.Context, items []*models.
 		if !results[i].Success || c.ForkID != nil {
 			continue
 		}
-		s.triggerEmbedding(c.ID)
+		s.triggerEmbedding(c.ID, c.CurrentVersion)
 	}
 
 	// Fire webhook events and trigger index rebuild once
@@ -605,7 +644,7 @@ func (s *ContentService) UpdateContent(ctx context.Context, content *models.Cont
 	// never had side effects; now live rows don't either. Search-index
 	// maintenance (embedding/keywords) is not a live-file write.
 	if content.ForkID == nil {
-		s.triggerEmbedding(content.ID)
+		s.triggerEmbedding(content.ID, content.CurrentVersion)
 	}
 
 	// Rebuild search keyword cache when content changes

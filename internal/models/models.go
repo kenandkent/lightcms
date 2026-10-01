@@ -75,6 +75,12 @@ type Content struct {
 	ContentHash     string                 `bson:"content_hash,omitempty" json:"-"`                          // SHA-256 of last generated static HTML
 	Embedding       []float32              `bson:"embedding,omitempty" json:"-"`                             // Voyage AI vector embedding (1024 dims)
 	EmbeddingAt     *time.Time             `bson:"embedding_at,omitempty" json:"-"`                          // When embedding was last generated
+	// EmbeddingVersion pins the embedding (and the cached PlainText written
+	// with it) to the ContentVersion whose text was embedded. Async embed
+	// jobs are exactly-once-safe: a stale job's conditional write is skipped
+	// when a newer version is already indexed, so rapid updates converge to
+	// the latest text instead of last-writer-winning with older text.
+	EmbeddingVersion int64                 `bson:"embedding_version,omitempty" json:"-"`
 	PlainText       string                 `bson:"plain_text,omitempty" json:"-"`                            // Cached stripped-HTML text for search snippets
 	PublishAt       *time.Time             `bson:"publish_at,omitempty" json:"publish_at,omitempty"`         // Scheduled publish time
 	Deleted         bool                   `bson:"deleted" json:"deleted"`                                   // Soft delete flag
