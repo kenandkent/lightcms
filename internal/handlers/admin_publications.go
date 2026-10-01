@@ -69,7 +69,7 @@ func TemplateSelectorCardHTML(tmpl models.Template) template.HTML {
 		b.WriteString("<p>" + html.EscapeString(tmpl.Description) + "</p>")
 	}
 	if req := RequiredFieldNames(tmpl); len(req) > 0 {
-		b.WriteString(`<p class="template-required">Required fields: ` + html.EscapeString(strings.Join(req, ", ")) + "</p>")
+		b.WriteString(`<p class="template-required">必填字段：` + html.EscapeString(strings.Join(req, ", ")) + "</p>")
 	}
 	b.WriteString("</a>")
 	return template.HTML(b.String())
@@ -116,7 +116,7 @@ func fieldHelpHTML(f models.TemplateField) string {
 		b.WriteString(`<p class="help-text">` + html.EscapeString(f.Description) + "</p>")
 	}
 	if f.Example != "" {
-		b.WriteString(`<p class="help-text">Example: <code>` + html.EscapeString(f.Example) + "</code></p>")
+		b.WriteString(`<p class="help-text">示例：<code>` + html.EscapeString(f.Example) + "</code></p>")
 	}
 	return b.String()
 }
@@ -189,7 +189,7 @@ func RenderProductField(f models.TemplateField, value any, errs []templatecontra
 	case "image":
 		if val != "" {
 			b.WriteString(`<div class="current-image"><img src="` + html.EscapeString(val) +
-				`" alt="Current image" style="max-width: 200px; margin-bottom: 0.5rem;"></div>`)
+				`" alt="当前图片" style="max-width: 200px; margin-bottom: 0.5rem;"></div>`)
 		}
 		b.WriteString(`<input type="file" id="` + html.EscapeString(id) + `" name="` + html.EscapeString(id) + `" accept="image/*">`)
 	case "richtext":
@@ -206,7 +206,7 @@ func RenderProductField(f models.TemplateField, value any, errs []templatecontra
 			`" rows="12" class="code-editor"` + ph + req + ">" + html.EscapeString(val) + "</textarea>")
 	case "select":
 		b.WriteString(`<select id="` + html.EscapeString(id) + `" name="` + html.EscapeString(id) + `"` + req + ">")
-		b.WriteString(`<option value="">Select...</option>`)
+		b.WriteString(`<option value="">请选择…</option>`)
 		for _, opt := range strings.Split(f.Options, ",") {
 			opt = strings.TrimSpace(opt)
 			if opt == "" {
@@ -283,21 +283,21 @@ func SelectForkAction(published bool, existingForkID string) (action, notice str
 		return "edit_content", ""
 	}
 	if existingForkID != "" {
-		return "reuse_fork", "Editing Draft — Live page unchanged. Continue editing fork " + existingForkID + "."
+		return "reuse_fork", "正在编辑草稿——线上页面不受影响。继续编辑分支 " + existingForkID + "。"
 	}
-	return "open_fork", "Editing Draft — Live page unchanged. Saving creates a Fork Draft; publish is a separate action."
+	return "open_fork", "正在编辑草稿——线上页面不受影响。保存将创建分支草稿，发布是单独的操作。"
 }
 
 // ForkEditBannerHTML renders the draft-vs-live banner for the edit page.
 func ForkEditBannerHTML(published bool, forkID string) template.HTML {
 	if !published {
-		return template.HTML(`<div class="notice notice-draft">Editing unpublished draft.</div>`)
+		return template.HTML(`<div class="notice notice-draft">正在编辑未发布草稿。</div>`)
 	}
-	msg := "Editing Draft — Live page unchanged."
+	msg := "正在编辑草稿——线上页面不受影响。"
 	if forkID != "" {
-		msg += " Fork: " + forkID + "."
+		msg += " 分支：" + forkID + "。"
 	}
-	msg += " Saving never rewrites the live page; use Merge, then Publish."
+	msg += "保存不会覆盖线上页面，请先合并再发布。"
 	return template.HTML(`<div class="notice notice-fork">` + html.EscapeString(msg) + "</div>")
 }
 
@@ -335,12 +335,12 @@ func codeList(ids []string) string {
 func MergeResultHTML(r ForkMergeDisplay) template.HTML {
 	var b strings.Builder
 	b.WriteString(`<div class="notice notice-merge">`)
-	b.WriteString("<p>Merged " + strconv.Itoa(r.Updated) + " updated, " + strconv.Itoa(r.Created) + " created. ")
-	b.WriteString("Merge drafts; publishing is a separate action.</p>")
+	b.WriteString("<p>已合并 " + strconv.Itoa(r.Updated) + " 个更新、" + strconv.Itoa(r.Created) + " 个新建。")
+	b.WriteString("合并的是草稿；发布是单独的操作。</p>")
 	if len(r.RequiresPublish) > 0 {
-		b.WriteString("<p>requires_publish: " + codeList(r.RequiresPublish) + "</p>")
+		b.WriteString("<p>待发布： " + codeList(r.RequiresPublish) + "</p>")
 	}
-	b.WriteString("<p>Live canonical HTML is unchanged until you Publish.</p>")
+	b.WriteString("<p>在发布之前，线上正式 HTML 不会变化。</p>")
 	b.WriteString("</div>")
 	return template.HTML(b.String())
 }
@@ -362,14 +362,14 @@ type PublishDisplay struct {
 func PublishResultHTML(d PublishDisplay) template.HTML {
 	var b strings.Builder
 	b.WriteString(`<div class="notice notice-published">`)
-	b.WriteString("<p>Published. Public URL: ")
+	b.WriteString("<p>已发布。公开 URL： ")
 	b.WriteString(`<a href="` + html.EscapeString(d.Result.PublicURL) + `">` + html.EscapeString(d.Result.PublicURL) + "</a></p>")
 	b.WriteString("<ul>")
-	b.WriteString("<li>Publication ID: <code>" + html.EscapeString(d.Result.PublicationID.Hex()) + "</code></li>")
-	b.WriteString("<li>Content ID: <code>" + html.EscapeString(d.Result.ContentID.Hex()) + "</code></li>")
-	b.WriteString("<li>Content version: " + strconv.FormatInt(d.Result.ContentVersion, 10) + "</li>")
-	b.WriteString("<li>Template version: " + strconv.FormatInt(d.TemplateVersion, 10) + "</li>")
-	b.WriteString("<li>Path: <code>" + html.EscapeString(d.Result.FullPath) + "</code></li>")
+	b.WriteString("<li>发布 ID：<code>" + html.EscapeString(d.Result.PublicationID.Hex()) + "</code></li>")
+	b.WriteString("<li>内容 ID：<code>" + html.EscapeString(d.Result.ContentID.Hex()) + "</code></li>")
+	b.WriteString("<li>内容版本：" + strconv.FormatInt(d.Result.ContentVersion, 10) + "</li>")
+	b.WriteString("<li>模板版本：" + strconv.FormatInt(d.TemplateVersion, 10) + "</li>")
+	b.WriteString("<li>路径：<code>" + html.EscapeString(d.Result.FullPath) + "</code></li>")
 	b.WriteString("</ul></div>")
 	return template.HTML(b.String())
 }
@@ -403,15 +403,15 @@ func PublishErrorRetryable(err error) bool {
 func FailedPublishHTML(priorURL, code string, retryable bool) template.HTML {
 	var b strings.Builder
 	b.WriteString(`<div class="notice notice-failed">`)
-	b.WriteString("<p>Publish failed: <code>" + html.EscapeString(code) + "</code>.</p>")
+	b.WriteString("<p>发布失败：<code>" + html.EscapeString(code) + "</code>.</p>")
 	if priorURL != "" {
-		b.WriteString("<p>Prior live URL is still serving: ")
+		b.WriteString("<p>之前的线上 URL 仍在服务：")
 		b.WriteString(`<a href="` + html.EscapeString(priorURL) + `">` + html.EscapeString(priorURL) + "</a></p>")
 	}
 	if retryable {
-		b.WriteString(`<form method="POST" action=""><button type="submit" class="btn btn-primary">Retry Publish</button></form>`)
+		b.WriteString(`<form method="POST" action=""><button type="submit" class="btn btn-primary">重试发布</button></form>`)
 	} else {
-		b.WriteString("<p>Fix the reported errors, then retry.</p>")
+		b.WriteString("<p>请修复上述错误后重试。</p>")
 	}
 	b.WriteString("</div>")
 	return template.HTML(b.String())
@@ -426,9 +426,9 @@ func FailedPublishHTML(priorURL, code string, retryable bool) template.HTML {
 // TemplateVersionNoticeHTML states that a template save created a new version
 // while existing live pages are untouched pending an explicit upgrade.
 func TemplateVersionNoticeHTML(oldVersion, newVersion int64) template.HTML {
-	msg := fmt.Sprintf("Template saved as Version %d (was %d). Existing live pages are unchanged; run Upgrade Preview, then start an explicit Upgrade Job to republish.", newVersion, oldVersion)
+	msg := fmt.Sprintf("模板已保存为版本 %d（原 %d）。现有线上页面不受影响，请先运行升级预览，再启动正式升级任务重新发布。", newVersion, oldVersion)
 	return template.HTML(`<div class="notice notice-version">` + html.EscapeString(msg) +
-		` <a href="" class="btn btn-sm btn-outline">Upgrade Preview</a></div>`)
+		` <a href="" class="btn btn-sm btn-outline">升级预览</a></div>`)
 }
 
 // ---------------------------------------------------------------------------
@@ -442,25 +442,25 @@ func TemplateVersionNoticeHTML(oldVersion, newVersion int64) template.HTML {
 func UpgradePreviewHTML(p generation.UpgradePreview) template.HTML {
 	var b strings.Builder
 	b.WriteString(`<div class="upgrade-preview">`)
-	b.WriteString("<h3>Upgrade Preview: " + html.EscapeString(p.Template) + " v" +
+	b.WriteString("<h3>升级预览： " + html.EscapeString(p.Template) + " v" +
 		strconv.FormatInt(p.FromVersion, 10) + " → v" + strconv.FormatInt(p.ToVersion, 10) + "</h3>")
-	b.WriteString("<p>" + strconv.Itoa(p.WouldRepublish) + " of " + strconv.Itoa(p.TotalPages) + " pages would republish. Preview only — no live pages touched.</p>")
-	b.WriteString(`<table><thead><tr><th>Path</th><th>Active template</th><th>Target</th><th>Outcome</th></tr></thead><tbody>`)
+	b.WriteString("<p>" + strconv.Itoa(p.WouldRepublish) + " of " + strconv.Itoa(p.TotalPages) + " 个页面需要重新发布。仅预览——线上页面不受影响。</p>")
+	b.WriteString(`<table><thead><tr><th>路径</th><th>当前模板</th><th>目标</th><th>结果</th></tr></thead><tbody>`)
 	items := append([]generation.UpgradePreviewItem(nil), p.Items...)
 	sort.Slice(items, func(i, j int) bool { return items[i].FullPath < items[j].FullPath })
 	for _, it := range items {
-		outcome := "up to date"
+		outcome := "已是最新"
 		if it.WouldRepublish {
-			outcome = "would republish"
+			outcome = "需要重新发布"
 		} else if it.ValidationErrors > 0 {
-			outcome = "blocked: validation errors"
+			outcome = "已拦截：存在校验错误"
 		}
 		b.WriteString("<tr><td><code>" + html.EscapeString(it.FullPath) + "</code></td><td>v" +
 			strconv.FormatInt(it.ActiveTemplateV, 10) + "</td><td>v" + strconv.FormatInt(it.TargetTemplateV, 10) +
 			"</td><td>" + html.EscapeString(outcome) + "</td></tr>")
 	}
 	b.WriteString("</tbody></table>")
-	b.WriteString(`<form method="POST" action=""><button type="submit" class="btn btn-primary">Start Upgrade Job</button></form>`)
+	b.WriteString(`<form method="POST" action=""><button type="submit" class="btn btn-primary">启动升级任务</button></form>`)
 	b.WriteString("</div>")
 	return template.HTML(b.String())
 }
@@ -470,16 +470,16 @@ func UpgradePreviewHTML(p generation.UpgradePreview) template.HTML {
 func UpgradeJobHTML(j generation.UpgradeJob) template.HTML {
 	var b strings.Builder
 	b.WriteString(`<div class="upgrade-job">`)
-	b.WriteString("<h3>Upgrade Job <code>" + html.EscapeString(j.ID.Hex()) + "</code> — " + html.EscapeString(string(j.Status)) + "</h3>")
+	b.WriteString("<h3>升级任务 <code>" + html.EscapeString(j.ID.Hex()) + "</code> — " + html.EscapeString(string(j.Status)) + "</h3>")
 	b.WriteString("<p>Template " + html.EscapeString(j.TemplateSlug) + " v" + strconv.FormatInt(j.FromVersion, 10) +
-		" → v" + strconv.FormatInt(j.ToVersion, 10) + ". Each page mints its own Publication; resume to retry failed items.</p>")
-	b.WriteString(`<table><thead><tr><th>Path</th><th>Status</th><th>Attempts</th><th>Detail</th></tr></thead><tbody>`)
+		" → v" + strconv.FormatInt(j.ToVersion, 10) + "。每个页面生成独立的发布记录，可恢复任务以重试失败项。</p>")
+	b.WriteString(`<table><thead><tr><th>路径</th><th>状态</th><th>尝试次数</th><th>详情</th></tr></thead><tbody>`)
 	items := append([]generation.UpgradeJobItem(nil), j.Items...)
 	sort.Slice(items, func(i, j int) bool { return items[i].FullPath < items[j].FullPath })
 	for _, it := range items {
 		detail := ""
 		if it.PublicationID != nil {
-			detail = "publication <code>" + html.EscapeString(it.PublicationID.Hex()) + "</code>"
+			detail = "发布 <code>" + html.EscapeString(it.PublicationID.Hex()) + "</code>"
 		} else if it.Error != "" {
 			detail = html.EscapeString(it.Error)
 		}
@@ -488,7 +488,7 @@ func UpgradeJobHTML(j generation.UpgradeJob) template.HTML {
 	}
 	b.WriteString("</tbody></table>")
 	if j.Status == generation.UpgradeJobRunning || j.Status == generation.UpgradeJobPartial {
-		b.WriteString(`<form method="POST" action=""><button type="submit" class="btn btn-primary">Retry / resume failed items</button></form>`)
+		b.WriteString(`<form method="POST" action=""><button type="submit" class="btn btn-primary">重试 / 恢复失败项</button></form>`)
 	}
 	b.WriteString("</div>")
 	return template.HTML(b.String())
@@ -508,15 +508,15 @@ func RestoreRevertActionsHTML(contentID string, version int64, sourcePublication
 	b.WriteString(`<div class="restore-revert-actions">`)
 	b.WriteString(`<form method="POST" action="/cm/content/` + html.EscapeString(contentID) +
 		`/versions/` + strconv.FormatInt(version, 10) + `/restore-draft" style="display:inline">`)
-	b.WriteString(`<button type="submit" class="btn btn-sm btn-outline" title="Restore version data as a draft only; live page unchanged">Restore as Draft</button></form> `)
+	b.WriteString(`<button type="submit" class="btn btn-sm btn-outline" title="仅将版本数据恢复为草稿，线上页面不受影响">恢复为草稿</button></form> `)
 	b.WriteString(`<form method="POST" action="/cm/content/` + html.EscapeString(contentID) +
 		`/versions/` + strconv.FormatInt(version, 10) + `/restore_and_publish" style="display:inline">`)
-	b.WriteString(`<button type="submit" class="btn btn-sm btn-primary" title="Re-render historical version data into a NEW publication">Restore and Publish (restore_and_publish)</button></form> `)
+	b.WriteString(`<button type="submit" class="btn btn-sm btn-primary" title="将历史版本数据重新渲染为新的发布">恢复并发布 (restore_and_publish)</button></form> `)
 	if sourcePublicationID != "" {
 		b.WriteString(`<form method="POST" action="/cm/content/` + html.EscapeString(contentID) +
 			`/publications/` + html.EscapeString(sourcePublicationID) + `/revert_live" style="display:inline">`)
-		b.WriteString(`<button type="submit" class="btn btn-sm btn-secondary" title="Restore the historical publication's exact retained bytes into a NEW publication">Revert Live to this Publication (revert_live)</button></form>`)
-		b.WriteString("<p class=\"help-text\">restore_and_publish re-renders draft data; revert_live restores the exact retained bytes.</p>")
+		b.WriteString(`<button type="submit" class="btn btn-sm btn-secondary" title="将该历史发布的完整保留字节恢复为新的发布">回滚线上到该发布 (revert_live)</button></form>`)
+		b.WriteString("<p class=\"help-text\">restore_and_publish 重新渲染草稿数据，revert_live 恢复完整保留字节。</p>")
 	}
 	b.WriteString("</div>")
 	return template.HTML(b.String())
@@ -617,7 +617,7 @@ func (h *Handler) AdminProductPublish(w http.ResponseWriter, r *http.Request) {
 	}
 	tv, err := templatecontract.NewService(h.db).GetCurrent(ctx, tmpl.Slug)
 	if err != nil {
-		h.writeAdminProductPage(w, "Publish", string(FailedPublishHTML(
+		h.writeAdminProductPage(w, "发布", string(FailedPublishHTML(
 			h.adminPriorURL(r, contentID, content.FullPath), "TEMPLATE_VERSION_NOT_FOUND", false)))
 		return
 	}
@@ -633,11 +633,11 @@ func (h *Handler) AdminProductPublish(w http.ResponseWriter, r *http.Request) {
 		TemplateVersionID: tv.ID, ExpectedActiveID: expected, Reason: "admin publish",
 	})
 	if perr != nil {
-		h.writeAdminProductPage(w, "Publish", string(FailedPublishHTML(
+		h.writeAdminProductPage(w, "发布", string(FailedPublishHTML(
 			h.adminPriorURL(r, contentID, content.FullPath), publication.CodeOf(perr), PublishErrorRetryable(perr))))
 		return
 	}
-	h.writeAdminProductPage(w, "Publish", string(PublishResultHTML(PublishDisplay{Result: res, TemplateVersion: tv.Version})))
+	h.writeAdminProductPage(w, "发布", string(PublishResultHTML(PublishDisplay{Result: res, TemplateVersion: tv.Version})))
 }
 
 // AdminProductPublications lists publication history with active/failed state
@@ -660,8 +660,8 @@ func (h *Handler) AdminProductPublications(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var b strings.Builder
-	b.WriteString("<h3>Publication history</h3>")
-	b.WriteString(`<table><thead><tr><th>ID</th><th>Status</th><th>Content v</th><th>Template v</th><th>Actions</th></tr></thead><tbody>`)
+	b.WriteString("<h3>发布历史</h3>")
+	b.WriteString(`<table><thead><tr><th>ID</th><th>状态</th><th>内容版本</th><th>模板版本</th><th>操作</th></tr></thead><tbody>`)
 	for _, p := range history {
 		b.WriteString("<tr><td><code>" + html.EscapeString(p.ID.Hex()) + "</code></td><td>" +
 			html.EscapeString(string(p.Status)) + "</td><td>" + strconv.FormatInt(p.ContentVersion, 10) +
@@ -669,7 +669,7 @@ func (h *Handler) AdminProductPublications(w http.ResponseWriter, r *http.Reques
 			string(RestoreRevertActionsHTML(contentID.Hex(), p.ContentVersion, p.ID.Hex())) + "</td></tr>")
 	}
 	b.WriteString("</tbody></table>")
-	h.writeAdminProductPage(w, "Publishing", b.String())
+	h.writeAdminProductPage(w, "发布记录", b.String())
 }
 
 // AdminProductUpgradePreview renders the read-only template upgrade preview
@@ -695,7 +695,7 @@ func (h *Handler) AdminProductUpgradePreview(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "Upgrade preview failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	h.writeAdminProductPage(w, "Upgrade Preview", string(UpgradePreviewHTML(prev)))
+	h.writeAdminProductPage(w, "升级预览", string(UpgradePreviewHTML(prev)))
 }
 
 // AdminProductUpgradeStart creates the durable upgrade job (no live pages
@@ -721,7 +721,7 @@ func (h *Handler) AdminProductUpgradeStart(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "Start upgrade job failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	h.writeAdminProductPage(w, "Upgrade Job", string(UpgradeJobHTML(job)))
+	h.writeAdminProductPage(w, "升级任务", string(UpgradeJobHTML(job)))
 }
 
 // AdminProductUpgradeRun processes pending/failed job items via
@@ -741,7 +741,7 @@ func (h *Handler) AdminProductUpgradeRun(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "Run upgrade job failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	h.writeAdminProductPage(w, "Upgrade Job", string(UpgradeJobHTML(job)))
+	h.writeAdminProductPage(w, "升级任务", string(UpgradeJobHTML(job)))
 }
 
 // AdminProductRestoreAndPublish re-renders historical version data into a NEW
@@ -773,7 +773,7 @@ func (h *Handler) AdminProductRestoreAndPublish(w http.ResponseWriter, r *http.R
 		Key:  strings.TrimSpace(r.FormValue("idempotency_key")),
 	})
 	if strings.TrimSpace(r.FormValue("idempotency_key")) == "" {
-		h.writeAdminProductPage(w, "Restore and Publish", string(FailedPublishHTML("", "IDEMPOTENCY_KEY_REQUIRED", false)))
+		h.writeAdminProductPage(w, "恢复并发布", string(FailedPublishHTML("", "IDEMPOTENCY_KEY_REQUIRED", false)))
 		return
 	}
 	res, err := h.adminGenerationService().RestoreAndPublish(genCtx, actor, contentID, version, nil)
@@ -783,10 +783,10 @@ func (h *Handler) AdminProductRestoreAndPublish(w http.ResponseWriter, r *http.R
 		if derr := h.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &probe); derr == nil {
 			prior = h.adminPriorURL(r, contentID, probe.FullPath)
 		}
-		h.writeAdminProductPage(w, "Restore and Publish", string(FailedPublishHTML(prior, generation.CodeOf(err), PublishErrorRetryable(err))))
+		h.writeAdminProductPage(w, "恢复并发布", string(FailedPublishHTML(prior, generation.CodeOf(err), PublishErrorRetryable(err))))
 		return
 	}
-	h.writeAdminProductPage(w, "Restore and Publish", string(PublishResultHTML(PublishDisplay{
+	h.writeAdminProductPage(w, "恢复并发布", string(PublishResultHTML(PublishDisplay{
 		Result: publication.PublicationResult{
 			ContentVersion: res.ContentVersion, FullPath: res.FullPath, PublicURL: res.PublicURL,
 		}, TemplateVersion: 0,
@@ -813,7 +813,7 @@ func (h *Handler) AdminProductRevertLive(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if strings.TrimSpace(r.FormValue("idempotency_key")) == "" {
-		h.writeAdminProductPage(w, "Revert Live", string(FailedPublishHTML("", "IDEMPOTENCY_KEY_REQUIRED", false)))
+		h.writeAdminProductPage(w, "回滚线上", string(FailedPublishHTML("", "IDEMPOTENCY_KEY_REQUIRED", false)))
 		return
 	}
 	actor := h.adminActor(r)
@@ -830,10 +830,10 @@ func (h *Handler) AdminProductRevertLive(w http.ResponseWriter, r *http.Request)
 		if derr := h.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &probe); derr == nil {
 			prior = h.adminPriorURL(r, contentID, probe.FullPath)
 		}
-		h.writeAdminProductPage(w, "Revert Live", string(FailedPublishHTML(prior, generation.CodeOf(err), PublishErrorRetryable(err))))
+		h.writeAdminProductPage(w, "回滚线上", string(FailedPublishHTML(prior, generation.CodeOf(err), PublishErrorRetryable(err))))
 		return
 	}
-	h.writeAdminProductPage(w, "Revert Live", string(PublishResultHTML(PublishDisplay{
+	h.writeAdminProductPage(w, "回滚线上", string(PublishResultHTML(PublishDisplay{
 		Result: publication.PublicationResult{
 			ContentVersion: res.ContentVersion, FullPath: res.FullPath, PublicURL: res.PublicURL,
 		}, TemplateVersion: 0,
