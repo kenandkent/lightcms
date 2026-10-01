@@ -19,14 +19,22 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"html"
 	"html/template"
+	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
+	"github.com/jonradoff/lightcms/v7/internal/auth"
+	"github.com/jonradoff/lightcms/v7/internal/build"
+	"github.com/jonradoff/lightcms/v7/internal/i18n"
 	"github.com/jonradoff/lightcms/v7/internal/models"
 	"github.com/jonradoff/lightcms/v7/internal/product/generation"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
@@ -34,6 +42,7 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
+	"github.com/gorilla/csrf"
 	"github.com/gorilla/mux"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -330,6 +339,23 @@ func codeList(ids []string) string {
 	return b.String()
 }
 
+// linkedCodeList renders each ID as a link to its content edit page — the
+// post-merge action for a requires_publish entry is "open the page and hit
+// Publish" (Wave 4C puts the button there).
+func linkedCodeList(ids []string) string {
+	cp := append([]string(nil), ids...)
+	sort.Strings(cp)
+	var b strings.Builder
+	for i, id := range cp {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(`<a href="/cm/content/` + html.EscapeString(id) + `"><code>` +
+			html.EscapeString(id) + "</code></a>")
+	}
+	return b.String()
+}
+
 // MergeResultHTML renders the merge outcome: requires_publish entries plus an
 // explicit statement that canonical HTML is unchanged pending Publish.
 func MergeResultHTML(r ForkMergeDisplay) template.HTML {
@@ -338,7 +364,7 @@ func MergeResultHTML(r ForkMergeDisplay) template.HTML {
 	b.WriteString("<p>已合并 " + strconv.Itoa(r.Updated) + " 个更新、" + strconv.Itoa(r.Created) + " 个新建。")
 	b.WriteString("合并的是草稿；发布是单独的操作。</p>")
 	if len(r.RequiresPublish) > 0 {
-		b.WriteString("<p>待发布： " + codeList(r.RequiresPublish) + "</p>")
+		b.WriteString("<p>待发布： " + linkedCodeList(r.RequiresPublish) + "</p>")
 	}
 	b.WriteString("<p>在发布之前，线上正式 HTML 不会变化。</p>")
 	b.WriteString("</div>")
@@ -399,8 +425,11 @@ func PublishErrorRetryable(err error) bool {
 }
 
 // FailedPublishHTML keeps the prior live URL available and shows the
-// retryable error (spec: failed publish leaves prior URL available).
-func FailedPublishHTML(priorURL, code string, retryable bool) template.HTML {
+// retryable error (spec: failed publish leaves prior URL available). Hidden
+// fields passed in hidden are re-emitted inside the retry form so a retry
+// replays the SAME request (idempotency key + expected_active_id) instead of
+// failing validation again — `action=""` posts back to the current handler.
+func FailedPublishHTML(priorURL, code string, retryable bool, hidden ...url.Values) template.HTML {
 	var b strings.Builder
 	b.WriteString(`<div class="notice notice-failed">`)
 	b.WriteString("<p>发布失败：<code>" + html.EscapeString(code) + "</code>.</p>")
@@ -409,7 +438,21 @@ func FailedPublishHTML(priorURL, code string, retryable bool) template.HTML {
 		b.WriteString(`<a href="` + html.EscapeString(priorURL) + `">` + html.EscapeString(priorURL) + "</a></p>")
 	}
 	if retryable {
-		b.WriteString(`<form method="POST" action=""><button type="submit" class="btn btn-primary">重试发布</button></form>`)
+		b.WriteString(`<form method="POST" action="">`)
+		for _, vals := range hidden {
+			keys := make([]string, 0, len(vals))
+			for k := range vals {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				for _, v := range vals[k] {
+					b.WriteString(`<input type="hidden" name="` + html.EscapeString(k) +
+						`" value="` + html.EscapeString(v) + `">`)
+				}
+			}
+		}
+		b.WriteString(`<button type="submit" class="btn btn-primary">重试发布</button></form>`)
 	} else {
 		b.WriteString("<p>请修复上述错误后重试。</p>")
 	}
@@ -438,8 +481,10 @@ func TemplateVersionNoticeHTML(oldVersion, newVersion int64) template.HTML {
 // ---------------------------------------------------------------------------
 
 // UpgradePreviewHTML renders the read-only preview: what WOULD republish,
-// plus the explicit start control.
-func UpgradePreviewHTML(p generation.UpgradePreview) template.HTML {
+// plus the explicit start control. The start form must post to the POST-only
+// upgrade-start route for templateID — the preview URL itself is GET-only
+// (main.go), so action="" would 405.
+func UpgradePreviewHTML(p generation.UpgradePreview, templateID string) template.HTML {
 	var b strings.Builder
 	b.WriteString(`<div class="upgrade-preview">`)
 	b.WriteString("<h3>升级预览： " + html.EscapeString(p.Template) + " v" +
@@ -460,14 +505,17 @@ func UpgradePreviewHTML(p generation.UpgradePreview) template.HTML {
 			"</td><td>" + html.EscapeString(outcome) + "</td></tr>")
 	}
 	b.WriteString("</tbody></table>")
-	b.WriteString(`<form method="POST" action=""><button type="submit" class="btn btn-primary">启动升级任务</button></form>`)
+	b.WriteString(`<form method="POST" action="/cm/templates/` + html.EscapeString(templateID) +
+		`/upgrade-start"><button type="submit" class="btn btn-primary">启动升级任务</button></form>`)
 	b.WriteString("</div>")
 	return template.HTML(b.String())
 }
 
 // UpgradeJobHTML renders the durable job with per-item outcomes and
-// retry/resume controls.
-func UpgradeJobHTML(j generation.UpgradeJob) template.HTML {
+// retry/resume controls. runURL must be the explicit /cm/upgrade-jobs/{id}/run
+// endpoint: posting back to the upgrade-start URL would create a NEW job
+// instead of running the existing one.
+func UpgradeJobHTML(j generation.UpgradeJob, runURL string) template.HTML {
 	var b strings.Builder
 	b.WriteString(`<div class="upgrade-job">`)
 	b.WriteString("<h3>升级任务 <code>" + html.EscapeString(j.ID.Hex()) + "</code> — " + html.EscapeString(string(j.Status)) + "</h3>")
@@ -488,7 +536,8 @@ func UpgradeJobHTML(j generation.UpgradeJob) template.HTML {
 	}
 	b.WriteString("</tbody></table>")
 	if j.Status == generation.UpgradeJobRunning || j.Status == generation.UpgradeJobPartial {
-		b.WriteString(`<form method="POST" action=""><button type="submit" class="btn btn-primary">重试 / 恢复失败项</button></form>`)
+		b.WriteString(`<form method="POST" action="` + html.EscapeString(runURL) +
+			`"><button type="submit" class="btn btn-primary">重试 / 恢复失败项</button></form>`)
 	}
 	b.WriteString("</div>")
 	return template.HTML(b.String())
@@ -502,19 +551,49 @@ func UpgradeJobHTML(j generation.UpgradeJob) template.HTML {
 // NEW Publication.
 // ---------------------------------------------------------------------------
 
+// newIdempotencyKey mints a render-time idempotency key (16 random bytes,
+// hex-encoded). Because the key is generated when the page renders, a
+// double-submit of the SAME page replays the completed operation instead of
+// minting a second Publication. On crypto/rand failure it returns "" so the
+// handler rejects the submit (IDEMPOTENCY_KEY_REQUIRED) rather than mutating
+// without idempotency.
+func newIdempotencyKey() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // RestoreRevertActionsHTML renders the three distinct version actions.
-func RestoreRevertActionsHTML(contentID string, version int64, sourcePublicationID string) template.HTML {
+// activePubID is the currently-active Publication (empty when none); it is
+// emitted as the expected_active_id lost-update guard on the mutating forms.
+func RestoreRevertActionsHTML(contentID string, version int64, sourcePublicationID, activePubID string) template.HTML {
+	hidden := func() string {
+		var b strings.Builder
+		b.WriteString(`<input type="hidden" name="idempotency_key" value="` +
+			html.EscapeString(newIdempotencyKey()) + `">`)
+		if activePubID != "" {
+			b.WriteString(`<input type="hidden" name="expected_active_id" value="` +
+				html.EscapeString(activePubID) + `">`)
+		}
+		return b.String()
+	}
 	var b strings.Builder
 	b.WriteString(`<div class="restore-revert-actions">`)
+	// Restore as draft: draft-only field restore. The registered route is
+	// /revert (RevertContentVersion) — there is no restore-draft route.
 	b.WriteString(`<form method="POST" action="/cm/content/` + html.EscapeString(contentID) +
-		`/versions/` + strconv.FormatInt(version, 10) + `/restore-draft" style="display:inline">`)
+		`/versions/` + strconv.FormatInt(version, 10) + `/revert" style="display:inline">`)
 	b.WriteString(`<button type="submit" class="btn btn-sm btn-outline" title="仅将版本数据恢复为草稿，线上页面不受影响">恢复为草稿</button></form> `)
 	b.WriteString(`<form method="POST" action="/cm/content/` + html.EscapeString(contentID) +
 		`/versions/` + strconv.FormatInt(version, 10) + `/restore_and_publish" style="display:inline">`)
+	b.WriteString(hidden())
 	b.WriteString(`<button type="submit" class="btn btn-sm btn-primary" title="将历史版本数据重新渲染为新的发布">恢复并发布 (restore_and_publish)</button></form> `)
 	if sourcePublicationID != "" {
 		b.WriteString(`<form method="POST" action="/cm/content/` + html.EscapeString(contentID) +
 			`/publications/` + html.EscapeString(sourcePublicationID) + `/revert_live" style="display:inline">`)
+		b.WriteString(hidden())
 		b.WriteString(`<button type="submit" class="btn btn-sm btn-secondary" title="将该历史发布的完整保留字节恢复为新的发布">回滚线上到该发布 (revert_live)</button></form>`)
 		b.WriteString("<p class=\"help-text\">restore_and_publish 重新渲染草稿数据，revert_live 恢复完整保留字节。</p>")
 	}
@@ -539,6 +618,52 @@ func (h *Handler) adminActor(r *http.Request) generation.Actor {
 		a.IsAdmin = u.Role == "admin"
 	}
 	return a
+}
+
+// adminRequirePerm gates an Admin product handler behind one or more RBAC
+// permissions (Wave 4A). The caller has already handled the anonymous
+// redirect; here an authenticated session whose role lacks the permission
+// gets a hard 403 — never a silent pass-through. Unknown roles hold no
+// permissions and are forbidden too.
+func (h *Handler) adminRequirePerm(w http.ResponseWriter, r *http.Request, perms ...string) bool {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return false
+	}
+	for _, perm := range perms {
+		if !auth.HasPermission(user.Role, perm) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return false
+		}
+	}
+	return true
+}
+
+// adminRetryHidden collects the mutating form fields a failure page must
+// re-emit so the retry replays the SAME operation (idempotency key) under the
+// SAME lost-update precondition (expected_active_id).
+func adminRetryHidden(r *http.Request) url.Values {
+	v := url.Values{}
+	for _, k := range []string{"idempotency_key", "expected_active_id"} {
+		if val := strings.TrimSpace(r.FormValue(k)); val != "" {
+			v.Set(k, val)
+		}
+	}
+	return v
+}
+
+// adminExpectedActive parses the expected_active_id form precondition.
+func adminExpectedActive(r *http.Request) *primitive.ObjectID {
+	raw := strings.TrimSpace(r.FormValue("expected_active_id"))
+	if raw == "" {
+		return nil
+	}
+	id, err := primitive.ObjectIDFromHex(raw)
+	if err != nil {
+		return nil
+	}
+	return &id
 }
 
 // adminGenerationService builds the same orchestrator REST uses (Task 12).
@@ -583,7 +708,92 @@ func (h *Handler) adminPriorURL(r *http.Request, contentID primitive.ObjectID, f
 	return base + fullPath
 }
 
-func (h *Handler) writeAdminProductPage(w http.ResponseWriter, title, body string) {
+// writeAdminProductPage renders one Admin product page inside the shared
+// Admin layout. The layout is template text ({{i18n}}, {{.CSRFField}}, ...),
+// so it must be EXECUTED with the same request data renderAdmin supplies —
+// writing it verbatim would ship the placeholders as literal page content and
+// the logout form would lose its CSRF field. The layout+body shell is parsed
+// once; body is trusted server-generated HTML and never re-parsed.
+var (
+	productPageTmplOnce sync.Once
+	productPageTmpl     *template.Template
+	productPageTmplErr  error
+)
+
+func productPageTemplate() (*template.Template, error) {
+	productPageTmplOnce.Do(func() {
+		productPageTmpl, productPageTmplErr = template.New("admin_product_page").
+			Funcs(adminTemplateFuncMap).
+			Parse(adminLayoutStart + `<div class="page-header"><h1>{{.Title}}</h1></div>{{.Body}}` + adminLayoutEnd)
+	})
+	return productPageTmpl, productPageTmplErr
+}
+
+// stampCSRFTokens inserts the gorilla/csrf hidden field into every POST form
+// of the rendered body. The publication forms are plain-HTML helpers with no
+// {{.CSRFField}} slot, and the /cm router (main.go csrf.Protect) rejects
+// token-less POSTs with 403. An empty token (no middleware, e.g. direct
+// handler calls in tests) stamps nothing.
+func stampCSRFTokens(body, token string) string {
+	if token == "" {
+		return body
+	}
+	field := `<input type="hidden" name="gorilla.csrf.Token" value="` + html.EscapeString(token) + `">`
+	const open = `<form method="POST"`
+	var b strings.Builder
+	rest := body
+	for {
+		i := strings.Index(rest, open)
+		if i < 0 {
+			b.WriteString(rest)
+			return b.String()
+		}
+		j := strings.IndexByte(rest[i:], '>')
+		if j < 0 {
+			b.WriteString(rest)
+			return b.String()
+		}
+		end := i + j + 1
+		b.WriteString(rest[:end])
+		b.WriteString(field)
+		rest = rest[end:]
+	}
+}
+
+func (h *Handler) writeAdminProductPage(w http.ResponseWriter, r *http.Request, title, body string) {
+	body = stampCSRFTokens(body, csrf.Token(r))
+	tmpl, err := productPageTemplate()
+	if err == nil {
+		data := map[string]interface{}{
+			"Title":                title,
+			"Body":                 template.HTML(body),
+			"IsAuthenticated":      h.auth.IsAuthenticated(r),
+			"Lang":                 i18n.LangFromRequest(r),
+			"CSRFToken":            csrf.Token(r),
+			"CSRFField":            csrf.TemplateField(r),
+			"AppVersion":           build.GetVersion(),
+			"CopilotEnabled":       false,
+			"UnreadMessageCount":   0,
+			"PendingApprovalCount": 0,
+		}
+		if user, ok := h.auth.GetCurrentUser(r); ok {
+			data["CurrentUser"] = user
+			data["CopilotEnabled"] = h.anthropicAPIKey != "" && auth.HasPermission(user.Role, auth.PermContentEdit)
+		}
+		data["UnreadMessageCount"], _ = h.db.Count(r.Context(), "contact_messages", bson.M{"read": false})
+		if h.approvalService != nil {
+			data["PendingApprovalCount"] = h.approvalService.CountPending(r.Context())
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		if err := tmpl.Execute(w, data); err != nil {
+			log.Printf("admin product page %q execute error: %v", title, err)
+		}
+		return
+	}
+	// Layout failed to parse (should be impossible): fall back to the legacy
+	// raw composition rather than serving an empty page.
+	log.Printf("admin product page layout parse error: %v", err)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, adminLayoutStart+`<div class="page-header"><h1>`+html.EscapeString(title)+
 		"</h1></div>"+body+adminLayoutEnd)
@@ -596,6 +806,9 @@ func (h *Handler) writeAdminProductPage(w http.ResponseWriter, title, body strin
 func (h *Handler) AdminProductPublish(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit, auth.PermContentPublish) {
 		return
 	}
 	vars := mux.Vars(r)
@@ -617,27 +830,24 @@ func (h *Handler) AdminProductPublish(w http.ResponseWriter, r *http.Request) {
 	}
 	tv, err := templatecontract.NewService(h.db).GetCurrent(ctx, tmpl.Slug)
 	if err != nil {
-		h.writeAdminProductPage(w, "发布", string(FailedPublishHTML(
-			h.adminPriorURL(r, contentID, content.FullPath), "TEMPLATE_VERSION_NOT_FOUND", false)))
+		h.writeAdminProductPage(w, r, "发布", string(FailedPublishHTML(
+			h.adminPriorURL(r, contentID, content.FullPath), "TEMPLATE_VERSION_NOT_FOUND", false,
+			adminRetryHidden(r))))
 		return
 	}
-	var expected *primitive.ObjectID
-	if raw := strings.TrimSpace(r.FormValue("expected_active_id")); raw != "" {
-		if id, err := primitive.ObjectIDFromHex(raw); err == nil {
-			expected = &id
-		}
-	}
+	expected := adminExpectedActive(r)
 	svc := h.adminPublicationService()
 	res, perr := svc.Publish(ctx, publication.PublishRequest{
 		ContentID: contentID, ContentVersion: content.CurrentVersion,
 		TemplateVersionID: tv.ID, ExpectedActiveID: expected, Reason: "admin publish",
 	})
 	if perr != nil {
-		h.writeAdminProductPage(w, "发布", string(FailedPublishHTML(
-			h.adminPriorURL(r, contentID, content.FullPath), publication.CodeOf(perr), PublishErrorRetryable(perr))))
+		h.writeAdminProductPage(w, r, "发布", string(FailedPublishHTML(
+			h.adminPriorURL(r, contentID, content.FullPath), publication.CodeOf(perr),
+			PublishErrorRetryable(perr), adminRetryHidden(r))))
 		return
 	}
-	h.writeAdminProductPage(w, "发布", string(PublishResultHTML(PublishDisplay{Result: res, TemplateVersion: tv.Version})))
+	h.writeAdminProductPage(w, r, "发布", string(PublishResultHTML(PublishDisplay{Result: res, TemplateVersion: tv.Version})))
 }
 
 // AdminProductPublications lists publication history with active/failed state
@@ -645,6 +855,9 @@ func (h *Handler) AdminProductPublish(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AdminProductPublications(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermContentView) {
 		return
 	}
 	vars := mux.Vars(r)
@@ -659,6 +872,12 @@ func (h *Handler) AdminProductPublications(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "Failed to load publications", http.StatusInternalServerError)
 		return
 	}
+	// The active Publication is the expected_active_id the mutating forms
+	// guard against a lost update; fetch it once for the whole page.
+	activePubID := ""
+	if active, aerr := repo.GetActive(r.Context(), contentID); aerr == nil && active != nil {
+		activePubID = active.ID.Hex()
+	}
 	var b strings.Builder
 	b.WriteString("<h3>发布历史</h3>")
 	b.WriteString(`<table><thead><tr><th>ID</th><th>状态</th><th>内容版本</th><th>模板版本</th><th>操作</th></tr></thead><tbody>`)
@@ -666,10 +885,10 @@ func (h *Handler) AdminProductPublications(w http.ResponseWriter, r *http.Reques
 		b.WriteString("<tr><td><code>" + html.EscapeString(p.ID.Hex()) + "</code></td><td>" +
 			html.EscapeString(string(p.Status)) + "</td><td>" + strconv.FormatInt(p.ContentVersion, 10) +
 			"</td><td>" + strconv.FormatInt(p.TemplateVersion, 10) + "</td><td>" +
-			string(RestoreRevertActionsHTML(contentID.Hex(), p.ContentVersion, p.ID.Hex())) + "</td></tr>")
+			string(RestoreRevertActionsHTML(contentID.Hex(), p.ContentVersion, p.ID.Hex(), activePubID)) + "</td></tr>")
 	}
 	b.WriteString("</tbody></table>")
-	h.writeAdminProductPage(w, "发布记录", b.String())
+	h.writeAdminProductPage(w, r, "发布记录", b.String())
 }
 
 // AdminProductUpgradePreview renders the read-only template upgrade preview
@@ -677,6 +896,9 @@ func (h *Handler) AdminProductPublications(w http.ResponseWriter, r *http.Reques
 func (h *Handler) AdminProductUpgradePreview(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermTemplateView) {
 		return
 	}
 	vars := mux.Vars(r)
@@ -695,7 +917,7 @@ func (h *Handler) AdminProductUpgradePreview(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "Upgrade preview failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	h.writeAdminProductPage(w, "升级预览", string(UpgradePreviewHTML(prev)))
+	h.writeAdminProductPage(w, r, "升级预览", string(UpgradePreviewHTML(prev, tmpl.ID.Hex())))
 }
 
 // AdminProductUpgradeStart creates the durable upgrade job (no live pages
@@ -703,6 +925,9 @@ func (h *Handler) AdminProductUpgradePreview(w http.ResponseWriter, r *http.Requ
 func (h *Handler) AdminProductUpgradeStart(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermTemplateEdit, auth.PermContentPublish) {
 		return
 	}
 	vars := mux.Vars(r)
@@ -721,7 +946,8 @@ func (h *Handler) AdminProductUpgradeStart(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "Start upgrade job failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	h.writeAdminProductPage(w, "升级任务", string(UpgradeJobHTML(job)))
+	h.writeAdminProductPage(w, r, "升级任务", string(UpgradeJobHTML(job,
+		"/cm/upgrade-jobs/"+job.ID.Hex()+"/run")))
 }
 
 // AdminProductUpgradeRun processes pending/failed job items via
@@ -729,6 +955,9 @@ func (h *Handler) AdminProductUpgradeStart(w http.ResponseWriter, r *http.Reques
 func (h *Handler) AdminProductUpgradeRun(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermTemplateEdit, auth.PermContentPublish) {
 		return
 	}
 	jobID, err := primitive.ObjectIDFromHex(mux.Vars(r)["jobID"])
@@ -741,7 +970,8 @@ func (h *Handler) AdminProductUpgradeRun(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "Run upgrade job failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	h.writeAdminProductPage(w, "升级任务", string(UpgradeJobHTML(job)))
+	h.writeAdminProductPage(w, r, "升级任务", string(UpgradeJobHTML(job,
+		"/cm/upgrade-jobs/"+jobID.Hex()+"/run")))
 }
 
 // AdminProductRestoreAndPublish re-renders historical version data into a NEW
@@ -749,6 +979,9 @@ func (h *Handler) AdminProductUpgradeRun(w http.ResponseWriter, r *http.Request)
 func (h *Handler) AdminProductRestoreAndPublish(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit, auth.PermContentPublish) {
 		return
 	}
 	vars := mux.Vars(r)
@@ -767,26 +1000,31 @@ func (h *Handler) AdminProductRestoreAndPublish(w http.ResponseWriter, r *http.R
 		ctx = services.WithEditorEmail(ctx, u.Email)
 	}
 	actor := h.adminActor(r)
+	idemKey := strings.TrimSpace(r.FormValue("idempotency_key"))
 	genCtx := generation.WithIdempotency(ctx, generation.IdempotencyParams{
 		Owner: actor.Owner(), Method: "POST",
 		Path: "/cm/content/" + contentID.Hex() + "/versions/" + vars["version"] + "/restore_and_publish",
-		Key:  strings.TrimSpace(r.FormValue("idempotency_key")),
+		Key:  idemKey,
 	})
-	if strings.TrimSpace(r.FormValue("idempotency_key")) == "" {
-		h.writeAdminProductPage(w, "恢复并发布", string(FailedPublishHTML("", "IDEMPOTENCY_KEY_REQUIRED", false)))
+	if idemKey == "" {
+		h.writeAdminProductPage(w, r, "恢复并发布", string(FailedPublishHTML("", "IDEMPOTENCY_KEY_REQUIRED", false)))
 		return
 	}
-	res, err := h.adminGenerationService().RestoreAndPublish(genCtx, actor, contentID, version, nil)
+	// Same lost-update guard AdminProductPublish honors: a stale
+	// expected_active_id rejects the restore instead of racing a newer
+	// activation.
+	res, err := h.adminGenerationService().RestoreAndPublish(genCtx, actor, contentID, version, adminExpectedActive(r))
 	if err != nil {
 		var prior string
 		var probe models.Content
 		if derr := h.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &probe); derr == nil {
 			prior = h.adminPriorURL(r, contentID, probe.FullPath)
 		}
-		h.writeAdminProductPage(w, "恢复并发布", string(FailedPublishHTML(prior, generation.CodeOf(err), PublishErrorRetryable(err))))
+		h.writeAdminProductPage(w, r, "恢复并发布", string(FailedPublishHTML(prior,
+			generation.CodeOf(err), PublishErrorRetryable(err), adminRetryHidden(r))))
 		return
 	}
-	h.writeAdminProductPage(w, "恢复并发布", string(PublishResultHTML(PublishDisplay{
+	h.writeAdminProductPage(w, r, "恢复并发布", string(PublishResultHTML(PublishDisplay{
 		Result: publication.PublicationResult{
 			ContentVersion: res.ContentVersion, FullPath: res.FullPath, PublicURL: res.PublicURL,
 		}, TemplateVersion: 0,
@@ -801,6 +1039,9 @@ func (h *Handler) AdminProductRevertLive(w http.ResponseWriter, r *http.Request)
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit, auth.PermContentPublish) {
+		return
+	}
 	vars := mux.Vars(r)
 	contentID, err := primitive.ObjectIDFromHex(vars["id"])
 	if err != nil {
@@ -812,8 +1053,9 @@ func (h *Handler) AdminProductRevertLive(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "Invalid publication ID", http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(r.FormValue("idempotency_key")) == "" {
-		h.writeAdminProductPage(w, "回滚线上", string(FailedPublishHTML("", "IDEMPOTENCY_KEY_REQUIRED", false)))
+	idemKey := strings.TrimSpace(r.FormValue("idempotency_key"))
+	if idemKey == "" {
+		h.writeAdminProductPage(w, r, "回滚线上", string(FailedPublishHTML("", "IDEMPOTENCY_KEY_REQUIRED", false)))
 		return
 	}
 	actor := h.adminActor(r)
@@ -821,19 +1063,20 @@ func (h *Handler) AdminProductRevertLive(w http.ResponseWriter, r *http.Request)
 	genCtx := generation.WithIdempotency(ctx, generation.IdempotencyParams{
 		Owner: actor.Owner(), Method: "POST",
 		Path: "/cm/content/" + contentID.Hex() + "/publications/" + sourceID.Hex() + "/revert_live",
-		Key:  strings.TrimSpace(r.FormValue("idempotency_key")),
+		Key:  idemKey,
 	})
-	res, err := h.adminGenerationService().RevertLive(genCtx, actor, contentID, sourceID, nil)
+	res, err := h.adminGenerationService().RevertLive(genCtx, actor, contentID, sourceID, adminExpectedActive(r))
 	if err != nil {
 		var prior string
 		var probe models.Content
 		if derr := h.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &probe); derr == nil {
 			prior = h.adminPriorURL(r, contentID, probe.FullPath)
 		}
-		h.writeAdminProductPage(w, "回滚线上", string(FailedPublishHTML(prior, generation.CodeOf(err), PublishErrorRetryable(err))))
+		h.writeAdminProductPage(w, r, "回滚线上", string(FailedPublishHTML(prior,
+			generation.CodeOf(err), PublishErrorRetryable(err), adminRetryHidden(r))))
 		return
 	}
-	h.writeAdminProductPage(w, "回滚线上", string(PublishResultHTML(PublishDisplay{
+	h.writeAdminProductPage(w, r, "回滚线上", string(PublishResultHTML(PublishDisplay{
 		Result: publication.PublicationResult{
 			ContentVersion: res.ContentVersion, FullPath: res.FullPath, PublicURL: res.PublicURL,
 		}, TemplateVersion: 0,

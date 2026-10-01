@@ -266,7 +266,7 @@ func TestAdminPublicationUpgradeUI(t *testing.T) {
 			{ContentID: primitive.NewObjectID().Hex(), FullPath: "/news/b", CurrentVersion: 1, HasActive: true, ActiveTemplateV: 3, TargetTemplateV: 3},
 		},
 	}
-	html := string(UpgradePreviewHTML(prev))
+	html := string(UpgradePreviewHTML(prev, primitive.NewObjectID().Hex()))
 	for _, want := range []string{"financial-news", "/news/a", "需要重新发布", "启动升级任务"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("upgrade preview missing %q in:\n%s", want, html)
@@ -280,7 +280,7 @@ func TestAdminPublicationUpgradeUI(t *testing.T) {
 			{ContentID: primitive.NewObjectID(), FullPath: "/news/c", Status: generation.UpgradeItemFailed, Attempts: 2, Error: "stage failed"},
 		},
 	}
-	jhtml := string(UpgradeJobHTML(job))
+	jhtml := string(UpgradeJobHTML(job, "/cm/upgrade-jobs/"+job.ID.Hex()+"/run"))
 	for _, want := range []string{"/news/a", "done", "/news/c", "failed", "重试", "恢复"} {
 		if !strings.Contains(jhtml, want) {
 			t.Errorf("upgrade job missing %q in:\n%s", want, jhtml)
@@ -290,10 +290,14 @@ func TestAdminPublicationUpgradeUI(t *testing.T) {
 
 // TestAdminPublicationRestoreVsRevert: two distinct buttons with distinct
 // outcomes — restore_and_publish re-renders a ContentVersion; revert_live
-// restores a Publication's bytes (spec §13, §18.4–§18.5).
+// restores a Publication's bytes (spec §13, §18.4–§18.5). The restore-as-draft
+// button must post to the REGISTERED /revert route (there is no restore-draft
+// route), and the mutating forms must carry their hidden idempotency /
+// expected_active_id fields (Wave 4A).
 func TestAdminPublicationRestoreVsRevert(t *testing.T) {
 	cid := primitive.NewObjectID().Hex()
-	html := string(RestoreRevertActionsHTML(cid, 7, primitive.NewObjectID().Hex()))
+	activeID := primitive.NewObjectID().Hex()
+	html := string(RestoreRevertActionsHTML(cid, 7, primitive.NewObjectID().Hex(), activeID))
 	if !strings.Contains(html, "restore_and_publish") {
 		t.Errorf("must expose a restore_and_publish action in:\n%s", html)
 	}
