@@ -91,6 +91,7 @@ func (s *Service) publishWithOp(ctx context.Context, actor Actor, tv templatecon
 		ContentID: contentID, ContentVersion: contentVersion,
 		TemplateVersionID: tv.ID, ExpectedActiveID: expectedActive,
 		Reason: "page_generation publish", IdempotencyRecord: &op.ID,
+		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
 	})
 	if err != nil {
 		// Terminal pre-activation failures are already MarkedTerminal by the

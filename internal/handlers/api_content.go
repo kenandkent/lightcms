@@ -2074,6 +2074,18 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Lane 2B: bulk-create is a draft-only write path — it mints no
+	// Publication row, no outbox event, and no idempotency record. Accepting
+	// published:true would persist a live flag without control-plane truth
+	// (the pre-V3 divergence). Reject with a 400 that directs to the publish
+	// endpoints; this also covers upsert mode below, which shares the flag.
+	for i, item := range req.Items {
+		if item.Published {
+			a.jsonError(w, http.StatusBadRequest, fmt.Sprintf("item %d: published:true is not accepted on bulk-create (it would bypass publication records, outbox delivery, and idempotency) — create the item as a draft, then publish via POST /api/v1/content/{id}/publish, POST /api/v1/content/batch-publish, or the page-generation publish endpoint", i))
+			return
+		}
+	}
+
 	// Resolve templates and folders once
 	templateCache := make(map[string]*models.Template)
 	folders, _ := a.settingsService.ListFolders(r.Context())

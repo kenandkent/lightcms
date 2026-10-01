@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/auth"
@@ -107,6 +108,9 @@ type Handler struct {
 	publicationService *publication.Service
 	idempotencyService *idempotency.Service
 	generationService  *generation.Service
+	// Lane 2B: migration-required degraded-boot reason (see healthz.go
+	// SetMigrationRequired). atomic.Value holding a string; empty = healthy.
+	migrationRequired atomic.Value
 }
 
 // SetPublicationRuntime wires the shared V3 publication runtime (Task 16C/E).

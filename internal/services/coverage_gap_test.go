@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -439,7 +440,7 @@ func TestAnalytics_FlushBufferForTest_AndPrefField(t *testing.T) {
 }
 
 // TestBulkCreateContent_Branches covers the partial-failure (duplicate key),
-// published static-generation, webhook, and total-failure branches.
+// Lane 2B published:true rejection, webhook, and total-failure branches.
 func TestBulkCreateContent_Branches(t *testing.T) {
 	db, cleanup := testutil.MustConnectTestDB(t)
 	defer cleanup()
@@ -485,7 +486,16 @@ func TestBulkCreateContent_Branches(t *testing.T) {
 	if results[0].Success {
 		t.Error("expected duplicate-path item to fail")
 	}
-	if !results[1].Success || !results[2].Success {
+	// Lane 2B: Published:true items are rejected — a bulk write mints no
+	// Publication row, outbox event, or idempotency record, so persisting
+	// the live flag would diverge from control-plane truth.
+	if results[1].Success {
+		t.Error("expected published:true item to fail")
+	}
+	if !strings.Contains(strings.ToLower(results[1].Error), "publish") {
+		t.Errorf("published:true rejection must direct to publish endpoints, got %q", results[1].Error)
+	}
+	if !results[2].Success {
 		t.Errorf("expected non-duplicate items to succeed: %+v", results)
 	}
 	if results[2].FullPath != "/bulk-folder/leaf" {

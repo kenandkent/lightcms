@@ -289,6 +289,11 @@ type cutoverPlan struct {
 	attempt        int64
 	useIdem        bool
 	startedAt      time.Time // plan freeze time for duration_ms logs.
+	// Lane 2B: caller attribution carried from the request into the minted
+	// Publication record (empty = unattributed, as before).
+	actor        string
+	via          string
+	agentSession string
 }
 
 // planFields builds the Task 16F structured log fields for one plan at a
@@ -405,6 +410,8 @@ func (s *Service) buildPublishPlan(ctx context.Context, req PublishRequest, cont
 		snapshot: map[string]any{"template_render_hash": tv.RenderHash},
 		opID:     opID, attempt: attempt, useIdem: useIdem,
 		startedAt: s.now(),
+		// Lane 2B: thread caller attribution into the minted record.
+		actor: req.Actor, via: req.Via, agentSession: req.AgentSession,
 	}
 	sum := sha256.Sum256(html)
 	plan.rawHash = hex.EncodeToString(sum[:])
@@ -471,6 +478,8 @@ func (s *Service) buildRollbackPlan(ctx context.Context, req RollbackRequest, co
 		html: html, verification: verification, snapshot: snapshot,
 		opID: opID, attempt: attempt, useIdem: useIdem,
 		startedAt: s.now(),
+		// Lane 2B: thread caller attribution into the minted record.
+		actor: req.Actor, via: req.Via, agentSession: req.AgentSession,
 	}
 	tv, terr := s.templates.GetVersion(ctx, source.TemplateVersionID)
 	if terr != nil {
@@ -634,6 +643,11 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		StorageProvider:    "filesystem",
 		StoragePath:        s.store.ImmutablePath(plan.contentID, plan.pubID),
 		LogicalPublishedAt: plan.logicalAt,
+		// Lane 2B: caller attribution from the request (empty when the
+		// caller provided none — omitempty keeps old docs byte-identical).
+		Actor:              plan.actor,
+		Via:                plan.via,
+		AgentSession:       plan.agentSession,
 		RendererVersion:    s.rendererVersion, ProductBuildSHA: s.buildSHA,
 		RenderDependenciesHash: plan.tv.RenderHash, DependencySnapshot: plan.snapshot,
 	}

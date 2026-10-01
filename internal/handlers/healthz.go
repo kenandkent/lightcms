@@ -45,6 +45,23 @@ type healthResponse struct {
 
 var processStart = time.Now()
 
+// migrationRequiredReason, when non-empty, marks the boot degraded: the V3
+// product index set could not be ensured (legacy canonical collisions) and
+// the publication migration must run before publish paths are protected.
+// Lane 2B: latched once at startup via SetMigrationRequired (called from
+// cmd/server boot wiring); read by Healthz as a degraded dependency.
+// atomic.Value keeps concurrent health probes race-free.
+func (h *Handler) SetMigrationRequired(reason string) {
+	h.migrationRequired.Store(reason)
+}
+
+func (h *Handler) getMigrationRequired() string {
+	if v, ok := h.migrationRequired.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
 // Healthz serves GET /healthz in the vibectl VibeCtl Health Check Protocol format.
 // The endpoint is unauthenticated — it is safe to expose publicly.
 func (h *Handler) Healthz(w http.ResponseWriter, r *http.Request) {
@@ -79,11 +96,30 @@ func (h *Handler) Healthz(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 
+	// Lane 2B: a degraded boot (product indexes unensurable — legacy
+	// canonical collisions) surfaces here as a degraded dependency with the
+	// operator reason, while the process stays live (HTTP 200) so the
+	// migration dry-run diagnostic path remains reachable.
+	if migReason := h.getMigrationRequired(); migReason != "" {
+		resp.Dependencies = append(resp.Dependencies, healthDependency{
+			Name: "migration", Status: healthStatusDegraded, Message: migReason,
+		})
+	}
+	hasUnhealthy := false
+	hasDegraded := false
 	for _, d := range resp.Dependencies {
-		if d.Status == healthStatusUnhealthy {
-			resp.Status = healthStatusUnhealthy
-			break
+		switch d.Status {
+		case healthStatusUnhealthy:
+			hasUnhealthy = true
+		case healthStatusDegraded:
+			hasDegraded = true
 		}
+	}
+	switch {
+	case hasUnhealthy:
+		resp.Status = healthStatusUnhealthy
+	case hasDegraded:
+		resp.Status = healthStatusDegraded
 	}
 
 	// Collect KPIs if analytics service is available

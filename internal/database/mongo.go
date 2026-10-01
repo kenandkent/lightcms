@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -71,15 +72,21 @@ func (db *DB) createIndexes(ctx context.Context) error {
 	// Drop the old unpartitioned index first (ignore error if it doesn't exist).
 	// Drop both the old single-field index and any previous partial-index attempts.
 	db.database.Collection("content").Indexes().DropOne(ctx, "full_path_1")
-	// Task 16E (Task 14 migration contract): the legacy UNIQUE
-	// (full_path, fork_id) SPARSE index is DROP-ONLY here. The migration
-	// drops it after the new canonical index is verified; Connect must NOT
-	// recreate it on restart, or the migration's post-condition breaks.
-	// Uniqueness is enforced by the canonical partial-unique index below
-	// (every Task 2+ write carries canonical_full_path/path_scope).
-	db.database.Collection("content").Indexes().DropOne(ctx, "full_path_1_fork_id_1")
+	// Lane 2B: ensure the canonical uniqueness guard BEFORE dropping the
+	// legacy UNIQUE (full_path, fork_id) SPARSE guard. On legacy DBs with
+	// canonical collisions (case-variant paths sharing one canonical key)
+	// the canonical build fails with a duplicate-key error: keep serving
+	// degraded (legacy guard retained) so `migrate-publications --dry-run`
+	// can report the blockers instead of Connect failing the whole boot.
+	// The migration drops the legacy index after the canonical one is
+	// verified (Run step 8); the drop below is that same idempotent step
+	// for the healthy path. Task 16E (Task 14 migration contract): Connect
+	// must NOT recreate the legacy index on restart, or the migration's
+	// post-condition breaks.
 	if err := db.ensureCanonicalContentIndex(ctx); err != nil {
-		return err
+		log.Printf("WARNING: canonical content index unavailable — serving degraded without canonical uniqueness (run `lightcms migrate-publications --dry-run` for blockers): %v", err)
+	} else {
+		db.database.Collection("content").Indexes().DropOne(ctx, "full_path_1_fork_id_1")
 	}
 
 	// Drop old unique slug index if it exists (we're changing it to non-unique)
@@ -748,6 +755,21 @@ func (db *DB) UpdateOne(ctx context.Context, collection string, filter, update i
 	}
 	_, err := db.database.Collection(collection).UpdateOne(ctx, filter, update)
 	return err
+}
+
+// UpdateOneMatched performs an UpdateOne and reports the matched count so
+// callers can implement compare-and-swap (0 matches = lost race). It
+// consults the same "UpdateOne" fault hook as UpdateOne, so fault-injection
+// tests keep exercising the write-failure branches.
+func (db *DB) UpdateOneMatched(ctx context.Context, collection string, filter, update interface{}) (int64, error) {
+	if err := db.fault("UpdateOne", collection); err != nil {
+		return 0, err
+	}
+	res, err := db.database.Collection(collection).UpdateOne(ctx, filter, update)
+	if err != nil {
+		return 0, err
+	}
+	return res.MatchedCount, nil
 }
 
 func (db *DB) DeleteOne(ctx context.Context, collection string, filter interface{}) error {

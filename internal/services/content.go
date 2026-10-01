@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -413,6 +414,12 @@ type BulkCreateResult struct {
 // Uses unordered InsertMany so one failure doesn't abort the rest.
 // Task 16A: draft-only — no static HTML generation for published items.
 // Only data/version rows plus search-index maintenance.
+// Lane 2B: Published:true items are rejected per-item (never persisted).
+// A bulk write mints no Publication row, no outbox event, and no idempotency
+// record, so persisting content.Published=true would leave a live flag with
+// no control-plane truth. The HTTP layer rejects the whole batch with 400;
+// this per-item backstop protects direct service callers with the same
+// directing error.
 func (s *ContentService) BulkCreateContent(ctx context.Context, items []*models.Content, versionComment string) []BulkCreateResult {
 	results := make([]BulkCreateResult, len(items))
 	now := time.Now()
@@ -421,6 +428,11 @@ func (s *ContentService) BulkCreateContent(ctx context.Context, items []*models.
 	docs := make([]interface{}, 0, len(items))
 	validIndices := make([]int, 0, len(items))
 	for i, c := range items {
+		if c.Published {
+			results[i] = BulkCreateResult{Index: i, Success: false,
+				Error: "published:true is not accepted on bulk-create (it would bypass publication records, outbox delivery, and idempotency) — create as a draft, then publish via the content publish, batch-publish, or page-generation publish endpoints"}
+			continue
+		}
 		c.CreatedAt = now
 		c.UpdatedAt = now
 		c.ID = primitive.NewObjectID()
@@ -520,6 +532,12 @@ func (s *ContentService) BulkCreateContent(ctx context.Context, items []*models.
 	return results
 }
 
+// ErrVersionConflict reports a lost CAS race: the content row moved between
+// the caller's read and write. Callers must re-read, re-apply, and retry.
+// (Lane 2B: returned by UpdateContent's current_version compare-and-swap;
+// errors.Is-compatible so HTTP layers can map it to 409.)
+var ErrVersionConflict = errors.New("content changed concurrently — re-read and retry the update")
+
 // UpdateContent updates content and saves a new version with an optional comment
 // Task 16A (spec §12.5, §12.7): draft-only data/version operation. It updates
 // the Content row, creates a ContentVersion, refreshes canonical bookkeeping
@@ -589,40 +607,60 @@ func (s *ContentService) UpdateContent(ctx context.Context, content *models.Cont
 	}
 	refreshRequiresPublish(content)
 
-	// Update content
+	// Update content.
+	// Lane 2B: compare-and-swap on current_version. Two concurrent writers
+	// that read the same CurrentVersion must not both stamp the same next
+	// version (duplicate-key 500s) or silently overwrite each other: the
+	// loser gets ErrVersionConflict and retries from a fresh read — the same
+	// contract generation.replaceLiveForPublish already enforces. Legacy rows
+	// without a current_version (<= 0) keep the plain _id filter with the
+	// Count()+1 fallback below; saveVersion's persist-back converges them to
+	// CAS-eligible versions on the next write.
 	update := bson.M{
 		"$set": bson.M{
-			"template_id":      content.TemplateID,
-			"template_name":    content.TemplateName,
-			"title":            content.Title,
-			"slug":             content.Slug,
-			"folder_id":        content.FolderID,
-			"folder_path":      content.FolderPath,
-			"full_path":        content.FullPath,
-			"canonical_full_path": content.CanonicalFullPath,
-			"path_scope":          content.PathScope,
-			"path_active":         content.PathActive,
-			"current_version":     content.CurrentVersion,
+			"template_id":             content.TemplateID,
+			"template_name":           content.TemplateName,
+			"title":                   content.Title,
+			"slug":                    content.Slug,
+			"folder_id":               content.FolderID,
+			"folder_path":             content.FolderPath,
+			"full_path":               content.FullPath,
+			"canonical_full_path":     content.CanonicalFullPath,
+			"path_scope":              content.PathScope,
+			"path_active":             content.PathActive,
+			"current_version":         content.CurrentVersion,
 			"has_unpublished_changes": content.HasUnpublishedChanges,
-			"category":         content.Category,
-			"tags":             content.Tags,
-			"meta_description": content.MetaDescription,
-			"og_image":         content.OGImage,
-			"data":             content.Data,
-			"published":        content.Published,
-			"published_at":     content.PublishedAt,
-			"publish_at":       content.PublishAt,
-			"use_header":       content.UseHeader,
-			"use_footer":       content.UseFooter,
-			"use_theme":        content.UseTheme,
-			"raw_mode":         content.RawMode,
-			"internal_links":   content.InternalLinks,
-			"updated_at":       content.UpdatedAt,
+			"category":                content.Category,
+			"tags":                    content.Tags,
+			"meta_description":        content.MetaDescription,
+			"og_image":                content.OGImage,
+			"data":                    content.Data,
+			"published":               content.Published,
+			"published_at":            content.PublishedAt,
+			"publish_at":              content.PublishAt,
+			"use_header":              content.UseHeader,
+			"use_footer":              content.UseFooter,
+			"use_theme":               content.UseTheme,
+			"raw_mode":                content.RawMode,
+			"internal_links":          content.InternalLinks,
+			"updated_at":              content.UpdatedAt,
 		},
 	}
 
-	if err := s.db.UpdateOne(ctx, "content", bson.M{"_id": content.ID}, update); err != nil {
+	writeFilter := bson.M{"_id": content.ID}
+	if original.CurrentVersion > 0 {
+		writeFilter["current_version"] = original.CurrentVersion
+	}
+	matched, err := s.db.UpdateOneMatched(ctx, "content", writeFilter, update)
+	if err != nil {
 		return fmt.Errorf("failed to update content: %w", err)
+	}
+	if matched == 0 {
+		if original.CurrentVersion > 0 {
+			return fmt.Errorf("update content %s (want version %d): %w",
+				content.ID.Hex(), content.CurrentVersion, ErrVersionConflict)
+		}
+		return fmt.Errorf("failed to update content: no matching document")
 	}
 
 	// Save version with original for first-time versioning
@@ -694,13 +732,26 @@ func SetPublicationPublisher(p PublicationPublisher) {
 	legacyPublicationSaga = p
 }
 
+// publishAttributionFromContext reads the caller provenance the API/UI
+// middleware stamped on ctx for the saga request. Empty when the caller set
+// none (background jobs on a bare context): the saga omits empty attribution
+// (omitempty), minting records exactly as before.
+func publishAttributionFromContext(ctx context.Context) (actor, via, session string) {
+	prov, _ := ProvenanceFromContext(ctx)
+	return prov.Actor, prov.Via, prov.AgentSession
+}
+
 // PublishContent publishes content and generates static page
 func (s *ContentService) PublishContent(ctx context.Context, id primitive.ObjectID) error {
 	if legacyPublicationSaga != nil {
 		// Delegate: latest content version + current template version are
 		// frozen under the saga page lock; the result (publication ID/URL)
 		// is intentionally not mapped onto the legacy error-only signature.
-		_, err := legacyPublicationSaga.Publish(ctx, publication.PublishRequest{ContentID: id})
+		// Lane 2B: thread caller attribution into the minted record.
+		actor, via, session := publishAttributionFromContext(ctx)
+		_, err := legacyPublicationSaga.Publish(ctx, publication.PublishRequest{
+			ContentID: id, Actor: actor, Via: via, AgentSession: session,
+		})
 		return err
 	}
 	var content models.Content
@@ -776,9 +827,9 @@ func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectI
 	now := time.Now()
 	update := bson.M{
 		"$set": bson.M{
-			"deleted":    true,
-			"deleted_at": now,
-			"updated_at": now,
+			"deleted":     true,
+			"deleted_at":  now,
+			"updated_at":  now,
 			"path_active": false,
 		},
 	}
@@ -827,10 +878,10 @@ func (s *ContentService) RestoreContent(ctx context.Context, id primitive.Object
 	}
 	update := bson.M{
 		"$set": bson.M{
-			"deleted":    false,
-			"path_active": true,
+			"deleted":                 false,
+			"path_active":             true,
 			"has_unpublished_changes": probe.Published,
-			"updated_at": time.Now(),
+			"updated_at":              time.Now(),
 		},
 		"$unset": bson.M{
 			"deleted_at": "",
@@ -1180,95 +1231,154 @@ func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitiv
 
 // saveVersion saves a new version of the content with an optional comment
 // Task 16A: honors content.CurrentVersion allocated by the caller (CAS-style)
-// and falls back to Count()+1 for legacy callers. Provenance stamping is
+// and falls back to max(history)+1 for legacy callers. Provenance stamping is
 // preserved (spec §12.5 audit/provenance).
+// Lane 2B: the old Count()+1 fallback collided under concurrency (two
+// writers counting the same N, or count lagging a racing insert when history
+// has gaps). Allocation is now max(history)+1 with a bounded duplicate-key
+// retry, and any correction is persisted back to the content row so the row
+// and the history converge instead of diverging permanently.
 func (s *ContentService) saveVersion(ctx context.Context, content *models.Content, original *models.Content, comment string) error {
-	// Get the current version count
-	count, err := s.db.Count(ctx, "content_versions", bson.M{"content_id": content.ID})
-	if err != nil {
-		return err
-	}
-
-	// If no versions exist and we have the original content, save it as v1 first
-	if count == 0 && original != nil {
-		v1 := models.ContentVersion{
-			ContentID:       original.ID,
-			Version:         1,
-			TemplateID:      original.TemplateID,
-			TemplateName:    original.TemplateName,
-			Title:           original.Title,
-			Slug:            original.Slug,
-			FolderID:        original.FolderID,
-			FolderPath:      original.FolderPath,
-			FullPath:        original.FullPath,
-			Category:        original.Category,
-			Tags:            original.Tags,
-			MetaDescription: original.MetaDescription,
-			OGImage:         original.OGImage,
-			Data:            original.Data,
-			Published:       original.Published,
-			PublishedAt:     original.PublishedAt,
-			UseHeader:       original.UseHeader,
-			UseFooter:       original.UseFooter,
-			UseTheme:        original.UseTheme,
-			RawMode:         original.RawMode,
-			CreatedAt:       original.CreatedAt,
-		}
-		if _, err := s.db.InsertOne(ctx, "content_versions", v1); err != nil {
+	for attempt := 0; attempt < 4; attempt++ {
+		maxV, err := s.maxContentVersion(ctx, content.ID)
+		if err != nil {
 			return err
 		}
-		count = 1
-	}
 
-	version := count + 1
-	if content.CurrentVersion > 0 {
-		// Caller-allocated CAS version wins when it advances history;
-		// otherwise fall back to count+1 to avoid duplicate-key writes.
-		if content.CurrentVersion > count {
-			version = content.CurrentVersion
-		} else if count == 0 {
+		// If no versions exist and we have the original content, save it as v1 first
+		if maxV == 0 && original != nil {
+			v1 := models.ContentVersion{
+				ContentID:       original.ID,
+				Version:         1,
+				TemplateID:      original.TemplateID,
+				TemplateName:    original.TemplateName,
+				Title:           original.Title,
+				Slug:            original.Slug,
+				FolderID:        original.FolderID,
+				FolderPath:      original.FolderPath,
+				FullPath:        original.FullPath,
+				Category:        original.Category,
+				Tags:            original.Tags,
+				MetaDescription: original.MetaDescription,
+				OGImage:         original.OGImage,
+				Data:            original.Data,
+				Published:       original.Published,
+				PublishedAt:     original.PublishedAt,
+				UseHeader:       original.UseHeader,
+				UseFooter:       original.UseFooter,
+				UseTheme:        original.UseTheme,
+				RawMode:         original.RawMode,
+				CreatedAt:       original.CreatedAt,
+			}
+			if _, err := s.db.InsertOne(ctx, "content_versions", v1); err != nil {
+				if !isDupKeyError(err) {
+					return err
+				}
+				// Lost the backfill race — someone else saved v1; recount.
+				continue
+			}
+			maxV = 1
+		}
+
+		version := maxV + 1
+		if content.CurrentVersion > version {
+			// Caller-allocated CAS version wins when it advances history.
 			version = content.CurrentVersion
 		}
-	}
-	// Keep the row's CurrentVersion convergent with the version we persist.
-	content.CurrentVersion = version
+		// Persist the corrected version back to the content row. When
+		// history runs ahead of the row (legacy divergence, or a concurrent
+		// CAS bump that landed between our read and write), the row must
+		// converge to the version we actually persist — otherwise the row
+		// and the history diverge permanently and the next writer
+		// re-derives a stale (duplicate) version.
+		if version != content.CurrentVersion {
+			if err := s.db.UpdateOne(ctx, "content",
+				bson.M{"_id": content.ID},
+				bson.M{"$set": bson.M{"current_version": version}}); err != nil {
+				return err
+			}
+		}
+		// Keep the row's CurrentVersion convergent with the version we persist.
+		content.CurrentVersion = version
 
-	modifiedByEmail := EditorEmailFromContext(ctx)
-	prov, _ := ProvenanceFromContext(ctx)
-	if prov.Actor == "" {
-		prov.Actor = "human" // default for legacy paths that set no provenance
-	}
-	contentVersion := models.ContentVersion{
-		ContentID:       content.ID,
-		Version:         version,
-		Comment:         comment,
-		ModifiedByEmail: modifiedByEmail,
-		Actor:           prov.Actor,
-		Via:             prov.Via,
-		AgentSession:    prov.AgentSession,
-		TemplateID:      content.TemplateID,
-		TemplateName:    content.TemplateName,
-		Title:           content.Title,
-		Slug:            content.Slug,
-		FolderID:        content.FolderID,
-		FolderPath:      content.FolderPath,
-		FullPath:        content.FullPath,
-		Category:        content.Category,
-		Tags:            content.Tags,
-		MetaDescription: content.MetaDescription,
-		OGImage:         content.OGImage,
-		Data:            content.Data,
-		Published:       content.Published,
-		PublishedAt:     content.PublishedAt,
-		UseHeader:       content.UseHeader,
-		UseFooter:       content.UseFooter,
-		UseTheme:        content.UseTheme,
-		RawMode:         content.RawMode,
-		CreatedAt:       time.Now(),
-	}
+		modifiedByEmail := EditorEmailFromContext(ctx)
+		prov, _ := ProvenanceFromContext(ctx)
+		if prov.Actor == "" {
+			prov.Actor = "human" // default for legacy paths that set no provenance
+		}
+		contentVersion := models.ContentVersion{
+			ContentID:       content.ID,
+			Version:         version,
+			Comment:         comment,
+			ModifiedByEmail: modifiedByEmail,
+			Actor:           prov.Actor,
+			Via:             prov.Via,
+			AgentSession:    prov.AgentSession,
+			TemplateID:      content.TemplateID,
+			TemplateName:    content.TemplateName,
+			Title:           content.Title,
+			Slug:            content.Slug,
+			FolderID:        content.FolderID,
+			FolderPath:      content.FolderPath,
+			FullPath:        content.FullPath,
+			Category:        content.Category,
+			Tags:            content.Tags,
+			MetaDescription: content.MetaDescription,
+			OGImage:         content.OGImage,
+			Data:            content.Data,
+			Published:       content.Published,
+			PublishedAt:     content.PublishedAt,
+			UseHeader:       content.UseHeader,
+			UseFooter:       content.UseFooter,
+			UseTheme:        content.UseTheme,
+			RawMode:         content.RawMode,
+			CreatedAt:       time.Now(),
+		}
 
-	_, err = s.db.InsertOne(ctx, "content_versions", contentVersion)
-	return err
+		if _, err := s.db.InsertOne(ctx, "content_versions", contentVersion); err != nil {
+			if !isDupKeyError(err) {
+				return err
+			}
+			// Lost the insert race (a concurrent writer persisted this version
+			// between our max read and insert, or history has a gap our read
+			// missed): recount from the new max and retry with a fresh version.
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("save version for content %s: version allocation did not converge", content.ID.Hex())
+}
+
+// maxContentVersion returns the highest persisted version number for content,
+// or 0 when no history exists.
+func (s *ContentService) maxContentVersion(ctx context.Context, id primitive.ObjectID) (int64, error) {
+	var top struct {
+		Version int64 `bson:"version"`
+	}
+	err := s.db.Collection("content_versions").FindOne(ctx,
+		bson.M{"content_id": id},
+		options.FindOne().SetSort(bson.D{{Key: "version", Value: -1}}),
+	).Decode(&top)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return top.Version, nil
+}
+
+// isDupKeyError reports Mongo duplicate-key errors (code 11000) without
+// depending on exact driver error wrapping.
+func isDupKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if mongo.IsDuplicateKeyError(err) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "duplicate key") || strings.Contains(msg, "E11000")
 }
 
 // getAuthorRole looks up the role of a user by ID.

@@ -113,8 +113,13 @@ func (s *ContentService) PublishInternal(ctx context.Context, contentID primitiv
 	if legacyPublicationSaga == nil {
 		return fmt.Errorf("publication saga is not wired")
 	}
+	// Lane 2B: thread caller attribution (when the caller's ctx carries
+	// middleware-stamped provenance, e.g. copilot/API-triggered jobs) into
+	// the minted Publication record.
+	actor, via, session := publishAttributionFromContext(ctx)
 	_, perr := legacyPublicationSaga.Publish(ctx, publication.PublishRequest{
 		ContentID: contentID, IdempotencyRecord: &op.ID,
+		Actor: actor, Via: via, AgentSession: session,
 	})
 	if perr != nil {
 		// Pre-activation failure: mark terminal so the next same-key Begin

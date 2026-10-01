@@ -171,6 +171,14 @@ type PublishRequest struct {
 	ExpectedActiveID  *primitive.ObjectID
 	Reason            string
 	IdempotencyRecord *primitive.ObjectID
+	// Lane 2B: caller attribution threaded into the minted Publication
+	// record (actor "human"|"agent", via "ui"|"api"|"copilot", and the
+	// agent session ID). Additive and optional: existing callers that
+	// leave them empty compile unchanged and mint unattributed records
+	// exactly as before (empty values are omitted from the stored doc).
+	Actor        string
+	Via          string
+	AgentSession string
 }
 
 type PublicationResult struct {
@@ -194,6 +202,10 @@ type RollbackRequest struct {
 	SourcePublicationID primitive.ObjectID
 	ExpectedActiveID    *primitive.ObjectID
 	IdempotencyRecord   *primitive.ObjectID
+	// Lane 2B: caller attribution, same contract as PublishRequest.
+	Actor        string
+	Via          string
+	AgentSession string
 }
 
 // Error codes. PUBLICATION_CONFLICT matches spec §27; the remaining codes
