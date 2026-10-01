@@ -155,7 +155,7 @@
 2. 修改字段并保存（保存只写 Fork 草稿，可反复保存）。
 3. 打开 Fork 列表 `/cm/forks` → 进入对应 Fork `/cm/forks/{id}` 查看差异，确认改动范围。
 4. 在 Fork 页提交合并（`POST /cm/forks/{id}/merge`）。合并结果页会显示更新/新增条数与 `requires_publish` 列表，并明确提示 **“Live canonical HTML is unchanged until you Publish.”**——合并只合草稿，不上线。
-5. 回到内容页，用发布按钮 `POST /cm/content/{id}/publish` 发布（见 §4.1），拿到 Public URL 即完成。
+5. 回到内容页，点 **“发布上线”** 按钮（`POST /cm/content/{id}/publish`，见 §4.1），拿到 Public URL 即完成。
 
 成功标志：发布后响应页显示 Public URL、Publication ID、内容版本与模板版本；旧 Publication 保留为历史（状态变为 superseded）。
 
@@ -176,22 +176,24 @@
 
 前置条件：草稿已保存且通过字段校验；登录 Admin。
 
-1. 在内容页提交发布：`POST /cm/content/{id}/publish`（如需并发保护可附带表单字段 `expected_active_id`，值为当前 active Publication ID）。
+1. 打开内容编辑页 `/cm/content/{id}`，在主表单下方（保存/删除按钮之后）点 **“发布上线”** 按钮。按钮只对已存在的页面出现（新建页先保存一次），提交 `POST /cm/content/{id}/publish`；页面已有 active Publication 时表单自动附带隐藏字段 `expected_active_id`（当前 active Publication ID）做并发保护，期间若被别人发布会报冲突而不会覆盖。
 2. 阅读结果页：
    - 成功：显示 Public URL（可点击）、Publication ID、Content ID、内容版本、模板版本、路径。
-   - 失败：显示错误码（如 `PUBLICATION_STAGE_FAILED`）；**原线上 URL 继续服务**；若错误可重试，页上有 **“Retry Publish”** 按钮。
+   - 失败：显示错误码（如 `PUBLICATION_STAGE_FAILED`）；**原线上 URL 继续服务**；若错误可重试，页上有 **“重试发布”** 按钮。
 
 成功标志：结果页出现 Public URL 且可访问。
 
-出错怎么办：点 **“Retry Publish”**（为新 Publication 重试，安全）；若错误不可重试（提示先修错误），先修字段/模板问题再发。
+出错怎么办：点 **“重试发布”**（重发同一次发布，安全）；若错误不可重试（提示先修错误），先修字段/模板问题再发。
+
+**“已发布”勾选框**：编辑页“页面设置”里的 **“已发布”** 决定保存后的发布状态——勾选后保存即通过发布流程上线；线上版本可在发布历史（发布上线按钮旁的 **“发布历史”** 链接，`GET /cm/content/{id}/publications`）中查看和回滚。只想更新草稿、暂不动线上时不要勾选，用 **“更新”** 保存，改完再点 **“发布上线”**。
 
 ### 4.2 回滚到某次历史发布（精确回滚）
 
 前置条件：知道目标历史 Publication ID（从发布历史查到，见第 5 章）；回滚会创建一个**新** Publication，旧记录永不篡改。
 
 Admin：
-1. 打开发布历史 `GET /cm/content/{id}/publications`，找到目标行。
-2. 点该行 **“Revert Live to this Publication (revert_live)”**，在表单中填入本次操作的幂等键（表单字段 `idempotency_key`，必填，不填整页报错 `IDEMPOTENCY_KEY_REQUIRED`）。
+1. 打开发布历史 `GET /cm/content/{id}/publications`（从内容编辑页的 **“发布历史”** 链接进入），找到目标行。
+2. 点该行 **“回滚线上到该发布 (revert_live)”**，在表单中填入本次操作的幂等键（表单字段 `idempotency_key`，必填，不填整页报错 `IDEMPOTENCY_KEY_REQUIRED`）。
 3. 提交 `POST /cm/content/{id}/publications/{publicationID}/revert_live`。
 
 API：`POST /api/v1/content/{id}/revert-live`，请求体 `{"source_publication_id": "<历史PublicationID>", "expected_active_id": "<可选>"}`，必须带 `Idempotency-Key` 请求头。
@@ -204,7 +206,7 @@ API：`POST /api/v1/content/{id}/revert-live`，请求体 `{"source_publication_
 
 适用场景：想恢复的是“某版内容数据”而非“某次发布的精确字节”（例如源发布对象已过期，或只想找回文字）。
 
-Admin：在发布历史页点 **“Restore and Publish (restore_and_publish)”**（`POST /cm/content/{id}/versions/{version}/restore_and_publish`，同样必填 `idempotency_key` 表单字段）。
+Admin：在发布历史页（内容编辑页 **“发布历史”** 链接进入）点 **“恢复并发布 (restore_and_publish)”**（`POST /cm/content/{id}/versions/{version}/restore_and_publish`，同样必填 `idempotency_key` 表单字段）。
 API：`POST /api/v1/content/{id}/restore-and-publish`，请求体 `{"version": <版本号>, "expected_active_id": "<可选>"}` + `Idempotency-Key` 头。
 
 成功标志：`200`，新 Publication 上线；注意这是用历史数据**重新渲染**，不承诺与当年字节完全一致。
@@ -231,7 +233,7 @@ API：`POST /api/v1/content/{id}/restore-and-publish`，请求体 `{"version": <
 1. 后台：打开 `/cm/content/{id}/versions` 看版本列表；点某版本进 `/cm/content/{id}/versions/{version}/view` 查看内容，进 `…/diff` 对比差异。
 2. 只想恢复为草稿（不上线）：在版本页提交传统的恢复操作 `POST /cm/content/{id}/versions/{version}/revert`（只改草稿数据，线上不动）。
 3. API：`GET /api/v1/content/{id}/versions`（列表）、`GET /api/v1/content/{id}/versions/{version}`（单版）、`POST …/revert`（恢复为草稿）；MCP 对应 `get_content_versions` / `revert_to_version`。
-4. 发布历史（含每次上线的版本对照）：后台 `GET /cm/content/{id}/publications`，API `GET /api/v1/content/{id}/publications` 与 `GET …/publications/{publication_id}`。
+4. 发布历史（含每次上线的版本对照）：后台 `GET /cm/content/{id}/publications`（内容编辑页 **“发布历史”** 链接进入），API `GET /api/v1/content/{id}/publications` 与 `GET …/publications/{publication_id}`。
 
 成功标志：能看到“内容版本 ↔ 发布记录”对应关系（哪个版本在哪次发布上线）。
 
@@ -323,8 +325,8 @@ API：`POST /api/v1/content/{id}/restore-and-publish`，请求体 `{"version": <
 | 新建页面 | `/cm/content` → `/cm/content/new` 选模板卡片 → `/cm/content/new/{templateID}` 填表提交 |
 | 改未发布草稿 | `/cm/content/{id}` 直接改（横幅 “Editing unpublished draft.”） |
 | 改已发布页面 | `/cm/content/{id}`（横幅 “Editing Draft — Live page unchanged.”，自动进 Fork）→ `/cm/forks` 查看 Fork → `/cm/forks/{id}` 提交合并 → 回内容页发布 |
-| 发布 | 内容页提交 `POST /cm/content/{id}/publish`；失败页按 **“Retry Publish”** 重试 |
-| 发布历史与回滚 | `GET /cm/content/{id}/publications` → 行内 **“Restore and Publish (restore_and_publish)”** / **“Revert Live to this Publication (revert_live)”**（均需填 `idempotency_key`） |
+| 发布 | 内容页 `/cm/content/{id}` 主表单下方 **“发布上线”** 按钮 → `POST /cm/content/{id}/publish`；失败页按 **“重试发布”** 重试 |
+| 发布历史与回滚 | 内容页 **“发布历史”** 链接 → `GET /cm/content/{id}/publications` → 行内 **“恢复并发布 (restore_and_publish)”** / **“回滚线上到该发布 (revert_live)”**（均需填 `idempotency_key`） |
 | 版本查看/对比/恢复草稿 | `/cm/content/{id}/versions` → `…/versions/{v}/view`、`…/versions/{v}/diff`、`POST …/versions/{v}/revert`（恢复草稿，不上线） |
 | 升级预览/任务 | 模板页 **“Upgrade Preview”** → `GET /cm/templates/{id}/upgrade-preview` → **“Start Upgrade Job”**（`POST …/upgrade-start`）→ `POST /cm/upgrade-jobs/{jobID}/run` → **“Retry / resume failed items”** 续跑失败项 |
 | 模板管理 | `/cm/templates` 列表 → `/cm/templates/new` 新建 → `/cm/templates/{id}` 编辑（保存即产生新版本，旧页面不动） |

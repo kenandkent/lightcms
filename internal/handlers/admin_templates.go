@@ -1696,6 +1696,7 @@ var adminTemplates = map[string]string{
                         <input type="checkbox" name="published" {{if .Content}}{{if .Content.Published}}checked{{end}}{{end}}>
                         {{i18n "status.published" "已发布" $.Lang}}
                     </label>
+                    <p class="help-text">{{i18n "content_form.published_checkbox_help" "勾选后保存即通过发布流程上线；线上版本可在发布历史中查看和回滚" $.Lang}}</p>
                 </div>
                 <div class="form-group checkbox-group">
                     <label class="checkbox-label">
@@ -1738,6 +1739,17 @@ var adminTemplates = map[string]string{
                 {{end}}
             </div>
         </form>
+
+        {{if not .IsNew}}
+        <div class="form-actions">
+            <form method="POST" action="/cm/content/{{.Content.ID.Hex}}/publish">
+                {{$.CSRFField}}
+                {{if .ActivePublicationID}}<input type="hidden" name="expected_active_id" value="{{.ActivePublicationID}}">{{end}}
+                <button type="submit" class="btn btn-primary">{{i18n "content_form.publish_now" "发布上线" $.Lang}}</button>
+            </form>
+            <a href="/cm/content/{{.Content.ID.Hex}}/publications" class="btn btn-outline">{{i18n "content_form.publication_history" "发布历史" $.Lang}}</a>
+        </div>
+        {{end}}
 
         <!-- Redirect confirmation modal -->
         <div id="redirect-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.7); z-index: 10000; align-items: center; justify-content: center;">
