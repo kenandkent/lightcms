@@ -128,3 +128,23 @@ func seedImportSource(t *testing.T, db *database.DB, name string) string {
 	}
 	return id.Hex()
 }
+
+func TestAdminAssetUpload_CollidesWithPageCanonical(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+	db := testDB(t)
+	tmplID := seedTemplate(t, db, "Collision", "collision")
+	seedContent(t, db, tmplID, "Collision Page", "collision-test", "/collision-test")
+
+	// An *.html asset landing on a live page canonical must be rejected
+	// with 409 (same guard as AssetService.UploadAsset).
+	if rr := postMultipart(t, h.AssetUpload, "file", "collision-test.html", "<p>x</p>",
+		url.Values{"serve_path": {"/collision-test.html"}}, nil); rr.Code != http.StatusConflict {
+		t.Errorf("colliding asset upload: got %d, want 409 (%s)", rr.Code, rr.Body.String())
+	}
+	// A non-colliding upload still works.
+	if rr := postMultipart(t, h.AssetUpload, "file", "fine-12345.txt", "hello",
+		url.Values{"serve_path": {"/fine-12345.txt"}}, nil); rr.Code >= 500 {
+		t.Errorf("non-colliding asset upload: got %d (%s)", rr.Code, rr.Body.String())
+	}
+}

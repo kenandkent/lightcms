@@ -175,10 +175,15 @@ func (s *AssetService) UploadAsset(ctx context.Context, data []byte, filename, s
 }
 
 // findCanonicalCollision maps a *.html asset servePath to the page full_path
-// that generates the same file and reports it when a live (non-deleted,
-// non-fork) page owns that path. Mirrors the scanner's index mapping:
-// "<dir>/index.html" serves "<dir>" and "index.html" serves "/".
-func (s *AssetService) findCanonicalCollision(ctx context.Context, servePath string) string {
+// that generates the same file. Delegates to CheckAssetCanonicalCollision.
+// CheckAssetCanonicalCollision reports the live page full_path whose canonical
+// file would be overwritten by an asset upload at servePath, or "" when safe
+// (including on lookup failure, preserving the historical fail-open read).
+// Shared by UploadAsset and the admin form upload handler (which duplicates
+// the service's validation instead of calling it), so both enforce the
+// identical mapping. Mirrors the scanner's index mapping: "<dir>/index.html"
+// serves "<dir>" and "index.html" serves "/".
+func CheckAssetCanonicalCollision(ctx context.Context, db *database.DB, servePath string) string {
 	trimmed := strings.TrimSuffix(servePath, filepath.Ext(servePath))
 	candidates := []string{trimmed}
 	if trimmed == "/index" {
@@ -199,11 +204,17 @@ func (s *AssetService) findCanonicalCollision(ctx context.Context, servePath str
 		var hit struct {
 			FullPath string `bson:"full_path"`
 		}
-		if err := s.db.FindOne(ctx, "content", filter, &hit); err == nil && hit.FullPath != "" {
+		if err := db.FindOne(ctx, "content", filter, &hit); err == nil && hit.FullPath != "" {
 			return hit.FullPath
 		}
 	}
 	return ""
+}
+
+// findCanonicalCollision delegates to the shared helper (kept as a method
+// for existing callers).
+func (s *AssetService) findCanonicalCollision(ctx context.Context, servePath string) string {
+	return CheckAssetCanonicalCollision(ctx, s.db, servePath)
 }
 
 // DeleteAsset deletes an asset

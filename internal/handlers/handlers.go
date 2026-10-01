@@ -5066,6 +5066,16 @@ func (h *Handler) AssetUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Served-truth guard (shared with AssetService.UploadAsset): assets share
+	// the content/generated tree with page canonicals, so an *.html asset
+	// would land on the exact bytes of a same-path page canonical.
+	if strings.HasSuffix(strings.ToLower(servePath), ".html") {
+		if clash := services.CheckAssetCanonicalCollision(r.Context(), h.db, servePath); clash != "" {
+			http.Error(w, fmt.Sprintf("asset path %q collides with the canonical of an existing page (%q) — choose a different asset name", servePath, clash), http.StatusConflict)
+			return
+		}
+	}
+
 	// Get filename from serve path
 	filename := filepath.Base(servePath)
 
