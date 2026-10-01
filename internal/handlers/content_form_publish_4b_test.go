@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,8 +270,9 @@ func TestFormPublish4B_EditContentActivePublication(t *testing.T) {
 	}
 
 	// Seed an active publication row → the lookup path runs and still renders.
+	pubID := primitive.NewObjectID()
 	if _, err := db.Collection("content_publications").InsertOne(ctx, bson.M{
-		"_id": primitive.NewObjectID(), "content_id": contentID, "status": "active",
+		"_id": pubID, "content_id": contentID, "status": "active",
 		"content_version": int64(1), "template_version": int64(1),
 		"full_path": "/pubbed", "created_at": time.Now(),
 	}); err != nil {
@@ -285,5 +287,11 @@ func TestFormPublish4B_EditContentActivePublication(t *testing.T) {
 	rr = getPage(t, h.EditContent, map[string]string{"id": contentID.Hex()})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("EditContent (active publication): %d (%s)", rr.Code, rr.Body.String())
+	}
+
+	// Post-merge contract (4B data key + 4C template): the publish form must
+	// carry the active publication as the expected_active_id CAS precondition.
+	if body := rr.Body.String(); !strings.Contains(body, `name="expected_active_id" value="`+pubID.Hex()+`"`) {
+		t.Errorf("edit page missing expected_active_id=%s hidden input in publish form", pubID.Hex())
 	}
 }

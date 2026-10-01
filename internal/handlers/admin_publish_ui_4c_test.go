@@ -73,6 +73,17 @@ func TestEditContent_PublishUI(t *testing.T) {
 		t.Errorf("publish form is open at depth %d, want 1 (top level, exactly one form open)", depth)
 	}
 
+	// The delete form must also be top-level: a nested <form> start tag is
+	// ignored by HTML parsers, which silently turns 删除页面 into a save.
+	deleteAction := `action="/cm/content/` + id + `/delete"`
+	deleteIdx := strings.Index(body, deleteAction)
+	if deleteIdx < 0 {
+		t.Fatalf("edit page missing delete form %q", deleteAction)
+	}
+	if depth := formDepthAt(body, deleteIdx); depth != 1 {
+		t.Errorf("delete form is open at depth %d, want 1 (top level, exactly one form open)", depth)
+	}
+
 	// Publications history link.
 	historyHref := `href="/cm/content/` + id + `/publications"`
 	if !strings.Contains(body, historyHref) {

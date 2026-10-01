@@ -1731,17 +1731,15 @@ var adminTemplates = map[string]string{
                     {{end}}
                     <button type="submit" class="btn btn-primary">{{if .IsNew}}{{i18n "form.create" "创建" $.Lang}}{{else}}{{i18n "form.update" "更新" $.Lang}}{{end}}</button>
                 </div>
-                {{if not .IsNew}}
-                <form method="POST" action="/cm/content/{{.Content.ID.Hex}}/delete" onsubmit="return confirmDelete(this, 'Are you sure you want to delete this page? This cannot be undone.')">
-                    {{$.CSRFField}}
-                    <button type="submit" class="btn btn-danger">{{i18n "content_form.delete_page" "删除页面" $.Lang}}</button>
-                </form>
-                {{end}}
             </div>
         </form>
 
         {{if not .IsNew}}
         <div class="form-actions">
+            <form method="POST" action="/cm/content/{{.Content.ID.Hex}}/delete" onsubmit="return confirmDelete(this, 'Are you sure you want to delete this page? This cannot be undone.')">
+                {{$.CSRFField}}
+                <button type="submit" class="btn btn-danger">{{i18n "content_form.delete_page" "删除页面" $.Lang}}</button>
+            </form>
             <form method="POST" action="/cm/content/{{.Content.ID.Hex}}/publish">
                 {{$.CSRFField}}
                 {{if .ActivePublicationID}}<input type="hidden" name="expected_active_id" value="{{.ActivePublicationID}}">{{end}}
