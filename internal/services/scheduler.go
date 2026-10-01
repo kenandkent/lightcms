@@ -66,6 +66,12 @@ func (s *SchedulerService) runOnce(ctx context.Context) {
 		"publish_at": bson.M{"$lte": time.Now()},
 		"published":  false,
 		"deleted":    bson.M{"$ne": true},
+		// Lane 1B: never auto-publish sandbox or unapproved rows.
+		// fork_id:nil matches both missing and null (live rows omit the
+		// field via omitempty); pending_approval $ne:true covers
+		// missing/false (approval sets explicit true).
+		"fork_id":          nil,
+		"pending_approval": bson.M{"$ne": true},
 	}
 
 	cursor, err := s.db.FindMany(runCtx, "content", filter)

@@ -2,10 +2,12 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -27,7 +29,24 @@ func NewAssetService(db *database.DB) *AssetService {
 	return &AssetService{db: db}
 }
 
+// ErrAssetCanonicalCollision is returned when a *.html asset upload would
+// write the same generated file as a live page canonical (e.g. asset
+// "/promo.html" vs page "/promo"). The scanner would otherwise see the
+// asset as an orphan canonical and quarantine it; ServeAsset (no-cache)
+// vs ServePage (long-cache) headers would also disagree on the same bytes.
+// Callers map this to HTTP 409.
+var ErrAssetCanonicalCollision = errors.New("asset path collides with existing page")
+
 // UploadAsset uploads a new asset
+//
+// Cache-header story (Lane 1B fix 5c): assets live under content/generated
+// (the same tree as page canonicals) by design — storage dirs are NOT
+// moved. A *.html asset and a page canonical at the same file would share
+// bytes but be served with different headers (ServeAsset: no-cache,
+// ServePage dotted-shortcut: public, max-age=31536000). The collision
+// guard below plus the scanner asset-skip keeps the namespaces disjoint:
+// *.html uploads that match a live canonical are rejected here, and the
+// orphan sweep skips paths present in the assets collection.
 func (s *AssetService) UploadAsset(ctx context.Context, data []byte, filename, servePath, description string) (*database.Asset, error) {
 	// Validate file extension
 	ext := strings.ToLower(filepath.Ext(filename))
@@ -69,6 +88,16 @@ func (s *AssetService) UploadAsset(ctx context.Context, data []byte, filename, s
 	// them up after stripping the prefix from the request URL.
 	if strings.HasPrefix(servePath, "/assets/") {
 		servePath = strings.TrimPrefix(servePath, "/assets")
+	}
+
+	// Lane 1B fix 5a: reject *.html uploads that collide with a live page
+	// canonical (same generated file). Paths are case-insensitive; the
+	// homepage canonical "/" maps to index.html.
+	if strings.HasSuffix(strings.ToLower(servePath), ".html") {
+		if clash := s.findCanonicalCollision(ctx, servePath); clash != "" {
+			return nil, fmt.Errorf("%w: asset %s would overwrite page %s — rename the asset or the page",
+				ErrAssetCanonicalCollision, servePath, clash)
+		}
 	}
 
 	// Get filename and folder from serve path
@@ -143,6 +172,38 @@ func (s *AssetService) UploadAsset(ctx context.Context, data []byte, filename, s
 	}
 
 	return asset, nil
+}
+
+// findCanonicalCollision maps a *.html asset servePath to the page full_path
+// that generates the same file and reports it when a live (non-deleted,
+// non-fork) page owns that path. Mirrors the scanner's index mapping:
+// "<dir>/index.html" serves "<dir>" and "index.html" serves "/".
+func (s *AssetService) findCanonicalCollision(ctx context.Context, servePath string) string {
+	trimmed := strings.TrimSuffix(servePath, filepath.Ext(servePath))
+	candidates := []string{trimmed}
+	if trimmed == "/index" {
+		candidates = append(candidates, "/")
+	}
+	if strings.HasSuffix(trimmed, "/index") && trimmed != "/index" {
+		candidates = append(candidates, strings.TrimSuffix(trimmed, "/index"))
+		if candidates[len(candidates)-1] == "" {
+			candidates[len(candidates)-1] = "/"
+		}
+	}
+	for _, cand := range candidates {
+		filter := bson.M{
+			"full_path": bson.M{"$regex": "^" + regexp.QuoteMeta(cand) + "$", "$options": "i"},
+			"deleted":   bson.M{"$ne": true},
+			"fork_id":   bson.M{"$exists": false},
+		}
+		var hit struct {
+			FullPath string `bson:"full_path"`
+		}
+		if err := s.db.FindOne(ctx, "content", filter, &hit); err == nil && hit.FullPath != "" {
+			return hit.FullPath
+		}
+	}
+	return ""
 }
 
 // DeleteAsset deletes an asset
