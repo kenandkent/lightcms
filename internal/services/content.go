@@ -1280,10 +1280,33 @@ func (s *ContentService) saveVersion(ctx context.Context, content *models.Conten
 			maxV = 1
 		}
 
-		version := maxV + 1
-		if content.CurrentVersion > version {
-			// Caller-allocated CAS version wins when it advances history.
-			version = content.CurrentVersion
+		// Lane W3 (concurrency gap fix): prefer the caller-allocated CAS
+		// version. Deriving max(history)+1 here let a slower writer jump
+		// history forward and permanently skip its own allocated number
+		// whenever a successor completed saveVersion between its CAS and
+		// its insert (gap + row divergence under concurrency). The
+		// allocated number is uniquely ours (CAS on current_version), so
+		// inserting it fills the gap instead of opening one. Legacy
+		// callers without an allocation (CurrentVersion <= 0) keep the
+		// history-derived fallback.
+		version := content.CurrentVersion
+		if version <= 0 {
+			version = maxV + 1
+		} else if version <= maxV {
+			// History is at or above our CAS-allocated number. Two cases:
+			// the number already exists (legacy divergence — heal forward
+			// past the max so row and history converge), or a faster
+			// successor advanced the max while our number is still an open
+			// gap (insert it directly so the chain stays contiguous).
+			// Checking existence explicitly keeps this correct even where
+			// the UNIQUE(content_id, version) backstop index is absent.
+			exists, err := s.versionExists(ctx, content.ID, version)
+			if err != nil {
+				return err
+			}
+			if exists {
+				version = maxV + 1
+			}
 		}
 		// Persist the corrected version back to the content row. When
 		// history runs ahead of the row (legacy divergence, or a concurrent
@@ -1339,14 +1362,41 @@ func (s *ContentService) saveVersion(ctx context.Context, content *models.Conten
 			if !isDupKeyError(err) {
 				return err
 			}
-			// Lost the insert race (a concurrent writer persisted this version
-			// between our max read and insert, or history has a gap our read
-			// missed): recount from the new max and retry with a fresh version.
+			// The number we tried to insert already exists in history:
+			// either history ran ahead of the row (legacy divergence —
+			// heal forward past the max so row and history converge) or a
+			// concurrent writer won a rare allocation race (recount from
+			// the fresh max). Persist any correction back to the row so
+			// the next CAS read starts from the healed value.
+			freshMax, merr := s.maxContentVersion(ctx, content.ID)
+			if merr != nil {
+				return merr
+			}
+			healed := freshMax + 1
+			if healed != content.CurrentVersion {
+				if err := s.db.UpdateOne(ctx, "content",
+					bson.M{"_id": content.ID},
+					bson.M{"$set": bson.M{"current_version": healed}}); err != nil {
+					return err
+				}
+				content.CurrentVersion = healed
+			}
 			continue
 		}
 		return nil
 	}
 	return fmt.Errorf("save version for content %s: version allocation did not converge", content.ID.Hex())
+}
+
+// versionExists reports whether a (content_id, version) doc is already
+// persisted — saveVersion's heal-vs-gap-fill decision when history runs
+// ahead of the row.
+func (s *ContentService) versionExists(ctx context.Context, id primitive.ObjectID, version int64) (bool, error) {
+	n, err := s.db.Count(ctx, "content_versions", bson.M{"content_id": id, "version": version})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // maxContentVersion returns the highest persisted version number for content,

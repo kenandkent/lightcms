@@ -26,6 +26,10 @@ func TestUpdateContent_PersistsCorrectedVersionBack(t *testing.T) {
 	db, cleanup := testutil.MustConnectTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
+	// Production parity: the UNIQUE(content_id, version) backstop index.
+	if err := db.EnsureProductIndexes(ctx); err != nil {
+		t.Fatalf("EnsureProductIndexes: %v", err)
+	}
 	svc := NewContentService(db)
 	tmplID := createTestTemplate(t, svc)
 
@@ -73,6 +77,10 @@ func TestUpdateContent_ConcurrentConvergence(t *testing.T) {
 	db, cleanup := testutil.MustConnectTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
+	// Production parity: the UNIQUE(content_id, version) backstop index.
+	if err := db.EnsureProductIndexes(ctx); err != nil {
+		t.Fatalf("EnsureProductIndexes: %v", err)
+	}
 	svc := NewContentService(db)
 	tmplID := createTestTemplate(t, svc)
 
