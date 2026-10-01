@@ -132,6 +132,8 @@ func (s *Service) RollbackPublication(ctx context.Context, actor Actor, contentI
 	res, err := s.pubs.Rollback(ctx, publication.RollbackRequest{
 		ContentID: contentID, SourcePublicationID: sourceID,
 		ExpectedActiveID: expectedActiveID, IdempotencyRecord: &op.ID,
+		// Lane 2B: thread caller attribution into the minted record.
+		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
 	})
 	if err != nil {
 		s.completePublishError(ctx, op, err)

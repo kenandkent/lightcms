@@ -465,10 +465,16 @@ func main() {
 		log.Fatalf("Failed to build publication runtime: %v", err)
 	}
 	// Ensure the full product index set (idempotency unique key, active
-	// publication pointer, outbox, template versions). Fatal: without
-	// these, same-key retries cannot replay and double-publish.
-	if err := db.EnsureProductIndexes(context.Background()); err != nil {
-		log.Fatalf("Failed to ensure product indexes (run `lightcms migrate-publications --dry-run` for blockers): %v", err)
+	// publication pointer, outbox, template versions). Lane 2B: legacy DBs
+	// with canonical collisions degrade instead of log.Fatalf — the server
+	// starts in a migration-required state (surfaced on /healthz) and
+	// `lightcms migrate-publications --dry-run` stays available as the
+	// diagnostic path. Non-collision failures still fatal.
+	if degraded, reason, ferr := ensureProductIndexesOrDegraded(context.Background(), db); ferr != nil {
+		log.Fatalf("Failed to ensure product indexes (run `lightcms migrate-publications --dry-run` for blockers): %v", ferr)
+	} else if degraded {
+		setMigrationRequired(reason)
+		h.SetMigrationRequired(reason)
 	}
 	// Legacy ContentService.PublishContent/UnpublishContent delegate to the
 	// saga; background jobs publish under stable operation keys (16D).

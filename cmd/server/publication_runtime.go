@@ -203,6 +203,83 @@ func (l *publicationRateLimiter) Allow(_ context.Context, _ generation.Actor) (b
 	return true, 0
 }
 
+// Lane 2B: degraded boot on legacy canonical collisions.
+//
+// EnsureProductIndexes builds the V3 control-plane guards (canonical
+// uniqueness, active-publication pointer, idempotency, outbox). On legacy
+// DBs with canonical collisions (case-variant paths sharing one canonical
+// key) the build fails with a duplicate-key error. That must NOT
+// log.Fatalf: the operator's diagnostic (`migrate-publications --dry-run`,
+// served by this same binary) needs a running process and a connectable DB,
+// and the site should keep serving reads/drafts in a migration-required
+// degraded state until the migration completes.
+
+// isIndexCollisionError reports whether err is an index-shape conflict
+// (duplicate key on unique-index build, conflicting index options/keys, or
+// an already-exists race) as opposed to a connectivity failure.
+func isIndexCollisionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"duplicate key", "e11000",
+		"indexoptionsconflict", "indexkeyspecsconflict",
+		"already exists",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureProductIndexesOrDegraded ensures the V3 product index set, reporting
+// (not fatalling) index-shape conflicts: degraded=true carries the operator
+// reason, which the caller latches as migration-required state and surfaces
+// on /healthz. Non-collision failures (connectivity, permissions) are
+// returned as fatal errors — boot keeps today's fail-fast behavior for those.
+func ensureProductIndexesOrDegraded(ctx context.Context, db *database.DB) (degraded bool, reason string, err error) {
+	if cerr := db.EnsureProductIndexes(ctx); cerr != nil {
+		if !isIndexCollisionError(cerr) {
+			return false, "", cerr
+		}
+		reason = fmt.Sprintf("product indexes unavailable (canonical collision or conflicting index; run `lightcms migrate-publications --dry-run` for blockers): %v", cerr)
+		log.Printf("WARNING: migration required — %s. Server starts degraded: publish paths are unprotected until the migration completes.", reason)
+		return true, reason, nil
+	}
+	return false, "", nil
+}
+
+// migrationRequiredReason latches the degraded-boot detail for health
+// reporting. Set once during boot when ensureProductIndexesOrDegraded
+// reports degraded; read by /health handlers.
+var (
+	migrationRequiredMu     sync.Mutex
+	migrationRequiredReason string
+)
+
+// setMigrationRequired latches the migration-required degraded state.
+func setMigrationRequired(reason string) {
+	migrationRequiredMu.Lock()
+	defer migrationRequiredMu.Unlock()
+	migrationRequiredReason = reason
+}
+
+// resetMigrationRequired clears the latch (tests only).
+func resetMigrationRequired() {
+	migrationRequiredMu.Lock()
+	defer migrationRequiredMu.Unlock()
+	migrationRequiredReason = ""
+}
+
+// migrationRequiredState reports the latched degraded state.
+func migrationRequiredState() (bool, string) {
+	migrationRequiredMu.Lock()
+	defer migrationRequiredMu.Unlock()
+	return migrationRequiredReason != "", migrationRequiredReason
+}
+
 // runMigrationCommand implements `lightcms migrate-publications
 // --dry-run|--apply` (Task 14 contract) inside the existing server binary —
 // no second binary. It exits the process with 0 on success, 2 when the

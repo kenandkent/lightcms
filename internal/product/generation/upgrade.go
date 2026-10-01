@@ -343,6 +343,8 @@ func (s *Service) publishUpgradeItem(ctx context.Context, actor Actor, job Upgra
 		ContentID: contentID, ContentVersion: cv,
 		TemplateVersionID: targetVersionID, ExpectedActiveID: expected,
 		Reason: "template upgrade job " + job.ID.Hex(),
+		// Lane 2B: thread caller attribution into the minted record.
+		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
 	}
 	if s.idem == nil {
 		return s.pubs.Publish(ctx, req)

@@ -300,6 +300,12 @@ func (s *ImportService) RunRSSImport(ctx context.Context, sourceID primitive.Obj
 				} else {
 					updated++
 					logLine(models.ImportLogInfo, "Updated", fullPath)
+					// Lane 2B: the update branch must honor auto-publish like
+					// the create branch — otherwise re-imported pages silently
+					// stay drafts while new pages go live.
+					if src.AutoPublish {
+						s.autoPublish(bgCtx, job, existing, fullPath, logLine)
+					}
 				}
 			} else {
 				// Create new
@@ -436,6 +442,9 @@ func (s *ImportService) RunMarkdownImport(ctx context.Context, pages []importer.
 
 			existing := s.findByPath(bgCtx, fullPath)
 
+			// Lane 2B: publish intent applies to updates and creates alike.
+			wantPublish := autoPublish || importer.FrontmatterGet(page.Frontmatter, "published") == "true"
+
 			if existing != nil {
 				existing.Data = data
 				err := s.contentService.UpdateContent(bgCtx, existing)
@@ -445,6 +454,9 @@ func (s *ImportService) RunMarkdownImport(ctx context.Context, pages []importer.
 				} else {
 					updated++
 					logLine(models.ImportLogInfo, "Updated", fullPath)
+					if wantPublish {
+						s.autoPublish(bgCtx, job, existing, fullPath, logLine)
+					}
 				}
 			} else {
 				content := &models.Content{
@@ -470,8 +482,7 @@ func (s *ImportService) RunMarkdownImport(ctx context.Context, pages []importer.
 				} else {
 					created++
 					logLine(models.ImportLogInfo, "Created", fullPath)
-					pubStr := importer.FrontmatterGet(page.Frontmatter, "published")
-					if autoPublish || pubStr == "true" {
+					if wantPublish {
 						s.autoPublish(bgCtx, job, content, fullPath, logLine)
 					}
 				}
@@ -553,6 +564,12 @@ func (s *ImportService) RunCSVImport(ctx context.Context, records []importer.CSV
 				} else {
 					updated++
 					logLine(models.ImportLogInfo, fmt.Sprintf("Row %d updated", rec.Row), fullPath)
+					// Lane 2B: the update branch must honor auto-publish like
+					// the create branch — otherwise re-imported rows silently
+					// stay drafts while new rows go live.
+					if autoPublish {
+						s.autoPublish(bgCtx, job, existing, fullPath, logLine)
+					}
 				}
 			} else {
 				content := &models.Content{

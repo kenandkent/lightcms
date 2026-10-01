@@ -150,6 +150,8 @@ func (s *Service) RestoreAndPublish(ctx context.Context, actor Actor, contentID 
 		ContentID: contentID, ContentVersion: next,
 		ExpectedActiveID: expectedActiveID, Reason: "restore_and_publish",
 		IdempotencyRecord: &op.ID,
+		// Lane 2B: thread caller attribution into the minted record.
+		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
 	})
 	if err != nil {
 		s.completePublishError(ctx, op, err)
@@ -227,6 +229,8 @@ func (s *Service) RevertLive(ctx context.Context, actor Actor, contentID, source
 	res, err := s.pubs.Rollback(ctx, publication.RollbackRequest{
 		ContentID: contentID, SourcePublicationID: sourcePublicationID,
 		ExpectedActiveID: expectedActiveID, IdempotencyRecord: &op.ID,
+		// Lane 2B: thread caller attribution into the minted record.
+		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
 	})
 	if err != nil {
 		s.completePublishError(ctx, op, err)
