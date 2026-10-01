@@ -526,9 +526,13 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 
 	// Publish content
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "publish_content",
-		Title:       "Publish Content",
-		Description: "Publish a content item, making it visible on the public site. Generates the static HTML page.",
+		Name:  "publish_content",
+		Title: "Publish Content",
+		Description: `Publish a content item, making it visible on the public site. Generates the static HTML page.
+
+Returns publication_id, public_url, full_path, and content_version for the new publication.
+
+Requires content.edit + content.publish for an existing page; publishing a newly created page requires content.create + content.publish.`,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Publish Content",
 			ReadOnlyHint:    false,
@@ -540,10 +544,20 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 		if blocked := s.sandboxBlock("publish_content"); blocked != nil {
 			return blocked, nil, nil
 		}
-		if err := s.client.PublishContent(ctx, args.ID); err != nil {
+		res, err := s.client.PublishContentResult(ctx, args.ID)
+		if err != nil {
 			return errorResult(err), nil, nil
 		}
-		return textResult(fmt.Sprintf("Content %s published successfully", args.ID)), nil, nil
+		return jsonResult(map[string]interface{}{
+			"success":         true,
+			"id":              args.ID,
+			"publication_id":  res.PublicationID,
+			"public_url":      res.PublicURL,
+			"full_path":       res.FullPath,
+			"content_id":      res.ContentID,
+			"content_version": res.ContentVersion,
+			"message":         fmt.Sprintf("Content %s published successfully", args.ID),
+		}), nil, nil
 	})
 
 	// Unpublish content
@@ -704,7 +718,9 @@ Examples:
 - Publish specific pages: {"ids": ["abc123", "def456"]}
 - Publish all drafts at once: {"publish_all_drafts": true}
 
-Returns a list of published IDs and any failures.`,
+Returns published_count, the published IDs, per-item publications ({id, publication_id, public_url}), and any failed entries ({id, error}).
+
+Each item is an existing page: requires content.edit + content.publish. Publishing newly created pages requires content.create + content.publish.`,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Publish Multiple",
 			ReadOnlyHint:    false,
@@ -720,7 +736,19 @@ Returns a list of published IDs and any failures.`,
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
-		return jsonResult(result), nil, nil
+		reply := make(map[string]interface{}, len(result)+1)
+		for k, v := range result {
+			reply[k] = v
+		}
+		published, _ := result["published"].([]interface{})
+		reply["published_count"] = len(published)
+		if _, ok := reply["publications"]; !ok {
+			reply["publications"] = []map[string]string{}
+		}
+		if _, ok := reply["failed"]; !ok {
+			reply["failed"] = []map[string]string{}
+		}
+		return jsonResult(reply), nil, nil
 	})
 
 	// Preview content
