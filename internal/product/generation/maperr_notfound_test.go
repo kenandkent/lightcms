@@ -30,13 +30,13 @@ func TestMapSagaErrPreservesNotFound(t *testing.T) {
 		{"publish template version conflict",
 			&templatecontract.Error{Code: templatecontract.CodeVersionConflict, Message: "stale version"},
 			CodeTemplateVersionConflict, 409},
-		// NOTE (accepted risk, Task 19): a BARE storage error still maps to
-		// INTERNAL_ERROR/500 because mapSagaCode's templatecontract.CodeOf
-		// fallthrough (never returns "") swallows it before the storage
-		// branch. Store failures raised through the saga's stage/verify/
-		// activate/unpublish cases correctly yield 503. Reordering
-		// mapSagaCode is deferred to the generation owner (it would change
-		// completePublishError status computation + locked pins).
+		// Lane 2C fix 1 (was: accepted risk, Task 19): a BARE storage error
+		// now maps to CodeStoreUnavailable/503 with Retry-After: 30.
+		// mapSagaCode checks ""-for-unknown codes before the
+		// templatecontract catch-all and matches *storage.Error explicitly.
+		// (CodeStoreUnavailable == publication.CodeStageFailed, so the
+		// existing stage-failure branch delivers the 503 — a duplicate
+		// case value would not compile.)
 	}
 	for _, c := range cases {
 		mapped := mapSagaErr(c.err)

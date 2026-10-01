@@ -102,6 +102,12 @@ type Handler struct {
 	approvalService      *services.ApprovalService
 	maintenanceService   *services.MaintenanceService
 	agentService         *services.AgentService
+	// settingsService owns theme persistence (settings row + version
+	// chain + theme-vars.css). Lane 2C fix 4: the admin theme handlers
+	// delegate to it instead of writing through h.db directly, so the API
+	// and admin UI share one writer path. Wired via SetSettingsService;
+	// themeService() falls back to a local instance when unwired.
+	settingsService *services.SettingsService
 	// Task 16C/E: shared V3 publication runtime for the 7 Admin product
 	// handlers (admin_publications.go). Wired once in main.go; nil in unit
 	// tests falls back to the local construction those handlers used pre-16.
@@ -168,6 +174,22 @@ func (h *Handler) SetCommentService(cs *services.CommentService) {
 // SetApprovalService sets the approval service
 func (h *Handler) SetApprovalService(as *services.ApprovalService) {
 	h.approvalService = as
+}
+
+// SetSettingsService wires the settings service that owns theme writes.
+func (h *Handler) SetSettingsService(ss *services.SettingsService) {
+	h.settingsService = ss
+}
+
+// themeService returns the wired settings service, or a local instance
+// over the handler's DB when unwired (unit tests, forgotten wiring).
+// Either way all theme mutations flow through SettingsService — the single
+// writer path for settings row + version chain + theme-vars.css.
+func (h *Handler) themeService() *services.SettingsService {
+	if h.settingsService != nil {
+		return h.settingsService
+	}
+	return services.NewSettingsService(h.db, h.contentService)
 }
 
 func New(db *database.DB, authManager *auth.Manager, baseURL string, env string, userService *services.UserService, auditService *services.AuditService, snippetService *services.SnippetService) *Handler {
@@ -2898,11 +2920,11 @@ func (h *Handler) UpdateTheme(w http.ResponseWriter, r *http.Request) {
 
 	r.ParseForm()
 	ctx := r.Context()
-
-	// Get old settings to check if header/footer changed and for versioning
-	oldSettings, _ := h.db.GetThemeSettings(ctx)
-	headerChanged := oldSettings == nil || oldSettings.HeaderHTML != r.FormValue("header_html")
-	footerChanged := oldSettings == nil || oldSettings.FooterHTML != r.FormValue("footer_html")
+	// Inject editor identity + provenance for version attribution.
+	if user, ok := h.auth.GetCurrentUser(r); ok {
+		ctx = services.WithEditorEmail(ctx, user.Email)
+	}
+	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
 
 	settings := &database.ThemeSettings{
 		PrimaryColor:    r.FormValue("primary_color"),
@@ -2922,7 +2944,9 @@ func (h *Handler) UpdateTheme(w http.ResponseWriter, r *http.Request) {
 		FooterHTML:      r.FormValue("footer_html"),
 	}
 
-	if err := h.db.SaveThemeSettings(ctx, settings); err != nil {
+	// Lane 2C fix 4: single writer path — SettingsService owns the
+	// settings row, the collision-safe version chain and theme-vars.css.
+	if err := h.themeService().UpdateTheme(ctx, settings); err != nil {
 		h.renderAdmin(w, r, "theme", map[string]interface{}{
 			"Settings": settings,
 			"Error":    err.Error(),
@@ -2930,96 +2954,10 @@ func (h *Handler) UpdateTheme(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Save theme version
-	h.saveThemeVersion(ctx, settings, oldSettings)
-
-	// Regenerate CSS file
-	h.generateThemeCSS(settings)
-
-	// If header or footer changed, regenerate all published content
-	if headerChanged || footerChanged {
-		h.regenerateAllContent(ctx)
-	}
-
 	h.renderAdmin(w, r, "theme", map[string]interface{}{
 		"Settings": settings,
 		"Success":  "Theme updated successfully!",
 	})
-}
-
-// saveThemeVersion saves a new version of the theme settings
-func (h *Handler) saveThemeVersion(ctx context.Context, theme *database.ThemeSettings, original *database.ThemeSettings) {
-	// Get the current version count
-	count, err := h.db.GetThemeVersionCount(ctx)
-	if err != nil {
-		return
-	}
-
-	// If no versions exist and we have original theme, save it as v1 first
-	if count == 0 && original != nil {
-		v1 := &database.ThemeVersion{
-			Version:         1,
-			PrimaryColor:    original.PrimaryColor,
-			SecondaryColor:  original.SecondaryColor,
-			AccentColor:     original.AccentColor,
-			BackgroundColor: original.BackgroundColor,
-			TextColor:       original.TextColor,
-			FontFamily:      original.FontFamily,
-			HeadingFont:     original.HeadingFont,
-			BorderRadius:    original.BorderRadius,
-			CustomCSS:       original.CustomCSS,
-			SiteName:        original.SiteName,
-			SiteTagline:     original.SiteTagline,
-			LogoURL:         original.LogoURL,
-			HeadHTML:        original.HeadHTML,
-			HeaderHTML:      original.HeaderHTML,
-			FooterHTML:      original.FooterHTML,
-		}
-		h.db.SaveThemeVersion(ctx, v1)
-		count = 1
-	}
-
-	version := int(count) + 1
-
-	themeVersion := &database.ThemeVersion{
-		Version:         version,
-		PrimaryColor:    theme.PrimaryColor,
-		SecondaryColor:  theme.SecondaryColor,
-		AccentColor:     theme.AccentColor,
-		BackgroundColor: theme.BackgroundColor,
-		TextColor:       theme.TextColor,
-		FontFamily:      theme.FontFamily,
-		HeadingFont:     theme.HeadingFont,
-		BorderRadius:    theme.BorderRadius,
-		CustomCSS:       theme.CustomCSS,
-		SiteName:        theme.SiteName,
-		SiteTagline:     theme.SiteTagline,
-		LogoURL:         theme.LogoURL,
-		HeadHTML:        theme.HeadHTML,
-		HeaderHTML:      theme.HeaderHTML,
-		FooterHTML:      theme.FooterHTML,
-	}
-
-	h.db.SaveThemeVersion(ctx, themeVersion)
-}
-
-func (h *Handler) generateThemeCSS(settings *database.ThemeSettings) {
-	css := fmt.Sprintf(`:root {
-    --primary: %s;
-    --secondary: %s;
-    --accent: %s;
-    --background: %s;
-    --text: %s;
-    --font-family: %s;
-    --heading-font: %s;
-    --border-radius: %s;
-}
-
-%s`, settings.PrimaryColor, settings.SecondaryColor, settings.AccentColor,
-		settings.BackgroundColor, settings.TextColor, settings.FontFamily,
-		settings.HeadingFont, settings.BorderRadius, settings.CustomCSS)
-
-	os.WriteFile("static/css/theme-vars.css", []byte(css), 0644)
 }
 
 // ThemeVersions shows the theme version history
@@ -3095,70 +3033,19 @@ func (h *Handler) RevertThemeVersion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	version, err := h.db.GetThemeVersion(ctx, versionNum)
-	if err != nil {
+	// Inject editor identity + provenance for version attribution.
+	if user, ok := h.auth.GetCurrentUser(r); ok {
+		ctx = services.WithEditorEmail(ctx, user.Email)
+	}
+	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
+
+	// Lane 2C fix 4: single writer path — the revert (settings row, new
+	// collision-safe version with revert comment, theme-vars.css) is owned
+	// by SettingsService.
+	if err := h.themeService().RevertThemeToVersion(ctx, versionNum,
+		fmt.Sprintf("Reverted to version %d", versionNum)); err != nil {
 		http.Redirect(w, r, "/cm/theme/versions", http.StatusSeeOther)
 		return
-	}
-
-	// Create theme settings from version
-	theme := &database.ThemeSettings{
-		PrimaryColor:    version.PrimaryColor,
-		SecondaryColor:  version.SecondaryColor,
-		AccentColor:     version.AccentColor,
-		BackgroundColor: version.BackgroundColor,
-		TextColor:       version.TextColor,
-		FontFamily:      version.FontFamily,
-		HeadingFont:     version.HeadingFont,
-		BorderRadius:    version.BorderRadius,
-		CustomCSS:       version.CustomCSS,
-		SiteName:        version.SiteName,
-		SiteTagline:     version.SiteTagline,
-		LogoURL:         version.LogoURL,
-		HeadHTML:        version.HeadHTML,
-		HeaderHTML:      version.HeaderHTML,
-		FooterHTML:      version.FooterHTML,
-	}
-
-	// Get old settings to check if header/footer changed
-	oldSettings, _ := h.db.GetThemeSettings(ctx)
-	headerChanged := oldSettings == nil || oldSettings.HeaderHTML != theme.HeaderHTML
-	footerChanged := oldSettings == nil || oldSettings.FooterHTML != theme.FooterHTML
-
-	if err := h.db.SaveThemeSettings(ctx, theme); err != nil {
-		http.Redirect(w, r, "/cm/theme/versions", http.StatusSeeOther)
-		return
-	}
-
-	// Save as new version with revert comment
-	count, _ := h.db.GetThemeVersionCount(ctx)
-	newVersion := &database.ThemeVersion{
-		Version:         int(count) + 1,
-		Comment:         fmt.Sprintf("Reverted to version %d", versionNum),
-		PrimaryColor:    theme.PrimaryColor,
-		SecondaryColor:  theme.SecondaryColor,
-		AccentColor:     theme.AccentColor,
-		BackgroundColor: theme.BackgroundColor,
-		TextColor:       theme.TextColor,
-		FontFamily:      theme.FontFamily,
-		HeadingFont:     theme.HeadingFont,
-		BorderRadius:    theme.BorderRadius,
-		CustomCSS:       theme.CustomCSS,
-		SiteName:        theme.SiteName,
-		SiteTagline:     theme.SiteTagline,
-		LogoURL:         theme.LogoURL,
-		HeadHTML:        theme.HeadHTML,
-		HeaderHTML:      theme.HeaderHTML,
-		FooterHTML:      theme.FooterHTML,
-	}
-	h.db.SaveThemeVersion(ctx, newVersion)
-
-	// Regenerate CSS
-	h.generateThemeCSS(theme)
-
-	// If header or footer changed, regenerate all published content
-	if headerChanged || footerChanged {
-		h.regenerateAllContent(ctx)
 	}
 
 	http.Redirect(w, r, "/cm/theme/versions", http.StatusSeeOther)

@@ -17,7 +17,7 @@ func TestCommentService_CreateListDelete(t *testing.T) {
 
 	svc := NewCommentService(db)
 	ctx := context.Background()
-	contentID := primitive.NewObjectID()
+	contentID := seedCommentContent(t, db, ctx)
 	userID := primitive.NewObjectID()
 
 	c, err := svc.Create(ctx, contentID, userID, "u@x.com", "User", "hello", nil)
@@ -72,7 +72,7 @@ func TestCommentService_ListRecent(t *testing.T) {
 
 	svc := NewCommentService(db)
 	ctx := context.Background()
-	contentID := primitive.NewObjectID()
+	contentID := seedCommentContent(t, db, ctx)
 	userID := primitive.NewObjectID()
 	for i := 0; i < 3; i++ {
 		if _, err := svc.Create(ctx, contentID, userID, "u@x.com", "U", "msg", nil); err != nil {
