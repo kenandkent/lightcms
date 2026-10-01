@@ -1,7 +1,8 @@
-# Binaries
-lightcms
+# Binaries (root-anchored: bare names would exclude any same-named directory,
+# e.g. cmd/server/ — do NOT un-anchor these)
+/lightcms
 bin/
-server
+/server
 
 # Uploads (user content)
 static/uploads/*

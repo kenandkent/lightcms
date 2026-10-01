@@ -241,13 +241,25 @@ func main() {
 		csrf.Path("/cm"),
 		csrf.SameSite(csrf.SameSiteStrictMode),
 		csrf.ErrorHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			log.Printf("CSRF validation failed for %s %s", r.Method, r.URL.Path)
+			log.Printf("CSRF validation failed for %s %s: %v", r.Method, r.URL.Path, csrf.FailureReason(r))
 			http.Error(w, "Invalid or missing CSRF token", http.StatusForbidden)
 		})),
 	)
 
 	// Admin routes (under /cm)
 	admin := r.PathPrefix("/cm").Subrouter()
+	// Plain HTTP (development) must explicitly opt out of gorilla/csrf's
+	// TLS Referer checks: without this, every form POST without a Referer
+	// header fails with ErrNoReferer even when the CSRF token is valid
+	// (curl, API-driven posts, Referer-stripping browsers). Production
+	// HTTPS keeps the strict Referer/Origin checks.
+	if !cfg.SecureCookies {
+		admin.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				next.ServeHTTP(w, csrf.PlaintextHTTPRequest(r))
+			})
+		})
+	}
 	admin.Use(csrfMiddleware)
 	admin.HandleFunc("/login", h.LoginPage).Methods("GET")
 	admin.HandleFunc("/login", h.LoginHandler).Methods("POST")
