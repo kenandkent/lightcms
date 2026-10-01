@@ -900,6 +900,54 @@ func (db *DB) GetThemeVersion(ctx context.Context, version int) (*ThemeVersion, 
 	return &v, nil
 }
 
+// NextThemeVersion atomically allocates the next theme version number
+// (Lane 2C fix 4). Count-based allocation (read count, insert count+1) lets
+// concurrent writers read the same count and insert duplicate version
+// numbers, forking the version chain. The counters collection serializes
+// allocation in a single atomic update: $max seeds the counter from
+// pre-existing rows (legacy count-based versions, EnsureThemeVersion1)
+// so the chain stays strictly increasing across the migration, then $inc
+// hands out a unique number. Concurrent callers serialize in Mongo and
+// always receive distinct, increasing values.
+func (db *DB) NextThemeVersion(ctx context.Context) (int, error) {
+	maxV := 0
+	var top struct {
+		Version int `bson:"version"`
+	}
+	err := db.ThemeVersions().FindOne(ctx, bson.M{},
+		options.FindOne().SetSort(bson.D{{Key: "version", Value: -1}}).SetProjection(bson.M{"version": 1}),
+	).Decode(&top)
+	if err != nil && err != mongo.ErrNoDocuments {
+		return 0, err
+	}
+	if err == nil {
+		maxV = top.Version
+	}
+	var c struct {
+		Seq int `bson:"seq"`
+	}
+	// NOTE: $max and $inc cannot share one update (ConflictingUpdateOperators),
+	// so seeding and allocation are two atomic ops. Both converge under
+	// concurrency: $max only ever raises the counter toward the observed
+	// row max (idempotent), and $inc hands out distinct values.
+	counters := db.Collection("counters")
+	if _, err := counters.UpdateOne(ctx,
+		bson.M{"_id": "theme_version"},
+		bson.M{"$max": bson.M{"seq": maxV}},
+		options.Update().SetUpsert(true),
+	); err != nil {
+		return 0, err
+	}
+	if err := counters.FindOneAndUpdate(ctx,
+		bson.M{"_id": "theme_version"},
+		bson.M{"$inc": bson.M{"seq": 1}},
+		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
+	).Decode(&c); err != nil {
+		return 0, err
+	}
+	return c.Seq, nil
+}
+
 // GetThemeVersionCount returns the number of theme versions
 func (db *DB) GetThemeVersionCount(ctx context.Context) (int64, error) {
 	return db.Count(ctx, "theme_versions", bson.M{})

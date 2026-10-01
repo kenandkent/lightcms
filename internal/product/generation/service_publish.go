@@ -2,6 +2,7 @@ package generation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -304,6 +305,27 @@ func mapSagaCode(err error) string {
 	if c := publication.CodeOf(err); c != "" {
 		return c
 	}
+	// Lane 2C fix 1: ""-for-unknown checks first. templatecontract.CodeOf
+	// NEVER returns "" for non-nil errors (unknown → INTERNAL_ERROR), so it
+	// must run LAST — otherwise it swallows bare storage/idempotency/
+	// generation errors and they collapse to 500 instead of their real
+	// codes (notably the retryable 503 CodeStoreUnavailable).
+	if c := idempotency.CodeOf(err); c != "" {
+		return c
+	}
+	if c := CodeOf(err); c != "" {
+		return c
+	}
+	var se *storage.Error
+	if errors.As(err, &se) {
+		// storage.CodeOf is a catch-all too (unknown → STORAGE_IO_ERROR),
+		// so match the typed error explicitly: every store failure is a
+		// retryable 503. CodeStoreUnavailable == publication.CodeStageFailed
+		// ("PUBLICATION_STAGE_FAILED"), so mapSagaErr's existing stage-
+		// failure branch delivers Retry-After: 30 with no new case needed
+		// (a duplicate case value would not compile).
+		return CodeStoreUnavailable
+	}
 	if c := templatecontract.CodeOf(err); c != "" {
 		switch c {
 		case templatecontract.CodeNotFound:
@@ -313,15 +335,6 @@ func mapSagaCode(err error) string {
 		case templatecontract.CodeVersionConflict:
 			return CodeTemplateVersionConflict
 		}
-		return c
-	}
-	if c := idempotency.CodeOf(err); c != "" {
-		return c
-	}
-	if c := storage.CodeOf(err); c != "" {
-		return CodeStoreUnavailable
-	}
-	if c := CodeOf(err); c != "" {
 		return c
 	}
 	return CodeInternal

@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/jonradoff/lightcms/v7/internal/auth"
+	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -76,6 +78,11 @@ func (a *APIHandler) APICreateComment(w http.ResponseWriter, r *http.Request) {
 	comment, err := a.commentService.Create(r.Context(), id, userID, userEmail, displayName,
 		strings.TrimSpace(req.Text), mentionIDs)
 	if err != nil {
+		// Lane 2C fix 2: orphan comments are 404, not 500.
+		if errors.Is(err, services.ErrContentNotFound) {
+			a.jsonError(w, http.StatusNotFound, "content not found")
+			return
+		}
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

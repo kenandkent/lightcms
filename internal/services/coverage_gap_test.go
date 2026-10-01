@@ -516,8 +516,9 @@ func TestCommentService_Create_WebhookBranch(t *testing.T) {
 	cms := NewCommentService(db)
 	cms.SetWebhookService(NewWebhookService(db))
 	ctx := context.Background()
+	contentID := seedCommentContent(t, db, ctx)
 
-	c, err := cms.Create(ctx, primitive.NewObjectID(), primitive.NewObjectID(),
+	c, err := cms.Create(ctx, contentID, primitive.NewObjectID(),
 		"a@x.com", "Author", "hello @b", []primitive.ObjectID{primitive.NewObjectID()})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -527,7 +528,7 @@ func TestCommentService_Create_WebhookBranch(t *testing.T) {
 	}
 
 	// Empty text branch.
-	if _, err := cms.Create(ctx, primitive.NewObjectID(), primitive.NewObjectID(),
+	if _, err := cms.Create(ctx, contentID, primitive.NewObjectID(),
 		"a@x.com", "Author", "", nil); err == nil {
 		t.Error("expected error for empty comment text")
 	}

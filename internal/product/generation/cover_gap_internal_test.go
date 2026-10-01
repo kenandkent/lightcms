@@ -50,13 +50,14 @@ func TestCoverGapMapSagaErr(t *testing.T) {
 		{&templatecontract.Error{Code: templatecontract.CodeNotFound, Message: "t"}, CodeTemplateNotFound},
 		{&templatecontract.Error{Code: templatecontract.CodeVersionNotFound, Message: "tv"}, CodeTemplateVersionNotFound},
 		{&templatecontract.Error{Code: templatecontract.CodeVersionConflict, Message: "tc"}, CodeTemplateVersionConflict},
-		// Bare storage errors stay INTERNAL: mapSagaCode's
-		// templatecontract.CodeOf fallthrough (never "") swallows them
-		// before the storage branch (accepted risk, Task 19 — reordering
-		// mapSagaCode belongs to the generation owner).
-		{&storage.Error{Code: storage.CodeIO, Message: "io"}, CodeInternal},
+		// Lane 2C fix 1: bare storage errors are retryable 503s, not
+		// INTERNAL. mapSagaCode checks ""-for-unknown codes before the
+		// templatecontract catch-all, and matches *storage.Error explicitly.
+		{&storage.Error{Code: storage.CodeIO, Message: "io"}, CodeStoreUnavailable},
+		// Typed idempotency codes pass through mapSagaCode untouched;
+		// mapSagaErr still renders unknown-to-it codes as INTERNAL.
 		{&idempotency.Error{Code: idempotency.CodeConflict, Message: "c"}, CodeInternal},
-		{&Error{Code: CodePathInvalid, Message: "g"}, CodeInternal},
+		{&Error{Code: CodePathInvalid, Message: "g"}, CodePathInvalid},
 		{errors.New("plain"), CodeInternal},
 	}
 	for i, c := range cases {
@@ -80,12 +81,12 @@ func TestCoverGapMapSagaErr(t *testing.T) {
 		&templatecontract.Error{Code: templatecontract.CodeVersionNotFound}: CodeTemplateVersionNotFound,
 		&templatecontract.Error{Code: templatecontract.CodeVersionConflict}: CodeTemplateVersionConflict,
 		&templatecontract.Error{Code: "OTHER_T"}:                            "OTHER_T",
-		// templatecontract.CodeOf never returns "": every other error maps
-		// to templatecontract.CodeInternal here (the idempotency/storage/
-		// generation branches below are unreachable).
-		&idempotency.Error{Code: idempotency.CodeConflict}: templatecontract.CodeInternal,
-		&storage.Error{Code: storage.CodeIO}:               templatecontract.CodeInternal,
-		&Error{Code: CodePathInvalid}:                      templatecontract.CodeInternal,
+		// Lane 2C fix 1: typed non-templatecontract errors keep their own
+		// codes (the templatecontract catch-all runs last). Only truly
+		// untyped errors fall through to templatecontract.CodeInternal.
+		&idempotency.Error{Code: idempotency.CodeConflict}: idempotency.CodeConflict,
+		&storage.Error{Code: storage.CodeIO}:               CodeStoreUnavailable,
+		&Error{Code: CodePathInvalid}:                      CodePathInvalid,
 		errors.New("plain"):                                templatecontract.CodeInternal,
 	} {
 		if got := mapSagaCode(err); got != want {

@@ -18,6 +18,12 @@ type ContentComment struct {
 	Text            string               `bson:"text" json:"text"`
 	Mentions        []primitive.ObjectID `bson:"mentions,omitempty" json:"mentions,omitempty"`
 	CreatedAt       time.Time            `bson:"created_at" json:"created_at"`
+	// Provenance: who or what authored this comment ( Lane 2C fix 2).
+	// Stamped from the request context following the content version-row
+	// pattern; Actor defaults to "human" for legacy paths.
+	Actor        string `bson:"actor,omitempty" json:"actor,omitempty"`                 // "human" | "agent"
+	Via          string `bson:"via,omitempty" json:"via,omitempty"`                     // "ui" | "api" | "copilot"
+	AgentSession string `bson:"agent_session,omitempty" json:"agent_session,omitempty"` // agent session ID when Actor == "agent"
 }
 
 // ApprovalWorkflow configures an approval chain for matching content.

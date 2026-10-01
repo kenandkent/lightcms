@@ -73,23 +73,26 @@ func (s *SettingsService) UpdateTheme(ctx context.Context, theme *database.Theme
 	}
 
 	// Regenerate all content if header/footer changed
-	if headerFooterChanged {
+	if headerFooterChanged && s.contentService != nil {
 		go s.contentService.RegenerateAllContent(context.Background())
 	}
 
 	return nil
 }
 
-// saveThemeVersion saves a new version of the theme settings
+// saveThemeVersion saves a new version of the theme settings.
+// Lane 2C fix 4: version numbers come from the atomic counters collection
+// (db.NextThemeVersion), not from a read of the row count — concurrent
+// writers racing on count+1 forked the chain with duplicate numbers. The
+// first-ever allocation (version 1) backfills the original theme exactly
+// once: only the writer that draws version 1 performs the backfill, so N
+// concurrent first-writers still produce exactly N+1 rows numbered 1..N+1.
 func (s *SettingsService) saveThemeVersion(ctx context.Context, theme *database.ThemeSettings, original *database.ThemeSettings, comment string) error {
-	// Get the current version count
-	count, err := s.db.GetThemeVersionCount(ctx)
+	ver, err := s.db.NextThemeVersion(ctx)
 	if err != nil {
 		return err
 	}
-
-	// If no versions exist and we have original theme, save it as v1 first
-	if count == 0 && original != nil {
+	if ver == 1 && original != nil {
 		v1 := database.ThemeVersion{
 			Version:         1,
 			PrimaryColor:    original.PrimaryColor,
@@ -111,13 +114,13 @@ func (s *SettingsService) saveThemeVersion(ctx context.Context, theme *database.
 		if err := s.db.SaveThemeVersion(ctx, &v1); err != nil {
 			return err
 		}
-		count = 1
+		if ver, err = s.db.NextThemeVersion(ctx); err != nil {
+			return err
+		}
 	}
 
-	version := int(count) + 1
-
 	themeVersion := database.ThemeVersion{
-		Version:         version,
+		Version:         ver,
 		Comment:         comment,
 		PrimaryColor:    theme.PrimaryColor,
 		SecondaryColor:  theme.SecondaryColor,
