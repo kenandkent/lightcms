@@ -3788,8 +3788,11 @@ func (h *Handler) serve404(w http.ResponseWriter, r *http.Request, theme *databa
 		}
 	}
 
-	// Fallback to simple 404
-	h.renderPublicWithOptions(w, r, theme, `<div style="text-align:center;padding:4rem"><h1>404</h1><p>Page not found</p></div>`, true, true)
+	// Fallback to simple 404 (chrome strings resolved server-side: this
+	// content fragment is injected via {{.Content}} so template funcs
+	// cannot reach it; authored DB 404 pages are untouched).
+	lang := i18n.LangFromRequest(r)
+	h.renderPublicWithOptions(w, r, theme, `<div style="text-align:center;padding:4rem"><h1>404</h1><p>`+template.HTMLEscapeString(i18n.T("site.error_404_msg", "页面未找到", lang))+`</p><p><a href="/\">`+template.HTMLEscapeString(i18n.T("site.error_404_back", "返回首页", lang))+`</a></p></div>`, true, true)
 }
 
 func (h *Handler) renderContent(content *models.Content, tmpl *models.Template) string {
@@ -3912,6 +3915,7 @@ func (h *Handler) renderPublicWithSEO(w http.ResponseWriter, r *http.Request, th
 		"Content":         template.HTML(content),
 		"UseHeader":       useHeader,
 		"UseFooter":       useFooter,
+		"Lang":            i18n.LangFromRequest(r),
 		"HeadHTML":        template.HTML(theme.HeadHTML),
 		"HeaderHTML":      template.HTML(theme.HeaderHTML),
 		"FooterHTML":      template.HTML(theme.FooterHTML),
@@ -4372,7 +4376,7 @@ func updateLinksInHTMLByPath(html, oldPath, newPath string) string {
 
 // Public layout template
 const publicLayout = `<!DOCTYPE html>
-<html lang="en">
+<html lang="{{.Lang}}">
 <head>
 {{if .HeadHTML}}{{.HeadHTML}}{{end}}
     <meta charset="UTF-8">
@@ -4392,6 +4396,26 @@ const publicLayout = `<!DOCTYPE html>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/theme-vars.css">
     <link rel="stylesheet" href="/static/css/main.css">
+    <style>
+    /* UI-C: macOS-style overlay scrollbars (public site). The track/thumb
+       slot keeps a constant width so revealing the thumb never shifts
+       layout; only the thumb paint fades in on hover and while scrolling
+       or touch-dragging (html.is-scrolling, 800ms idle timeout). */
+    html{scrollbar-width:thin;scrollbar-color:rgba(148,163,184,0) transparent;}
+    html:hover,html.is-scrolling{scrollbar-color:rgba(148,163,184,.55) transparent;}
+    ::-webkit-scrollbar{width:10px;height:10px;background:transparent;}
+    ::-webkit-scrollbar-track{background:transparent;}
+    ::-webkit-scrollbar-corner{background:transparent;}
+    ::-webkit-scrollbar-thumb{background-color:rgba(148,163,184,0);border-radius:8px;border:3px solid transparent;background-clip:content-box;}
+    html:hover::-webkit-scrollbar-thumb,html.is-scrolling::-webkit-scrollbar-thumb{background-color:rgba(148,163,184,.55);border:3px solid transparent;background-clip:content-box;}
+    ::-webkit-scrollbar-thumb:hover{background-color:rgba(148,163,184,.8);border:3px solid transparent;background-clip:content-box;}
+    /* UI-C: header language switch, matches dark nav style. */
+    .lang-switch{display:flex;align-items:center;gap:.5rem;font-size:.85rem;}
+    .lang-switch a{color:rgba(226,232,240,.7);}
+    .lang-switch a:hover{color:#fff;}
+    .lang-switch a.active{color:#fff;font-weight:600;}
+    .lang-switch .lang-sep{color:rgba(148,163,184,.4);}
+    </style>
 </head>
 <body>
     {{if .UseHeader}}
@@ -4403,8 +4427,13 @@ const publicLayout = `<!DOCTYPE html>
             <div class="nav-container">
                 <a href="/" class="logo">{{if .Theme.LogoURL}}<img src="{{.Theme.LogoURL}}" alt="{{.Theme.SiteName}}" class="site-logo">{{else}}{{.Theme.SiteName}}{{end}}</a>
                 <div class="nav-links">
-                    <a href="/">Home</a>
-                    <a href="/blog">Blog</a>
+                    <a href="/">{{i18n "site.nav_home" "首页" .Lang}}</a>
+                    <a href="/blog">{{i18n "site.nav_blog" "博客" .Lang}}</a>
+                </div>
+                <div class="lang-switch">
+                    <a href="?lang=zh"{{if eq .Lang "zh"}} class="active"{{end}}>{{i18n "site.lang_zh" "中文" .Lang}}</a>
+                    <span class="lang-sep">|</span>
+                    <a href="?lang=en"{{if eq .Lang "en"}} class="active"{{end}}>{{i18n "site.lang_en" "EN" .Lang}}</a>
                 </div>
             </div>
         </nav>
@@ -4425,11 +4454,15 @@ const publicLayout = `<!DOCTYPE html>
         {{else}}
         <div class="container">
             <p>{{.Theme.SiteTagline}}</p>
-            <p class="copyright">&copy; 2026 {{.Theme.SiteName}}. Powered by LightCMS.</p>
+            <p class="copyright">&copy; 2026 {{.Theme.SiteName}}. {{i18n "site.footer_powered" "由 LightCMS 驱动" .Lang}}</p>
         </div>
         {{end}}
     </footer>
     {{end}}
+    <script>
+    /* UI-C: reveal overlay scrollbar thumb while scrolling / touch-dragging. */
+    (function(){var t=null;function on(){var el=document.documentElement;el.classList.add('is-scrolling');if(t){clearTimeout(t);}t=setTimeout(function(){el.classList.remove('is-scrolling');t=null;},800);}window.addEventListener('scroll',on,{passive:true});window.addEventListener('touchmove',on,{passive:true});})();
+    </script>
 </body>
 </html>`
 
