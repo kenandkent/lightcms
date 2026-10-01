@@ -98,7 +98,7 @@ func (a *APIHandler) requirePermission(w http.ResponseWriter, r *http.Request, p
 	user := a.getAPIUser(r)
 	if user == nil {
 		log.Printf("[security] API request denied: key has no user context (perm=%s, path=%s)", perm, r.URL.Path)
-		a.jsonError(w, http.StatusForbidden, "API key must be associated with a user — legacy keys without user context are no longer supported")
+		a.jsonErrorCode(w, http.StatusForbidden, "PERMISSION_DENIED", "API key must be associated with a user — legacy keys without user context are no longer supported")
 		return false
 	}
 	if !auth.UserHasPermission(user, perm) {
@@ -106,7 +106,7 @@ func (a *APIHandler) requirePermission(w http.ResponseWriter, r *http.Request, p
 		if user.SandboxOnly && auth.HasPermission(user.Role, perm) {
 			msg = "this API key is sandbox-only: live mutations are not permitted — work inside a fork and submit it for human review"
 		}
-		a.jsonError(w, http.StatusForbidden, msg)
+		a.jsonErrorCode(w, http.StatusForbidden, "PERMISSION_DENIED", msg)
 		return false
 	}
 	return true
@@ -139,11 +139,58 @@ func (a *APIHandler) jsonResponse(w http.ResponseWriter, statusCode int, data in
 	json.NewEncoder(w).Encode(data)
 }
 
-// jsonError writes a JSON error response
+// jsonError writes a JSON error response. The body is the legacy additive
+// envelope: {"error": "<message>", "code": "<CODE>"} — "error" stays a string
+// for existing clients; the sibling "code" is derived from the status when the
+// caller has nothing more specific to say.
 func (a *APIHandler) jsonError(w http.ResponseWriter, statusCode int, message string) {
+	a.jsonErrorCode(w, statusCode, defaultErrorCode(statusCode), message)
+}
+
+// jsonErrorCode writes a JSON error response with an explicit machine-readable
+// code alongside the string message, e.g.
+// {"error": "Idempotency-Key is required for publish",
+//  "code": "IDEMPOTENCY_KEY_REQUIRED"}.
+// Additive only: no field was removed or re-nested, so legacy parsers that read
+// "error" as a string keep working, while agents/MCP can branch on "code".
+func (a *APIHandler) jsonErrorCode(w http.ResponseWriter, statusCode int, code, message string) {
+	if code == "" {
+		code = defaultErrorCode(statusCode)
+	}
 	a.jsonResponse(w, statusCode, map[string]interface{}{
 		"error": message,
+		"code":  code,
 	})
+}
+
+// defaultErrorCode maps an HTTP status to the machine-readable code emitted by
+// jsonError when the caller does not pass an explicit one. 428 is deliberately
+// absent: only the caller knows whether the missing precondition is the
+// Idempotency-Key (IDEMPOTENCY_KEY_REQUIRED) or something else, so those sites
+// pass the code explicitly. Unmapped statuses fall back to "ERROR".
+func defaultErrorCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "INVALID_REQUEST"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "CONFLICT"
+	case http.StatusUnprocessableEntity:
+		return "VALIDATION_FAILED"
+	case http.StatusTooManyRequests:
+		return "RATE_LIMITED"
+	case http.StatusInternalServerError:
+		return "INTERNAL_ERROR"
+	case http.StatusServiceUnavailable:
+		return "SERVICE_UNAVAILABLE"
+	default:
+		return "ERROR"
+	}
 }
 
 // decodeJSON reads and decodes the request body into the given target

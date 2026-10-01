@@ -182,7 +182,7 @@ func (a *APIHandler) APIGetContent(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -269,7 +269,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		ForkID          string                 `json:"fork_id"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -306,7 +306,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 
 	// Sandbox-only keys must create inside a fork.
 	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && req.ForkID == "" {
-		a.jsonError(w, http.StatusForbidden, "this API key is sandbox-only: new content must be created inside a fork (set fork_id)")
+		a.jsonErrorCode(w, http.StatusForbidden, "PERMISSION_DENIED", "this API key is sandbox-only: new content must be created inside a fork (set fork_id)")
 		return
 	}
 
@@ -401,7 +401,7 @@ func (a *APIHandler) APIUpdateContent(w http.ResponseWriter, r *http.Request) {
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -414,14 +414,14 @@ func (a *APIHandler) APIUpdateContent(w http.ResponseWriter, r *http.Request) {
 
 	// Sandbox-only keys may write to fork copies only, never live pages.
 	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && content.ForkID == nil {
-		a.jsonError(w, http.StatusForbidden, "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
+		a.jsonErrorCode(w, http.StatusForbidden, "PERMISSION_DENIED", "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
 		return
 	}
 
 	// Decode partial update from request body
 	var raw map[string]json.RawMessage
 	if err := a.decodeJSON(r, &raw); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -523,7 +523,7 @@ func (a *APIHandler) APIDeleteContent(w http.ResponseWriter, r *http.Request) {
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -543,7 +543,7 @@ func (a *APIHandler) APIRestoreContent(w http.ResponseWriter, r *http.Request) {
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -595,7 +595,7 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -609,7 +609,7 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 			f := a.publicationReqFields(r, "publish", t0)
 			f.StatusCode, f.ErrorCode = 428, "IDEMPOTENCY_KEY_REQUIRED"
 			observe.LogPublication("publish_rejected", f)
-			a.jsonError(w, 428, "Idempotency-Key is required for publish")
+			a.jsonErrorCode(w, 428, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required for publish")
 			return
 		}
 		var opID *primitive.ObjectID
@@ -695,7 +695,7 @@ func (a *APIHandler) APIUnpublishContent(w http.ResponseWriter, r *http.Request)
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -732,7 +732,7 @@ func (a *APIHandler) APIListContentVersions(w http.ResponseWriter, r *http.Reque
 	}
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -751,7 +751,7 @@ func (a *APIHandler) APIGetContentVersion(w http.ResponseWriter, r *http.Request
 	}
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -777,7 +777,7 @@ func (a *APIHandler) APIRevertContentVersion(w http.ResponseWriter, r *http.Requ
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -986,7 +986,7 @@ func (a *APIHandler) APISearchReplacePreview(w http.ResponseWriter, r *http.Requ
 		Pairs   []srPair `json:"pairs"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -1088,7 +1088,7 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 	// mutation — before the bulk slot, body parsing, scanning, or writes.
 	// The stable per-page auto-republish keys below derive from this header.
 	if strings.TrimSpace(r.Header.Get("Idempotency-Key")) == "" {
-		a.jsonError(w, 428, "Idempotency-Key is required for search-replace execute")
+		a.jsonErrorCode(w, 428, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required for search-replace execute")
 		return
 	}
 
@@ -1107,7 +1107,7 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 		AutoRepublish  bool     `json:"auto_republish"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -1368,7 +1368,7 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 		PublishAllDrafts bool     `json:"publish_all_drafts"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -1404,7 +1404,7 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 			f := a.publicationReqFields(r, "batch_publish", t0)
 			f.StatusCode, f.ErrorCode = 428, "IDEMPOTENCY_KEY_REQUIRED"
 			observe.LogPublication("publish_rejected", f)
-			a.jsonError(w, 428, "Idempotency-Key is required for batch publish")
+			a.jsonErrorCode(w, 428, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required for batch publish")
 			return
 		}
 		for _, id := range ids {
@@ -1496,7 +1496,7 @@ func (a *APIHandler) APIPreviewContent(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -1552,13 +1552,13 @@ func (a *APIHandler) APIUpdateContentByPath(w http.ResponseWriter, r *http.Reque
 
 	// Sandbox-only keys may write to fork copies only, never live pages.
 	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && content.ForkID == nil {
-		a.jsonError(w, http.StatusForbidden, "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
+		a.jsonErrorCode(w, http.StatusForbidden, "PERMISSION_DENIED", "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
 		return
 	}
 
 	var raw map[string]json.RawMessage
 	if err := a.decodeJSON(r, &raw); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -1658,7 +1658,7 @@ func (a *APIHandler) APIScopedSearchReplacePreview(w http.ResponseWriter, r *htt
 		Scope   scopeFilter `json:"scope"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 	if req.Search == "" {
@@ -1741,7 +1741,7 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 	// Lane 2A: scoped execute requires Idempotency-Key (428 when absent)
 	// with zero mutation — mirrors the global execute path.
 	if strings.TrimSpace(r.Header.Get("Idempotency-Key")) == "" {
-		a.jsonError(w, 428, "Idempotency-Key is required for search-replace execute")
+		a.jsonErrorCode(w, 428, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required for search-replace execute")
 		return
 	}
 
@@ -1760,7 +1760,7 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 		Scope          scopeFilter `json:"scope"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 	if req.Search == "" {
@@ -2061,7 +2061,7 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 		Upsert         bool   `json:"upsert"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -2237,7 +2237,7 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 		DryRun         bool         `json:"dry_run"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 	if len(req.Updates) == 0 {
@@ -2463,7 +2463,7 @@ func (a *APIHandler) APIBulkFieldOperation(w http.ResponseWriter, r *http.Reques
 		Scope          scopeFilter `json:"scope"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -2626,7 +2626,7 @@ func (a *APIHandler) APIExportContent(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == "POST" {
 		if err := a.decodeJSON(r, &req); err != nil {
-			a.jsonError(w, http.StatusBadRequest, "invalid request body")
+			a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 			return
 		}
 	}

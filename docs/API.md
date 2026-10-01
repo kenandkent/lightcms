@@ -364,6 +364,39 @@ curl -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json'
 | 503 | `PUBLICATION_STAGE_FAILED`（静态存储暂时不可用，`Retry-After: 30`） |
 | 500 | `INTERNAL_ERROR`（不可重试的内部错误） |
 
+### 遗留 /api/v1 端点：并列的 `code` 字段（Wave 3）
+
+上述嵌套信封只用于 **V3 页面生成 facade**（`httpapi.WriteError`）。遗留
+`/api/v1/*` 端点保持旧形态不变——`error` **仍是字符串**（现有客户端与后台
+JS 按字符串解析，勿改动）——但会在其旁并列一个机器可读的 `code`：
+
+```json
+{"error": "Idempotency-Key is required for publish",
+ "code": "IDEMPOTENCY_KEY_REQUIRED"}
+```
+
+- 这是**纯增量**变更：没有字段被删除或嵌套，解析 `{"error": "<string>"}`
+  的旧代码继续可用；Agent/MCP/外部客户端改按 `code` 分支，不再匹配文案。
+- 调用方未显式指定时，`code` 由 HTTP 状态码推导（默认表）：
+
+  | 状态 | 默认 `code` |
+  |---|---|
+  | 400 | `INVALID_REQUEST` |
+  | 401 | `UNAUTHENTICATED` |
+  | 403 | `PERMISSION_DENIED`（含 sandbox-only 拒绝） |
+  | 404 | `NOT_FOUND` |
+  | 409 | `CONFLICT` |
+  | 422 | `VALIDATION_FAILED` |
+  | 429 | `RATE_LIMITED` |
+  | 500 | `INTERNAL_ERROR` |
+  | 503 | `SERVICE_UNAVAILABLE` |
+  | 其他 | `ERROR` |
+
+- **428 例外**：状态本身不隐含原因，只有真正要求幂等键的调用点才写
+  `IDEMPOTENCY_KEY_REQUIRED`（`POST /content/{id}/publish`、`batch-publish`、
+  `search-replace/execute`（全局与 scoped）），消息文案保持不变。
+- 实现见 `internal/handlers/api.go` 的 `jsonErrorCode` / `defaultErrorCode`。
+
 ## 13. 错误恢复
 
 - **428**：补上缺失的 `expected_template_version`（先重取 schema）或
