@@ -155,8 +155,13 @@ func TestLoginPage_Returns200(t *testing.T) {
 		t.Fatalf("expected text/html content-type, got %s", ct)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "Login") {
-		t.Fatal("expected 'Login' in HTML body")
+	// UI-A i18n: default language is zh, so assert language-stable markers
+	// (brand + lang switch) instead of the English word "Login".
+	if !strings.Contains(body, "LightCMS") {
+		t.Fatal("expected 'LightCMS' in HTML body")
+	}
+	if !strings.Contains(body, "/cm/lang?lang=") {
+		t.Fatal("expected lang switch links in HTML body")
 	}
 }
 

@@ -263,6 +263,7 @@ func main() {
 	admin.Use(csrfMiddleware)
 	admin.HandleFunc("/login", h.LoginPage).Methods("GET")
 	admin.HandleFunc("/login", h.LoginHandler).Methods("POST")
+	admin.HandleFunc("/lang", h.HandleLangSwitch).Methods("GET")
 	admin.HandleFunc("/logout", h.LogoutHandler).Methods("POST") // Changed to POST for security
 	admin.HandleFunc("/change-password", h.ForceChangePasswordPage).Methods("GET")
 	admin.HandleFunc("/change-password", h.ForceChangePasswordHandler).Methods("POST")

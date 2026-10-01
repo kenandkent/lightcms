@@ -22,6 +22,7 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/build"
 	"github.com/jonradoff/lightcms/v7/internal/database"
 	"github.com/jonradoff/lightcms/v7/internal/errors"
+	"github.com/jonradoff/lightcms/v7/internal/i18n"
 	"github.com/jonradoff/lightcms/v7/internal/middleware"
 	"github.com/jonradoff/lightcms/v7/internal/models"
 	"github.com/jonradoff/lightcms/v7/internal/product/generation"
@@ -40,6 +41,7 @@ import (
 
 // adminTemplateFuncMap is built once and shared across all cached templates.
 var adminTemplateFuncMap = template.FuncMap{
+	"i18n":     func(key, fallback, lang string) string { return i18n.T(key, fallback, lang) },
 	"split":    func(s, sep string) []string { return strings.Split(s, sep) },
 	"join":     func(items []string, sep string) string { return strings.Join(items, sep) },
 	"multiply": func(a, b int) int { return a * b },
@@ -238,10 +240,10 @@ func (h *Handler) SeedDefaults(ctx context.Context) error {
 		helloWorld := models.Content{
 			TemplateID:   tmpl.ID,
 			TemplateName: tmpl.Name,
-		Title:        "Welcome to LightCMS",
-		Slug:         "",
-		FullPath:     "/",
-		Category:     "pages",
+			Title:        "Welcome to LightCMS",
+			Slug:         "",
+			FullPath:     "/",
+			Category:     "pages",
 			Published:    true,
 			PublishedAt:  &now,
 			UseHeader:    true,
@@ -353,10 +355,10 @@ func (h *Handler) ensureDefaultPages(ctx context.Context) {
 		page404 := models.Content{
 			TemplateID:   tmpl.ID,
 			TemplateName: tmpl.Name,
-		Title:        "Page Not Found",
-		Slug:         "404",
-		FullPath:     "/404",
-		Category:     "pages",
+			Title:        "Page Not Found",
+			Slug:         "404",
+			FullPath:     "/404",
+			Category:     "pages",
 			Published:    true,
 			PublishedAt:  &now,
 			UseHeader:    true,
@@ -1505,29 +1507,29 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 
 	update := bson.M{
 		"$set": bson.M{
-			"title":            title,
-			"slug":             slug,
-			"folder_id":        folderID,
-			"folder_path":      folderPath,
-			"full_path":        fullPath,
-			"canonical_full_path": newCanonical,
-			"path_scope":          "live",
-			"path_active":         true,
-			"current_version":     newVersion,
+			"title":                   title,
+			"slug":                    slug,
+			"folder_id":               folderID,
+			"folder_path":             folderPath,
+			"full_path":               fullPath,
+			"canonical_full_path":     newCanonical,
+			"path_scope":              "live",
+			"path_active":             true,
+			"current_version":         newVersion,
 			"has_unpublished_changes": hasUnpublished,
-			"tags":             updatedTags,
-			"meta_description": metaDescription,
-			"og_image":         ogImage,
-			"data":             data,
-			"published":        published,
-			"published_at":     publishedAt,
-			"pending_approval": contributorSubmittedForApproval,
-			"use_header":       useHeader,
-			"use_footer":       useFooter,
-			"use_theme":        useTheme,
-			"raw_mode":         rawMode,
-			"internal_links":   internalLinks,
-			"updated_at":       time.Now(),
+			"tags":                    updatedTags,
+			"meta_description":        metaDescription,
+			"og_image":                ogImage,
+			"data":                    data,
+			"published":               published,
+			"published_at":            publishedAt,
+			"pending_approval":        contributorSubmittedForApproval,
+			"use_header":              useHeader,
+			"use_footer":              useFooter,
+			"use_theme":               useTheme,
+			"raw_mode":                rawMode,
+			"internal_links":          internalLinks,
+			"updated_at":              time.Now(),
 		},
 	}
 
@@ -1668,12 +1670,12 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 	deletedPath := fmt.Sprintf("__deleted__/%s/%d", id.Hex(), now.UnixNano())
 	update := bson.M{
 		"$set": bson.M{
-			"deleted":    true,
-			"deleted_at": now,
-			"published":  false,       // Unpublish when deleting
-			"full_path":  deletedPath, // Unique path for deleted items
+			"deleted":     true,
+			"deleted_at":  now,
+			"published":   false,       // Unpublish when deleting
+			"full_path":   deletedPath, // Unique path for deleted items
 			"path_active": false,
-			"updated_at": now,
+			"updated_at":  now,
 		},
 	}
 
@@ -2754,11 +2756,11 @@ func (h *Handler) updateContentFolderPaths(ctx context.Context, oldFolderPath, n
 		}
 		h.db.UpdateOne(ctx, "content", bson.M{"_id": c.ID}, bson.M{
 			"$set": bson.M{
-				"folder_path": updatedFolderPath,
-				"full_path":   updatedFullPath,
-				"canonical_full_path": newCanon,
+				"folder_path":             updatedFolderPath,
+				"full_path":               updatedFullPath,
+				"canonical_full_path":     newCanon,
 				"has_unpublished_changes": c.Published,
-				"updated_at":  time.Now(),
+				"updated_at":              time.Now(),
 			},
 		})
 
@@ -3880,7 +3882,9 @@ func (h *Handler) renderPublicWithOptions(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) renderPublicWithSEO(w http.ResponseWriter, r *http.Request, theme *database.ThemeSettings, content string, useHeader, useFooter bool, title, metaDescription, ogImage, canonicalURL string, structuredData ...string) {
-	tmpl := template.Must(template.New("layout").Parse(publicLayout))
+	tmpl := template.Must(template.New("layout").Funcs(template.FuncMap{
+		"i18n": func(key, fallback, lang string) string { return i18n.T(key, fallback, lang) },
+	}).Parse(publicLayout))
 
 	// Get site config for title template
 	ctx := r.Context()
@@ -4006,6 +4010,9 @@ func (h *Handler) renderAdmin(w http.ResponseWriter, r *http.Request, name strin
 		data = make(map[string]interface{})
 	}
 	data["IsAuthenticated"] = h.auth.IsAuthenticated(r)
+	// UI-A i18n: per-request language flows through template data (templates
+	// are parsed once and cached, so there are no per-language trees).
+	data["Lang"] = i18n.LangFromRequest(r)
 
 	// Inject current user into template data for sidebar/nav
 	if user, ok := h.auth.GetCurrentUser(r); ok {
@@ -4300,10 +4307,10 @@ func (h *Handler) updateDependentContentByPath(ctx context.Context, oldPath, new
 			// Update in database (draft-only: mark unpublished changes, no file write)
 			if err := h.db.UpdateOne(ctx, "content", bson.M{"_id": content.ID}, bson.M{
 				"$set": bson.M{
-					"data":           content.Data,
-					"internal_links": content.InternalLinks,
+					"data":                    content.Data,
+					"internal_links":          content.InternalLinks,
 					"has_unpublished_changes": content.Published,
-					"updated_at":     time.Now(),
+					"updated_at":              time.Now(),
 				},
 			}); err != nil {
 				return err
@@ -6208,10 +6215,10 @@ func (h *Handler) ReplaceExecute(w http.ResponseWriter, r *http.Request) {
 			// Update the content in database (draft-only: no live file write)
 			update := bson.M{
 				"$set": bson.M{
-					"title":      newTitle,
-					"data":       newData,
+					"title":                   newTitle,
+					"data":                    newData,
 					"has_unpublished_changes": content.Published,
-					"updated_at": time.Now(),
+					"updated_at":              time.Now(),
 				},
 			}
 
