@@ -110,7 +110,12 @@ func NewOutbox(db *database.DB) *Outbox { return &Outbox{db: db} }
 //
 // Idempotency: the UNIQUE(event_type, aggregate_id) index is the arbiter. A
 // duplicate insert returns nil with no second row (once-created event), so a
-// lost-response retry after commit is safe.
+// lost-response retry after commit is safe. Implemented as an atomic upsert
+// ($setOnInsert): unlike insert-and-swallow-duplicate-key, it never raises
+// duplicate-key inside the caller's multi-document transaction — the failed
+// insert would abort the server-side transaction and kill the later commit
+// with NoSuchTransaction (see mongoOutbox.InsertUnique). Concurrent upserts
+// serialize on the unique index; exactly one wins the insert.
 func (o *Outbox) InsertUnique(ctx context.Context, eventType string, publicationID primitive.ObjectID, payload map[string]any) error {
 	if eventType == "" {
 		return pubErr(CodeValidation, "event_type is required", nil)
@@ -132,13 +137,12 @@ func (o *Outbox) InsertUnique(ctx context.Context, eventType string, publication
 		"next_attempt_at": now,
 		"created_at":      now,
 	}
-	if _, err := o.db.Collection(CollectionOutbox).InsertOne(ctx, doc); err != nil {
-		if isDupKey(err) {
-			return nil // idempotent: the event was already created
-		}
-		return err
-	}
-	return nil
+	_, err := o.db.Collection(CollectionOutbox).UpdateOne(ctx,
+		bson.M{"event_type": eventType, "aggregate_id": publicationID},
+		bson.M{"$setOnInsert": doc},
+		options.Update().SetUpsert(true),
+	)
+	return err
 }
 
 // OutboxRecord is one webhook_outbox row.

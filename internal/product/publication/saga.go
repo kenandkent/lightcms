@@ -827,12 +827,20 @@ func (s *Service) markVerifiedPresent(ctx context.Context, pubID primitive.Objec
 	return nil
 }
 
-// enrichOutboxURL adds the resolved public URL to the transactionally created
-// content.publish event (Task 5's payload lacks it). Best effort: delivery
-// joins on IDs + path and never depends on this field.
+// enrichOutboxURL backfills the resolved public URL onto the transactionally
+// created content.publish event for rows written before Task 16E persisted
+// it at activation time. Exactly-once-safe by construction:
+//   - the activation transaction already carries public_url in the payload
+//     (eventPayload reads the frozen Publication.PublicURL), so a worker that
+//     delivers between commit and this backfill still sends a complete
+//     payload — there is no race window, only a redundant no-op update;
+//   - the missing-only filter ({$exists: false}) means this update can never
+//     clobber a transaction-time value, so concurrent/duplicate finishCommit
+//     calls converge instead of last-writer-winning. Delivery joins on IDs +
+//     path and never depends on this field.
 func (s *Service) enrichOutboxURL(ctx context.Context, plan *cutoverPlan) {
 	_, _ = s.db.Collection(CollectionOutbox).UpdateOne(ctx,
-		bson.M{"event_type": EventPublished, "aggregate_id": plan.pubID},
+		bson.M{"event_type": EventPublished, "aggregate_id": plan.pubID, "payload.public_url": bson.M{"$exists": false}},
 		bson.M{"$set": bson.M{"payload.public_url": plan.publicURL}})
 }
 
