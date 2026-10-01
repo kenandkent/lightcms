@@ -49,7 +49,9 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 // doWithIdempotencyKey executes an HTTP request, attaching Idempotency-Key
 // when key != "". Task 16C: externally triggered single/batch publish and
 // rollback REQUIRE the key (server answers 428 without it), so publish
-// callers below always send one.
+// callers below always send one; lane 3A added the three search-replace
+// execute methods to the same contract. >=400 bodies become a typed
+// *APIError (parses both the legacy flat and V3 nested envelopes).
 func (c *Client) doWithIdempotencyKey(ctx context.Context, method, path string, body interface{}, result interface{}, key string) error {
 	var bodyReader io.Reader
 	if body != nil {
@@ -88,13 +90,7 @@ func (c *Client) doWithIdempotencyKey(ctx context.Context, method, path string, 
 	}
 
 	if resp.StatusCode >= 400 {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
-			return fmt.Errorf("%s", errResp.Error)
-		}
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+		return parseAPIError(resp.StatusCode, respBody)
 	}
 
 	if result != nil {
@@ -553,7 +549,9 @@ func (c *Client) SearchReplaceExecute(ctx context.Context, search, replace, comm
 		req["version_comment"] = comment
 	}
 	var result SearchReplaceResult
-	if err := c.do(ctx, "POST", "/search-replace/execute", req, &result); err != nil {
+	// Lane 3A: execute requires an Idempotency-Key (server answers 428
+	// without it) — auto-mint one per call, mirroring PublishContentResult.
+	if err := c.doWithIdempotencyKey(ctx, "POST", "/search-replace/execute", req, &result, newIdempotencyKey()); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -580,7 +578,8 @@ func (c *Client) SearchReplaceExecutePairs(ctx context.Context, pairs []map[stri
 		req["version_comment"] = comment
 	}
 	var result SearchReplaceResult
-	if err := c.do(ctx, "POST", "/search-replace/execute", req, &result); err != nil {
+	// Lane 3A: same 428 contract as the single-pair execute above.
+	if err := c.doWithIdempotencyKey(ctx, "POST", "/search-replace/execute", req, &result, newIdempotencyKey()); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -808,7 +807,9 @@ func (c *Client) ScopedSearchReplaceExecute(ctx context.Context, search, replace
 		"scope":           scope,
 	}
 	var result SearchReplaceResult
-	if err := c.do(ctx, "POST", "/search-replace/scoped/execute", req, &result); err != nil {
+	// Lane 3A: scoped execute mirrors the global execute Idempotency-Key
+	// requirement (428 otherwise) — auto-mint a key per call.
+	if err := c.doWithIdempotencyKey(ctx, "POST", "/search-replace/scoped/execute", req, &result, newIdempotencyKey()); err != nil {
 		return nil, err
 	}
 	return &result, nil
