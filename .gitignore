@@ -8,8 +8,14 @@ bin/
 static/uploads/*
 !static/uploads/.gitkeep
 
-# Generated sitemap (site-specific, not part of software)
+# Generated sitemap (site-specific, not part of software; regenerated on demand)
 static/sitemap.xml
+internal/handlers/static/sitemap.xml
+
+# Generated theme CSS (regenerated from DB settings on every boot and by
+# package tests using their own CWD — never track, or every run dirties the tree)
+static/css/theme-vars.css
+internal/handlers/static/css/theme-vars.css
 
 # Generated content (site-specific, not part of software)
 content/
