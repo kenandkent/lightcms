@@ -180,7 +180,7 @@ func TestAdminPublicationForkEdit(t *testing.T) {
 	if action != "open_fork" {
 		t.Errorf("published edit without fork: action = %q, want open_fork", action)
 	}
-	if !strings.Contains(notice, "Live page unchanged") {
+	if !strings.Contains(notice, "线上页面不受影响") {
 		t.Errorf("published edit notice must state live is unchanged, got %q", notice)
 	}
 	action, _ = SelectForkAction(true, primitive.NewObjectID().Hex())
@@ -192,11 +192,11 @@ func TestAdminPublicationForkEdit(t *testing.T) {
 		t.Errorf("unpublished edit: action = %q, want edit_content", action)
 	}
 	html := string(ForkEditBannerHTML(true, "abc123"))
-	if !strings.Contains(html, "Editing Draft") || !strings.Contains(html, "Live page unchanged") {
+	if !strings.Contains(html, "正在编辑草稿") || !strings.Contains(html, "线上页面不受影响") {
 		t.Errorf("fork banner must carry draft/live-unchanged copy in:\n%s", html)
 	}
 	html = string(ForkEditBannerHTML(false, ""))
-	if strings.Contains(html, "Live page unchanged") {
+	if strings.Contains(html, "线上页面不受影响") {
 		t.Errorf("unpublished banner must not claim live-unchanged in:\n%s", html)
 	}
 }
@@ -209,8 +209,8 @@ func TestAdminPublicationMergeDisplay(t *testing.T) {
 		ContentIDs:      []string{primitive.NewObjectID().Hex()},
 		RequiresPublish: []string{primitive.NewObjectID().Hex()},
 	}))
-	for _, want := range []string{"requires_publish", "publishing is a separate action", "canonical"} {
-		if !strings.Contains(strings.ToLower(html), strings.ToLower(want)) {
+	for _, want := range []string{"待发布", "发布是单独的操作", "线上正式 HTML"} {
+		if !strings.Contains(html, want) {
 			t.Errorf("merge result missing %q in:\n%s", want, html)
 		}
 	}
@@ -236,7 +236,7 @@ func TestAdminPublicationPublishResult(t *testing.T) {
 		}
 	}
 	failed := string(FailedPublishHTML("https://pages.example.com/news/old-live", "PUBLICATION_STAGE_FAILED", true))
-	for _, want := range []string{"https://pages.example.com/news/old-live", "PUBLICATION_STAGE_FAILED", "Retry"} {
+	for _, want := range []string{"https://pages.example.com/news/old-live", "PUBLICATION_STAGE_FAILED", "重试"} {
 		if !strings.Contains(failed, want) {
 			t.Errorf("failed publish must preserve prior URL + retryable error, missing %q in:\n%s", want, failed)
 		}
@@ -247,7 +247,7 @@ func TestAdminPublicationPublishResult(t *testing.T) {
 // regen; upgrade needs an explicit action (spec §9.5, §31.4).
 func TestAdminProductTemplateVersionNotice(t *testing.T) {
 	html := string(TemplateVersionNoticeHTML(3, 4))
-	for _, want := range []string{"Version 4", "live pages", "Upgrade Preview"} {
+	for _, want := range []string{"版本 4", "线上页面", "升级预览"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("version notice missing %q in:\n%s", want, html)
 		}
@@ -267,8 +267,8 @@ func TestAdminPublicationUpgradeUI(t *testing.T) {
 		},
 	}
 	html := string(UpgradePreviewHTML(prev))
-	for _, want := range []string{"financial-news", "/news/a", "would republish", "Start Upgrade Job"} {
-		if !strings.Contains(strings.ToLower(html), strings.ToLower(want)) {
+	for _, want := range []string{"financial-news", "/news/a", "需要重新发布", "启动升级任务"} {
+		if !strings.Contains(html, want) {
 			t.Errorf("upgrade preview missing %q in:\n%s", want, html)
 		}
 	}
@@ -281,8 +281,8 @@ func TestAdminPublicationUpgradeUI(t *testing.T) {
 		},
 	}
 	jhtml := string(UpgradeJobHTML(job))
-	for _, want := range []string{"/news/a", "done", "/news/c", "failed", "Retry", "resume"} {
-		if !strings.Contains(strings.ToLower(jhtml), strings.ToLower(want)) {
+	for _, want := range []string{"/news/a", "done", "/news/c", "failed", "重试", "恢复"} {
+		if !strings.Contains(jhtml, want) {
 			t.Errorf("upgrade job missing %q in:\n%s", want, jhtml)
 		}
 	}
@@ -300,7 +300,7 @@ func TestAdminPublicationRestoreVsRevert(t *testing.T) {
 	if !strings.Contains(html, "revert_live") {
 		t.Errorf("must expose a revert_live action in:\n%s", html)
 	}
-	if !strings.Contains(html, "draft") || !strings.Contains(html, "exact") {
+	if !strings.Contains(html, "草稿") || !strings.Contains(html, "完整保留字节") {
 		t.Errorf("buttons must explain distinct outcomes (draft re-render vs exact bytes) in:\n%s", html)
 	}
 }
