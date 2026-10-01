@@ -599,8 +599,13 @@ func (h *Handler) NewTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateCreate) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -640,8 +645,13 @@ func (h *Handler) EditTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateEdit) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -668,8 +678,13 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteTemplate(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateDelete) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -1627,8 +1642,13 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermContentDelete) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -6393,8 +6413,13 @@ func (h *Handler) NewSnippet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateSnippet(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusFound)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateEdit) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 	name := strings.TrimSpace(r.FormValue("name"))
@@ -6439,8 +6464,13 @@ func (h *Handler) EditSnippet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UpdateSnippet(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusFound)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateEdit) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 	vars := mux.Vars(r)
@@ -6477,8 +6507,13 @@ func (h *Handler) UpdateSnippet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteSnippet(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusFound)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateEdit) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 	vars := mux.Vars(r)
