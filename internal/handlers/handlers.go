@@ -4064,7 +4064,12 @@ func (h *Handler) renderAdmin(w http.ResponseWriter, r *http.Request, name strin
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
 	// Note: Security headers are now applied globally via middleware
-	tmpl.Execute(w, data)
+	// Log template execution errors: Execute may have partially written the
+	// response already, so the status cannot change — but silent truncation
+	// (e.g. a bad field reference inside a range block) must be visible.
+	if err := tmpl.Execute(w, data); err != nil {
+		log.Printf("admin template %q execute error: %v", name, err)
+	}
 }
 
 func slugify(s string) string {
@@ -4427,13 +4432,13 @@ const publicLayout = `<!DOCTYPE html>
             <div class="nav-container">
                 <a href="/" class="logo">{{if .Theme.LogoURL}}<img src="{{.Theme.LogoURL}}" alt="{{.Theme.SiteName}}" class="site-logo">{{else}}{{.Theme.SiteName}}{{end}}</a>
                 <div class="nav-links">
-                    <a href="/">{{i18n "site.nav_home" "首页" .Lang}}</a>
-                    <a href="/blog">{{i18n "site.nav_blog" "博客" .Lang}}</a>
+                    <a href="/">{{i18n "site.nav_home" "首页" $.Lang}}</a>
+                    <a href="/blog">{{i18n "site.nav_blog" "博客" $.Lang}}</a>
                 </div>
                 <div class="lang-switch">
-                    <a href="?lang=zh"{{if eq .Lang "zh"}} class="active"{{end}}>{{i18n "site.lang_zh" "中文" .Lang}}</a>
+                    <a href="?lang=zh"{{if eq .Lang "zh"}} class="active"{{end}}>{{i18n "site.lang_zh" "中文" $.Lang}}</a>
                     <span class="lang-sep">|</span>
-                    <a href="?lang=en"{{if eq .Lang "en"}} class="active"{{end}}>{{i18n "site.lang_en" "EN" .Lang}}</a>
+                    <a href="?lang=en"{{if eq .Lang "en"}} class="active"{{end}}>{{i18n "site.lang_en" "EN" $.Lang}}</a>
                 </div>
             </div>
         </nav>
@@ -4454,7 +4459,7 @@ const publicLayout = `<!DOCTYPE html>
         {{else}}
         <div class="container">
             <p>{{.Theme.SiteTagline}}</p>
-            <p class="copyright">&copy; 2026 {{.Theme.SiteName}}. {{i18n "site.footer_powered" "由 LightCMS 驱动" .Lang}}</p>
+            <p class="copyright">&copy; 2026 {{.Theme.SiteName}}. {{i18n "site.footer_powered" "由 LightCMS 驱动" $.Lang}}</p>
         </div>
         {{end}}
     </footer>
