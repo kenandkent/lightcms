@@ -285,11 +285,10 @@ func TestE2E_MigrateSlug(t *testing.T) {
 }
 
 // TestE2E_BatchPublishLegacy proves the §39.9 batch entry creates one
-// publication + outbox row per item through the shared saga. FINDING: the
-// wired branch never binds per-item idempotency (spec §21 requires
-// HMAC(parent_key, content) derivation), so repeating the same top-level
-// key mints DUPLICATE publications — table row FAIL with the derivation
-// specified as the fix.
+// publication + outbox row per item through the shared saga, and that a
+// same-key retry replays per-item idempotent records instead of minting
+// duplicates (lane 2A: per-item Begin/Complete keyed by parent key +
+// content path suffix).
 func TestE2E_BatchPublishLegacy(t *testing.T) {
 	e := newEnv(t, envOpts{})
 	e.seedTemplate(t, "financial-news")
@@ -321,15 +320,19 @@ func TestE2E_BatchPublishLegacy(t *testing.T) {
 			t.Fatalf("batch page %s not live: %d %s", slug, c, body)
 		}
 	}
-	// Same top-level key repeated: per-item derivation is missing, so a
-	// second call mints duplicates (spec §21 violation pinned here).
+	// Same top-level key repeated: per-item idempotency records replay, so
+	// no duplicate publications are minted (count stays at 2).
 	code, resp2 := e.postJSON("/api/v1/content/batch-publish", map[string]any{"ids": []string{idA, idB}}, hdr)
 	if code != 200 {
 		t.Fatalf("batch replay = %d (%v)", code, resp2)
 	}
-	if n := e.count("content_publications", bson.M{}); n != 4 {
-		t.Fatalf("batch publications after same-key repeat = %d (want 4 = duplicates minted; per-item derivation missing)", n)
+	if n := e.count("content_publications", bson.M{}); n != 2 {
+		t.Fatalf("batch publications after same-key repeat = %d (want 2 = replay, no duplicates)", n)
 	}
-	t.Logf("FINDING PINNED: batch publish ignores per-item idempotency derivation (spec §21); same-key repeat duplicates publications")
+	pubs2, _ := resp2["publications"].([]any)
+	if len(pubs2) != 2 {
+		t.Fatalf("batch replay publications = %v", resp2)
+	}
+	t.Logf("verified: same-key batch repeat replays per-item idempotent records (no duplicate publications)")
 	_ = generation.ModePublish
 }
