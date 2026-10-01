@@ -81,7 +81,7 @@ func TestAnalyticsPage_RangeControls(t *testing.T) {
 		t.Fatalf("status = %d", rr.Code)
 	}
 	body := rr.Body.String()
-	for _, want := range []string{"60 Days", "90 Days", `name="start"`, `name="end"`, `value="custom"`} {
+	for _, want := range []string{"60 天", "90 天", `name="start"`, `name="end"`, `value="custom"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("analytics page missing %q", want)
 		}

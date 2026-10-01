@@ -311,22 +311,22 @@ func TestAgentToolPage(t *testing.T) {
 	// Feedback banners render from query flags.
 	rr2 := httptest.NewRecorder()
 	h.AgentToolPage(rr2, sessionReq("GET", "/cm/tools/agent?sent=1", nil, nil))
-	if !strings.Contains(rr2.Body.String(), "Test digest sent to") {
+	if !strings.Contains(rr2.Body.String(), "测试简报已发送至") {
 		t.Errorf("sent banner missing")
 	}
 	rr2 = httptest.NewRecorder()
 	h.AgentToolPage(rr2, sessionReq("GET", "/cm/tools/agent?saved=1", nil, nil))
-	if !strings.Contains(rr2.Body.String(), "Configuration saved") {
+	if !strings.Contains(rr2.Body.String(), "配置已保存") {
 		t.Errorf("saved banner missing")
 	}
 	rr2 = httptest.NewRecorder()
 	h.AgentToolPage(rr2, sessionReq("GET", "/cm/tools/agent?error=send", nil, nil))
-	if !strings.Contains(rr2.Body.String(), "Test digest failed") {
+	if !strings.Contains(rr2.Body.String(), "测试简报发送失败") {
 		t.Errorf("failure banner missing")
 	}
-	for _, want := range []string{"CMS Agent", "Email delivery not configured", "RESEND_API_KEY",
+	for _, want := range []string{"CMS Agent", "邮件发送尚未配置", "RESEND_API_KEY",
 		"include_site_health", "include_traffic", "include_pending", "include_broken_links",
-		"include_agent_work", "include_ai_commentary", "Send test digest now"} {
+		"include_agent_work", "include_ai_commentary", "立即发送测试简报"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("agent page missing %q", want)
 		}

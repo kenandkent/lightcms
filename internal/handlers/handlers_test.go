@@ -930,8 +930,8 @@ func TestAdminDashboard_Authenticated(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "Dashboard") {
-		t.Fatal("expected 'Dashboard' in response body")
+	if !strings.Contains(rr.Body.String(), "仪表盘") {
+		t.Fatal("expected dashboard title in response body")
 	}
 }
 
@@ -947,8 +947,8 @@ func TestListTemplates_Authenticated(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "Templates") {
-		t.Fatal("expected 'Templates' in response body")
+	if !strings.Contains(rr.Body.String(), "模板") {
+		t.Fatal("expected templates title in response body")
 	}
 }
 
