@@ -92,7 +92,9 @@ Exact Rollback（精确回滚）
     = 接口：POST /api/v1/content/{id}/publications/{publication_id}/rollback
       （Handler：internal/product/httpapi/publications.go:72-73）
       Admin：POST /cm/.../content/{id}/publications/{publicationID}/revert_live
-      （cmd/server/main.go:413）
+      （路由注册在 cmd/server/main.go 的 Admin publication UX 段；后台入口：
+      内容编辑页“发布历史”链接 → GET /cm/content/{id}/publications → 行内
+      “回滚线上到该发布 (revert_live)”按钮，表单必填 idempotency_key）
 
 Re-render Rollback（重渲染回滚）
     = immutable object 已被 GC
@@ -103,7 +105,7 @@ Re-render Rollback（重渲染回滚）
 
 操作：
 
-1. 在 Publication 历史中找到目标版本，确认其 immutable 对象仍在（`storage_state != deleted`）。默认 Exact Rollback SLA 为 superseded 后 **90 天**；需更长保证的 Publication 必须 `pinned=true`（pinned 永不 GC，见 §6）。
+1. 在 Publication 历史中找到目标版本，确认其 immutable 对象仍在（`storage_state != deleted`）。后台入口：内容编辑页 **“发布历史”** 链接 → `/cm/content/{id}/publications`（行内按钮：恢复为草稿 / 恢复并发布 / 回滚线上到该发布）。默认 Exact Rollback SLA 为 superseded 后 **90 天**；需更长保证的 Publication 必须 `pinned=true`（pinned 永不 GC，见 §6）。
 2. 调用 rollback（需 `content.edit + content.publish` 权限与 `Idempotency-Key`，`restore.go:47,51`），传 `expectedActiveID` 做 CAS（防止回滚到过期 active 上）。
 3. 回滚创建的是**新 Publication**（引用历史 Content/Template Version），从不复用/篡改旧 Publication 记录（规范 §18.4）。
 4. CDN purge 与 webhook 为异步 best-effort：失败不回滚已提交的状态，进入 outbox 重试（规范 §18.1）；用 `publication_rollback_total` 与 outbox backlog 确认最终一致（[OPERATIONS.md](OPERATIONS.md)）。
