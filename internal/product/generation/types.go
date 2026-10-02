@@ -127,6 +127,11 @@ func (a Actor) Can(p string) bool {
 
 // HasScope reports whether the actor carries scope s. An empty Scopes
 // allowlist means full owner permissions (existing API-key semantics).
+//
+// Deprecated: authorization checks must use Can (role ∩ sandbox ∩ scopes).
+// HasScope alone cannot see the role and treats empty scopes as allow-all
+// (the R01 bypass). Kept for the scope-plumbing helpers that genuinely
+// operate on raw allowlists.
 func (a Actor) HasScope(s string) bool {
 	if len(a.Scopes) == 0 {
 		return true

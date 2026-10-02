@@ -263,7 +263,7 @@ func TestUnpublishCAS(t *testing.T) {
 		t.Fatalf("ActivateCAS: %v", err)
 	}
 
-	did, err := repo.UnpublishCAS(ctx, contentID, nil)
+	did, err := repo.UnpublishCAS(ctx, contentID, nil, publication.Attribution{})
 	if err != nil || !did {
 		t.Fatalf("UnpublishCAS = (%v, %v), want (true, nil)", did, err)
 	}
@@ -289,7 +289,7 @@ func TestUnpublishCAS(t *testing.T) {
 	}
 
 	// Second unpublish: idempotent success, no new event.
-	did, err = repo.UnpublishCAS(ctx, contentID, nil)
+	did, err = repo.UnpublishCAS(ctx, contentID, nil, publication.Attribution{})
 	if err != nil || did {
 		t.Fatalf("second UnpublishCAS = (%v, %v), want (false, nil)", did, err)
 	}
@@ -318,7 +318,7 @@ func TestUnpublishCASConflict(t *testing.T) {
 		t.Fatalf("ActivateCAS: %v", err)
 	}
 	other := primitive.NewObjectID()
-	if _, err := repo.UnpublishCAS(ctx, contentID, &other); !publication.IsConflict(err) {
+	if _, err := repo.UnpublishCAS(ctx, contentID, &other, publication.Attribution{}); !publication.IsConflict(err) {
 		t.Fatalf("UnpublishCAS with wrong expected ID = %v, want PUBLICATION_CONFLICT", err)
 	}
 	if active, _ := repo.GetActive(ctx, contentID); active == nil || active.ID != a.ID {
@@ -344,7 +344,7 @@ func TestUnpublishCASTransactional(t *testing.T) {
 		t.Fatalf("ActivateCAS: %v", err)
 	}
 
-	if _, err := repo.UnpublishCAS(ctx, contentID, nil); err == nil {
+	if _, err := repo.UnpublishCAS(ctx, contentID, nil, publication.Attribution{}); err == nil {
 		t.Fatal("expected outbox failure to abort UnpublishCAS")
 	}
 	if active, _ := good.GetActive(ctx, contentID); active == nil || active.ID != a.ID {

@@ -81,14 +81,14 @@ func TestOutboxUnpublishAndFailedEvents(t *testing.T) {
 	if err := repo.ActivateCAS(ctx, contentID, a.ID, nil); err != nil {
 		t.Fatalf("ActivateCAS: %v", err)
 	}
-	did, err := repo.UnpublishCAS(ctx, contentID, nil)
+	did, err := repo.UnpublishCAS(ctx, contentID, nil, publication.Attribution{})
 	if err != nil || !did {
 		t.Fatalf("UnpublishCAS = (%v, %v), want (true, nil)", did, err)
 	}
 	if n := outboxCount(t, db, "content.unpublish", a.ID); n != 1 {
 		t.Fatalf("expected 1 content.unpublish row, got %d", n)
 	}
-	if did2, err := repo.UnpublishCAS(ctx, contentID, nil); err != nil || did2 {
+	if did2, err := repo.UnpublishCAS(ctx, contentID, nil, publication.Attribution{}); err != nil || did2 {
 		t.Fatalf("second UnpublishCAS = (%v, %v), want (false, nil)", did2, err)
 	}
 	if n := outboxCount(t, db, "content.unpublish", a.ID); n != 1 {

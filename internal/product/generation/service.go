@@ -266,6 +266,7 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 			return *replayResp, nil
 		}
 		earlyOp = &op
+		ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 		if *req.ExpectedTemplateVersion != tv.Version {
 			verr := genErr(CodeTemplateVersionChanged,
 				fmt.Sprintf("template %s is at version %d, expected %d", tv.Slug, tv.Version, *req.ExpectedTemplateVersion), nil)
@@ -340,7 +341,7 @@ func (s *Service) resolveSandboxFork(ctx context.Context, actor Actor) (*primiti
 		if err != nil {
 			return genErr(CodeAgentSandboxRequired, "mode=sandbox requires an active agent sandbox", err)
 		}
-		if *owned != *want {
+		if owned == nil || want == nil || *owned != *want {
 			return genErr(CodePermissionDenied, "sandbox fork does not belong to this session", nil)
 		}
 		return nil
@@ -656,20 +657,35 @@ func (s *Service) beginOrResumePublish(ctx context.Context, actor Actor, req Gen
 // Success caches become the stored response.
 func (s *Service) replayOpResponse(op idempotency.Operation) (idempotency.Operation, *GenerateResponse, error) {
 	if op.ValidationReplay {
+		// BSON round-trips decode arrays/docs as primitive.A/M (named
+		// types that fail plain []any/map[string]any assertions) —
+		// accept both shapes so cached details survive the trip.
+		toStrMap := func(item any) (map[string]any, bool) {
+			switch m := item.(type) {
+			case map[string]any:
+				return m, true
+			case primitive.M:
+				return map[string]any(m), true
+			}
+			return nil, false
+		}
+		var list []any
+		switch raw := op.Response["details"].(type) {
+		case []any:
+			list = raw
+		case primitive.A:
+			list = []any(raw)
+		}
 		var details []FieldDetail
-		if raw, ok := op.Response["details"]; ok {
-			if list, ok := raw.([]any); ok {
-				for _, item := range list {
-					if m, ok := item.(map[string]any); ok {
-						str := func(k string) string {
-							if v, ok := m[k].(string); ok {
-								return v
-							}
-							return ""
-						}
-						details = append(details, FieldDetail{Code: str("code"), Field: str("field"), Message: str("message")})
+		for _, item := range list {
+			if m, ok := toStrMap(item); ok {
+				str := func(k string) string {
+					if v, ok := m[k].(string); ok {
+						return v
 					}
+					return ""
 				}
+				details = append(details, FieldDetail{Code: str("code"), Field: str("field"), Message: str("message")})
 			}
 		}
 		return idempotency.Operation{}, nil, &Error{
@@ -687,18 +703,26 @@ func (s *Service) replayOpResponse(op idempotency.Operation) (idempotency.Operat
 
 // completeResumedActive caches the success response for a taken-over attempt
 // whose publication is already active and returns the replayable response.
+// Template identity comes from the live record (not the current template:
+// the publication may predate an upgrade); when the op carries a content
+// binding it must agree with the record, otherwise the snapshot belongs to
+// a different execution and resuming would certify the wrong bytes.
 func (s *Service) completeResumedActive(ctx context.Context, op idempotency.Operation, pub publication.Publication, tv templatecontract.TemplateVersion) (*GenerateResponse, error) {
 	action, status := "updated", 200
 	if pub.ContentVersion <= 1 {
 		action, status = "created", 201
 	}
+	if op.ContentID != nil && *op.ContentID != pub.ContentID {
+		return nil, genErr(CodePublicationConflict,
+			"resumed operation is bound to different content; retry with a new key", nil)
+	}
 	cache := map[string]any{
 		"id": pub.ContentID.Hex(), "action": action, "template": tv.Slug,
 		"full_path": pub.FullPath, "mode": ModePublish, "published": true,
 		"requires_publish": false, "public_url": pub.PublicURL,
-		"content_version":  float64(pub.ContentVersion),
+		"content_version": float64(pub.ContentVersion),
 		"template_version": float64(pub.TemplateVersion),
-		"publication_id":   pub.ID.Hex(),
+		"publication_id": pub.ID.Hex(),
 	}
 	if _, cerr := s.idem.Complete(ctx, op.ID, op.Attempt, status, cache, false); cerr != nil {
 		return nil, cerr

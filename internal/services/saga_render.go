@@ -16,6 +16,17 @@ package services
 // safe). lc:query expansions and the wikilink index are read live at plan
 // time and frozen into the snapshot — exactly what makes them deterministic
 // for retries.
+//
+// Takeover drift note: a resumed attempt re-runs this adapter, re-reading
+// snippets, the wikilink index, and lc:query results live. If site
+// dependencies changed between the crashed attempt and the resume, the
+// retried bytes may differ from the first attempt's (the frozen publication
+// ID, logical time, and template pin stay stable, so convergence —
+// exactly one active publication per operation — is unaffected). Byte
+// identity across takeovers holds whenever site dependencies are stable,
+// which is the common case; freezing the full dependency closure into the
+// idempotency record was rejected as disproportionate (unbounded snapshot
+// growth for index-heavy sites).
 
 import (
 	"context"

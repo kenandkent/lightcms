@@ -105,25 +105,38 @@ func (s *Service) Begin(ctx context.Context, owner, method, path, key string, ca
 		UpdatedAt:       now,
 		ExpiresAt:       now.Add(s.ttl),
 	}
-	if err := s.repo.Insert(ctx, fresh); err != nil {
-		if !mongo.IsDuplicateKeyError(err) && !isDupKey(err) {
+	// Insert race loop: concurrent first-time beginners collide on the
+	// unique index and exactly one insert wins. A duplicate whose record
+	// then reads back missing fell into the TTL gap (expiry between our
+	// insert conflict and re-read) — retry the insert rather than handing
+	// the caller an unpersisted operation ID whose Bind/Freeze/Complete
+	// would all dead-end on NotFound.
+	for attempt := 0; ; attempt++ {
+		if err := s.repo.Insert(ctx, fresh); err != nil {
+			if !mongo.IsDuplicateKeyError(err) && !isDupKey(err) {
+				return Operation{}, err
+			}
+			// Lost the insert race: resolve as an existing record.
+		} else {
+			return *fresh, nil
+		}
+
+		existing, err := s.repo.FindByKey(ctx, owner, method, path, key)
+		if err != nil {
 			return Operation{}, err
 		}
-		// Lost the insert race: resolve as an existing record.
-	} else {
-		return *fresh, nil
+		if existing == nil {
+			// Index reports a duplicate but the document is gone (TTL expiry
+			// between insert and re-read): safe to treat as a new operation.
+			if attempt >= 2 {
+				return Operation{}, idemErr(CodeNotFound, "idempotency record vanished repeatedly; retry the request")
+			}
+			fresh.ID = primitive.NewObjectID()
+			fresh.OperationIDHex = fresh.ID.Hex()
+			continue
+		}
+		return s.resolveExisting(ctx, existing, hash, now)
 	}
-
-	existing, err := s.repo.FindByKey(ctx, owner, method, path, key)
-	if err != nil {
-		return Operation{}, err
-	}
-	if existing == nil {
-		// Index reports a duplicate but the document is gone (TTL expiry
-		// between insert and re-read): safe to treat as a new operation.
-		return *fresh, nil
-	}
-	return s.resolveExisting(ctx, existing, hash, now)
 }
 
 // resolveExisting applies the replay/conflict/lease/terminal matrix.
@@ -223,6 +236,54 @@ func (s *Service) Get(ctx context.Context, opID primitive.ObjectID) (Operation, 
 	return *op, nil
 }
 
+// leaseGenerationContextKey carries the caller's owned lease generation
+// for fencing (R07): mutating methods CAS on it when present, so a worker
+// that lost its lease to a takeover cannot write onto the new owner's
+// attempt. Callers stash it immediately after Begin/TakeOver (which return
+// the owned generation) and re-stash after every attempt-advancing call.
+// Absent = unchecked (backward compatible for unwired callers and tests).
+type leaseGenerationContextKey struct{}
+
+// WithLeaseGeneration returns a copy of ctx carrying the owned lease
+// generation for fencing idempotency mutations.
+func WithLeaseGeneration(ctx context.Context, generation int64) context.Context {
+	return context.WithValue(ctx, leaseGenerationContextKey{}, generation)
+}
+
+// leaseGenerationFrom extracts the fenced generation, if stashed.
+func leaseGenerationFrom(ctx context.Context) (int64, bool) {
+	v, ok := ctx.Value(leaseGenerationContextKey{}).(int64)
+	return v, ok
+}
+
+// fenceFilter augments a CAS filter with the stashed lease generation.
+// Callers translate a zero match through the existing mismatch diagnosers,
+// which report the attempt as superseded.
+func fenceFilter(ctx context.Context, filter bson.M) bson.M {
+	if gen, ok := leaseGenerationFrom(ctx); ok {
+		filter["lease_generation"] = gen
+	}
+	return filter
+}
+
+// fencedOut reports CodeLeaseLost when the caller stashed a generation and
+// the record moved past it (a newer worker took over). Nil means fencing is
+// inactive or the record agrees — fall through to the existing diagnosers.
+func (s *Service) fencedOut(ctx context.Context, opID primitive.ObjectID) error {
+	gen, ok := leaseGenerationFrom(ctx)
+	if !ok {
+		return nil
+	}
+	cur, err := s.repo.FindByID(ctx, opID)
+	if err != nil || cur == nil {
+		return nil
+	}
+	if cur.LeaseGeneration != gen {
+		return idemErr(CodeLeaseLost, "lease generation changed; a newer worker owns the attempt")
+	}
+	return nil
+}
+
 // BindContentAndVersion couples the operation to its Content/Version inside
 // the caller's Mongo transaction: pass the session (which may be nil for
 // non-transactional use, in which case ctx is used). No committed Content
@@ -246,14 +307,14 @@ func (s *Service) BindContentAndVersion(ctx context.Context, sess mongo.SessionC
 		wctx = sess
 	}
 	matched, err := s.repo.UpdateCAS(wctx,
-		bson.M{
+		fenceFilter(ctx, bson.M{
 			"_id": opID, "state": StateProcessing, "attempt_state": AttemptProcessing,
 			"$or": []bson.M{
 				{"content_id": bson.M{"$exists": false}},
 				{"content_id": nil},
 				{"content_id": contentID},
 			},
-		},
+		}),
 		bson.M{"$set": bson.M{
 			"content_id":          contentID,
 			"content_version":     version,
@@ -265,6 +326,9 @@ func (s *Service) BindContentAndVersion(ctx context.Context, sess mongo.SessionC
 	}
 	if matched == 1 {
 		return nil
+	}
+	if ferr := s.fencedOut(ctx, opID); ferr != nil {
+		return ferr
 	}
 	current, rerr := s.repo.FindByID(wctx, opID)
 	if rerr != nil {
@@ -302,14 +366,14 @@ func (s *Service) FreezeExecution(ctx context.Context, opID primitive.ObjectID, 
 	}
 	now := time.Now().UTC()
 	matched, err := s.repo.UpdateCAS(ctx,
-		bson.M{
+		fenceFilter(ctx, bson.M{
 			"_id": opID, "attempt": attempt, "state": StateProcessing, "attempt_state": AttemptProcessing,
 			"$or": []bson.M{
 				{"publication_id": bson.M{"$exists": false}},
 				{"publication_id": nil},
 				{"publication_id": publicationID},
 			},
-		},
+		}),
 		bson.M{
 			"$set": bson.M{
 				"publication_id":       publicationID,
@@ -329,6 +393,9 @@ func (s *Service) FreezeExecution(ctx context.Context, opID primitive.ObjectID, 
 	}
 	if matched == 1 {
 		return nil
+	}
+	if ferr := s.fencedOut(ctx, opID); ferr != nil {
+		return ferr
 	}
 	current, rerr := s.repo.FindByID(ctx, opID)
 	if rerr != nil {
@@ -491,7 +558,7 @@ func (s *Service) Complete(ctx context.Context, opID primitive.ObjectID, attempt
 		((statusCode == 400 || statusCode == 422) && validationOnly)
 	if !cacheable {
 		matched, err := s.repo.UpdateCAS(ctx,
-			bson.M{"_id": opID, "attempt": attempt, "state": StateProcessing},
+			fenceFilter(ctx, bson.M{"_id": opID, "attempt": attempt, "state": StateProcessing}),
 			bson.M{"$set": bson.M{
 				"processing_expires_at": now, // release: immediate takeover allowed
 				"last_error_code":       httpLikeCode(statusCode),
@@ -501,12 +568,15 @@ func (s *Service) Complete(ctx context.Context, opID primitive.ObjectID, attempt
 			return Operation{}, err
 		}
 		if matched == 0 {
+			if ferr := s.fencedOut(ctx, opID); ferr != nil {
+				return Operation{}, ferr
+			}
 			return Operation{}, s.completionBlocker(ctx, opID, attempt)
 		}
 		return s.Get(ctx, opID)
 	}
 	matched, err := s.repo.UpdateCAS(ctx,
-		bson.M{"_id": opID, "attempt": attempt, "state": StateProcessing},
+		fenceFilter(ctx, bson.M{"_id": opID, "attempt": attempt, "state": StateProcessing}),
 		bson.M{"$set": bson.M{
 			"state":                 StateCompleted,
 			"attempt_state":         AttemptCompleted,
@@ -522,6 +592,9 @@ func (s *Service) Complete(ctx context.Context, opID primitive.ObjectID, attempt
 		return Operation{}, err
 	}
 	if matched == 0 {
+		if ferr := s.fencedOut(ctx, opID); ferr != nil {
+			return Operation{}, ferr
+		}
 		return Operation{}, s.completionBlocker(ctx, opID, attempt)
 	}
 	// Mark the matching attempt-history entry completed (best effort: the
@@ -563,7 +636,7 @@ func (s *Service) MarkTerminal(ctx context.Context, opID primitive.ObjectID, att
 	}
 	now := time.Now().UTC()
 	matched, err := s.repo.UpdateCAS(ctx,
-		bson.M{"_id": opID, "attempt": attempt, "state": StateProcessing, "attempt_state": AttemptProcessing},
+		fenceFilter(ctx, bson.M{"_id": opID, "attempt": attempt, "state": StateProcessing, "attempt_state": AttemptProcessing}),
 		bson.M{"$set": bson.M{
 			"attempt_state":         AttemptTerminal,
 			"terminal_error_code":   errCode,
@@ -574,6 +647,9 @@ func (s *Service) MarkTerminal(ctx context.Context, opID primitive.ObjectID, att
 		return Operation{}, err
 	}
 	if matched == 0 {
+		if ferr := s.fencedOut(ctx, opID); ferr != nil {
+			return Operation{}, ferr
+		}
 		return Operation{}, s.completionBlocker(ctx, opID, attempt)
 	}
 	_, _ = s.repo.UpdateCAS(ctx,

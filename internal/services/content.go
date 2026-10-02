@@ -802,7 +802,10 @@ func (s *ContentService) PublishContent(ctx context.Context, id primitive.Object
 // UnpublishContent unpublishes content and removes static page
 func (s *ContentService) UnpublishContent(ctx context.Context, id primitive.ObjectID) error {
 	if legacyPublicationSaga != nil {
-		return legacyPublicationSaga.Unpublish(ctx, publication.UnpublishRequest{ContentID: id})
+		prov, _ := ProvenanceFromContext(ctx)
+		return legacyPublicationSaga.Unpublish(ctx, publication.UnpublishRequest{
+			ContentID: id, Actor: prov.Actor, Via: prov.Via, AgentSession: prov.AgentSession,
+		})
 	}
 	var content models.Content
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &content); err != nil {

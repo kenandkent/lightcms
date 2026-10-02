@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 
@@ -108,6 +109,7 @@ func (s *Service) RollbackPublication(ctx context.Context, actor Actor, contentI
 	if err != nil {
 		return zero, mapIdemBeginErr(err)
 	}
+	ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 	if op.Replay {
 		m := op.Response
 		str := func(k string) string {

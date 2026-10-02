@@ -349,9 +349,12 @@ func (s *FilesystemStore) cutover(obj StagedObject, canonical string, oldID *pri
 	if canonExisted {
 		// Recoverable backup of the old bytes. A copy (not a move) keeps
 		// the old page serving until the atomic rename below.
+		// POSIX rename(2) replacement is atomic; Windows deployments are
+		// unsupported (MapView/ReplaceFile would be needed there).
 		prev := previousPath(canonical, *oldID)
 		if err := copyFile(prev, canonical); err != nil {
 			_ = os.Remove(next)
+			_ = os.Remove(prev) // drop the partial backup; scanner never sees it
 			return storeErr(CodeIO, "back up canonical to previous", prev, err)
 		}
 		if err := syncDir(filepath.Dir(canonical)); err != nil {

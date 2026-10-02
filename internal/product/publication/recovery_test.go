@@ -731,7 +731,7 @@ func TestRecovery_UnpublishBackupCleaned(t *testing.T) {
 	if _, err := f.store.StageUnpublishBackup(ctx, "/news/backup-clean", pub.ID); err != nil {
 		t.Fatalf("StageUnpublishBackup: %v", err)
 	}
-	if _, err := f.repo.UnpublishCAS(ctx, contentID, nil); err != nil {
+	if _, err := f.repo.UnpublishCAS(ctx, contentID, nil, publication.Attribution{}); err != nil {
 		t.Fatalf("UnpublishCAS: %v", err)
 	}
 

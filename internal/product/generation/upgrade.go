@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 
@@ -357,7 +358,12 @@ func (s *Service) publishUpgradeItem(ctx context.Context, actor Actor, job Upgra
 	if berr != nil {
 		return publication.PublicationResult{}, mapIdemBeginErr(berr)
 	}
+	ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 	if op.Replay {
+		// Resume path returns the frozen identifiers only: the job loop
+		// records PublicationID per item (full result fields are not
+		// needed — the canonical bytes/URL are readable from the live
+		// publication record). Deliberately minimal, not lossy.
 		if hex, ok := op.Response["publication_id"].(string); ok && hex != "" {
 			if pid, perr := primitive.ObjectIDFromHex(hex); perr == nil {
 				return publication.PublicationResult{PublicationID: pid, ContentID: contentID}, nil

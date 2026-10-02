@@ -285,7 +285,7 @@ func TestCoverGapRepositoryValidationAndFaults(t *testing.T) {
 		t.Fatalf("ActivateCAS2: %v", err)
 	}
 	ghost := primitive.NewObjectID()
-	if _, err := repo.UnpublishCAS(ctx, contentID, &ghost); publication.CodeOf(err) != publication.CodeConflict {
+	if _, err := repo.UnpublishCAS(ctx, contentID, &ghost, publication.Attribution{}); publication.CodeOf(err) != publication.CodeConflict {
 		t.Fatalf("UnpublishCAS stale expected: %v", err)
 	}
 }

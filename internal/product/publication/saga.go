@@ -429,6 +429,12 @@ func (s *Service) buildPublishPlan(ctx context.Context, req PublishRequest, cont
 	if err != nil {
 		return nil, err
 	}
+	if useIdem {
+		// Fence all idem mutations below on the freshly read generation:
+		// a takeover between here and Complete/MarkTerminal must fail
+		// loudly instead of writing onto the new owner's attempt.
+		ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
+	}
 	var opID *primitive.ObjectID
 	if useIdem {
 		opID = &op.ID
@@ -505,6 +511,12 @@ func (s *Service) buildRollbackPlan(ctx context.Context, req RollbackRequest, co
 	op, attempt, useIdem, err := s.idemAttempt(ctx, req.IdempotencyRecord)
 	if err != nil {
 		return nil, err
+	}
+	if useIdem {
+		// Fence all idem mutations below on the freshly read generation:
+		// a takeover between here and Complete/MarkTerminal must fail
+		// loudly instead of writing onto the new owner's attempt.
+		ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 	}
 	var opID *primitive.ObjectID
 	if useIdem {
@@ -706,7 +718,11 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 	// idempotency lease, verify we still own it (a takeover by a newer
 	// worker must stop us BEFORE any side effect) and heartbeat it for
 	// the duration of the cutover. Losing the lease cancels ctx: forward
-	// progress stops; compensation paths are ctx-resilient or best-effort.
+	// progress stops. Compensation stays safe under cancellation by
+	// construction — every file step takes `_ context.Context` (Abort,
+	// Delete, CompensateActivate, backup remove/restore all ignore it)
+	// and every Mongo step on these paths is best-effort (`_ =`); the
+	// scanner converges whatever a cancelled worker leaves behind.
 	if plan.opID != nil && s.idem != nil {
 		cur, gerr := s.idem.Get(ctx, *plan.opID)
 		if gerr != nil || cur.State != idempotency.StateProcessing ||
@@ -862,8 +878,9 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 	return s.finishCommit(ctx, plan, oldID)
 }
 
-// failCutover handles a file-cutover failure: the store already restored the
-// previous file when it moved one, so only the attempt record remains.
+// failCutover handles a file-cutover failure: the store never moved the
+// canonical (cutover prepares .next fully before the single atomic rename),
+// so only staged leftovers plus the attempt record remain.
 func (s *Service) failCutover(ctx context.Context, plan *cutoverPlan, staged storage.StagedObject, code, message string, err error) (PublicationResult, error) {
 	_ = s.store.Abort(ctx, staged)
 	_ = s.repo.MarkFailed(ctx, plan.pubID, "cutover: "+message)
@@ -922,8 +939,11 @@ func (s *Service) finishCommit(ctx context.Context, plan *cutoverPlan, oldID *pr
 	}
 	if plan.renamed {
 		if rerr := s.upsertRedirect(ctx, plan.oldPath, plan.fullPath); rerr != nil {
-			// Activation stands; the old canonical is RETAINED (not deleted)
-			// until the redirect exists. Never silently swallow: loud error.
+			// Activation stands; the redirect was already committed
+			// inside the activation transaction, so this backfill only
+			// fails on genuine redirects-collection trouble — loud either
+			// way. The old canonical is RETAINED (not deleted) until the
+			// redirect exists. Never silently swallow: loud error.
 			return PublicationResult{}, sagaErr(CodeRedirectFailed,
 				"page is live at "+plan.fullPath+" but the redirect from "+plan.oldPath+" was not recorded; retry redirect creation", rerr)
 		}

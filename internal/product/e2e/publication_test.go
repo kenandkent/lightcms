@@ -1419,20 +1419,9 @@ func TestE2E_SchedulerStableKey(t *testing.T) {
 
 	// Crashed worker (expired lease, same attempt, no snapshot): the next
 	// tick takes over and converges without a duplicate. Use a fresh page
-	// so the lease belongs to an unfinished attempt.
-	//
-	// BUG PINNED (Task 16D, internal/services/publish_internal.go:96): the
-	// takeover branch declares `op, terr := TakeOverByKey(...)` inside the
-	// case clause, shadowing the outer `op`. The taken-over operation is
-	// discarded and the saga receives the outer ZERO op ID, so every
-	// background crash-takeover fails with IDEMPOTENCY_NOT_FOUND. Worse,
-	// the discarded TakeOverByKey already refreshed the lease (+5m), so the
-	// next tick sees IN_PROGRESS → retry-later; when that lapses the cycle
-	// repeats: a crashed scheduler attempt NEVER converges (livelock with
-	// 5-minute period) until an operator intervenes. Specified fix (not
-	// implemented here — services/ is frozen): assign the outer `op`
-	// (`var terr error; op, terr = ...`). The scanner has no lease role
-	// (file-level only) and cannot break the cycle — recorded below.
+	// so the lease belongs to an unfinished attempt. (R04: the pre-fix
+	// shadowing bug made this fail IDEMPOTENCY_NOT_FOUND in a livelock;
+	// the taken-over op is now assigned and the tick converges.)
 	code, draft2 := e.postJSON("/api/v1/page-generation", map[string]any{
 		"template": "financial-news", "title": "Sched2", "slug": "sched-page-2",
 		"folder_path": "/news", "mode": "draft", "data": map[string]any{"headline": "s2"},
@@ -1453,30 +1442,21 @@ func TestE2E_SchedulerStableKey(t *testing.T) {
 		t.Fatalf("expire: %v", err)
 	}
 	err = e.contentSvc.PublishInternal(ctx, cid2, "scheduler", path, key2)
-	if err == nil || publication.CodeOf(err) != idempotency.CodeNotFound {
-		t.Fatalf("takeover tick = %v, want IDEMPOTENCY_NOT_FOUND (shadowing bug pin)", err)
-	}
-	t.Logf("BUG PINNED: scheduler crash-takeover via PublishInternal fails with IDEMPOTENCY_NOT_FOUND (publish_internal.go:96 shadows the taken-over op)")
-	// The underlying seam is sound: taking over and passing the taken op
-	// explicitly converges with exactly one publication. (The bug's own
-	// discarded takeover refreshed the lease, so expire it again first.)
-	if _, err := e.db.Collection("idempotency_records").UpdateOne(ctx,
-		bson.M{"owner": "scheduler", "path": path, "key": key2},
-		bson.M{"$set": bson.M{"processing_expires_at": time.Now().Add(-time.Second)}}); err != nil {
-		t.Fatalf("re-expire: %v", err)
-	}
-	taken, err := e.idem.TakeOverByKey(ctx, "scheduler", "POST", path, key2)
 	if err != nil {
-		t.Fatalf("manual takeover: %v", err)
-	}
-	if _, err := e.saga.Publish(ctx, publication.PublishRequest{ContentID: cid2, IdempotencyRecord: &taken.ID}); err != nil {
-		t.Fatalf("seam publish with taken op: %v", err)
+		t.Fatalf("takeover tick must converge after the R04 shadowing fix, got: %v", err)
 	}
 	if n := e.count("content_publications", bson.M{"content_id": cid2}); n != 1 {
-		t.Fatalf("takeover publications = %d, want 1", n)
+		t.Fatalf("takeover publications = %d, want exactly 1", n)
 	}
 	if active := e.activePub(t, cid2); active == nil {
 		t.Fatal("takeover tick left no active publication")
+	}
+	// Same key again replays through PublishInternal (no duplicate).
+	if err := e.contentSvc.PublishInternal(ctx, cid2, "scheduler", path, key2); err != nil {
+		t.Fatalf("post-takeover replay: %v", err)
+	}
+	if n := e.count("content_publications", bson.M{"content_id": cid2}); n != 1 {
+		t.Fatalf("replay publications = %d, want still 1", n)
 	}
 	// Scanner's role is file-level only (no lease ownership): nothing to
 	// repair after clean scheduler ticks.

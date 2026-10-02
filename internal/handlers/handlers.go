@@ -1789,6 +1789,7 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	} else if intentUnpublish {
 		if perr := h.publicationService.Unpublish(ctx, publication.UnpublishRequest{
 			ContentID: id,
+			Actor:     "human", Via: "ui",
 		}); perr != nil {
 			publishFailed = true
 			publishFailureCode = publication.CodeOf(perr)

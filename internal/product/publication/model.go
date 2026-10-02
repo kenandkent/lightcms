@@ -199,6 +199,19 @@ type PublicationResult struct {
 type UnpublishRequest struct {
 	ContentID        primitive.ObjectID
 	ExpectedActiveID *primitive.ObjectID
+	// Caller attribution, same contract as PublishRequest (recorded on
+	// the unpublished row and the outbox event; empty = unattributed).
+	Actor        string
+	Via          string
+	AgentSession string
+}
+
+// Attribution carries caller identity for repository writes that stamp
+// actor fields (unpublish flows). Empty = unattributed (omitted on write).
+type Attribution struct {
+	Actor        string
+	Via          string
+	AgentSession string
 }
 
 type RollbackRequest struct {

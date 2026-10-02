@@ -17,25 +17,6 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
-// publish implements mode=publish (§20.6): direct authorized command through
-// PublicationService — replace Main Content + new Version + Publication, never
-// a transient Fork. It owns Begin/Bind/Complete around the saga (Task 11
-// handoff): callers must Complete (the saga never does), re-bind per attempt,
-// never TakeOver a terminal attempt, and attest purity/secrets (Complete
-// trusts the caller — this file only marks pure pre-mutation 422 as
-// validationOnly and never stores secrets in the cached response).
-func (s *Service) publish(ctx context.Context, actor Actor, tv templatecontract.TemplateVersion, live *models.Content, active *publication.Publication, published, targetExists bool, fullPath, slug, folderPath, title, canonical string, data map[string]any, warns []templatecontract.FieldWarning, req GenerateRequest, idemParams IdempotencyParams) (GenerateResponse, error) {
-	op, berr := s.beginForPublish(ctx, actor, req, tv, idemParams)
-	if berr != nil {
-		var zero GenerateResponse
-		return zero, berr
-	}
-	if op.Replay {
-		return responseFromCache(op)
-	}
-	return s.publishWithOp(ctx, actor, tv, live, active, published, targetExists, fullPath, slug, folderPath, title, canonical, data, warns, req, idemParams, &op)
-}
-
 func (s *Service) publishWithOp(ctx context.Context, actor Actor, tv templatecontract.TemplateVersion, live *models.Content, active *publication.Publication, published, targetExists bool, fullPath, slug, folderPath, title, canonical string, data map[string]any, warns []templatecontract.FieldWarning, req GenerateRequest, idemParams IdempotencyParams, op *idempotency.Operation) (GenerateResponse, error) {
 	var zero GenerateResponse
 	if s.idem == nil {
@@ -61,11 +42,15 @@ func (s *Service) publishWithOp(ctx context.Context, actor Actor, tv templatecon
 		// missing or moved row is corruption: fail loudly, never rewrite.
 		var bound models.Content
 		if err := s.db.FindOne(ctx, "content", bson.M{"_id": *op.ContentID}, &bound); err != nil {
-			return zero, genErr(CodeInternal, "idempotency-bound content is missing; refusing to rewrite", err)
+			berr := genErr(CodeInternal, "idempotency-bound content is missing; refusing to rewrite", err)
+			s.completePublishError(ctx, *op, berr)
+			return zero, berr
 		}
 		if bound.CurrentVersion != op.ContentVersion {
-			return zero, genErr(CodeContentVersionConflict,
+			berr := genErr(CodeContentVersionConflict,
 				fmt.Sprintf("bound content version %d moved to %d; retry with a new key", op.ContentVersion, bound.CurrentVersion), nil)
+			s.completePublishError(ctx, *op, berr)
+			return zero, berr
 		}
 		contentID, contentVersion = *op.ContentID, op.ContentVersion
 		isCreate = contentVersion == 1
@@ -272,6 +257,8 @@ func mapIdemBeginErr(err error) error {
 		return genErr(CodeIdempotencyConflict, "same Idempotency-Key with a different request body", err)
 	case idempotency.CodeInProgress, idempotency.CodeLeaseActive:
 		return &Error{Code: CodeRequestInProgress, Message: "operation is already being executed", RetryAfter: 5, Err: err}
+	case idempotency.CodeLeaseLost:
+		return &Error{Code: CodeRequestInProgress, Message: "lease lost to a newer worker; retry to take over", RetryAfter: 1, Err: err}
 	case idempotency.CodeLeaseExpired:
 		return &Error{Code: CodeRequestInProgress, Message: "worker lease expired; retry to take over the same attempt", RetryAfter: 1, Err: err}
 	default:

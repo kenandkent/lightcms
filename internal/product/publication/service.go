@@ -306,7 +306,8 @@ func (s *Service) Unpublish(ctx context.Context, req UnpublishRequest) error {
 		}
 	}
 
-	did, err := s.repo.UnpublishCAS(ctx, req.ContentID, req.ExpectedActiveID)
+	did, err := s.repo.UnpublishCAS(ctx, req.ContentID, req.ExpectedActiveID,
+		Attribution{Actor: req.Actor, Via: req.Via, AgentSession: req.AgentSession})
 	if err != nil {
 		// R11 symmetric with publish: determine whether the transaction
 		// took effect before touching files. Still-active ⇒ the txn did

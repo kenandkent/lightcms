@@ -653,6 +653,16 @@ func (db *DB) EnsureProductIndexes(ctx context.Context) error {
 		return err
 	}
 
+	// 8. Forks: sandbox resolver lookup {created_by, agent_session, status}
+	// runs per mode=sandbox request — index it (R09). Small collection;
+	// safe to build inline.
+	if err := create("content_forks", mongo.IndexModel{
+		Keys:    bson.D{{Key: "created_by", Value: 1}, {Key: "agent_session", Value: 1}, {Key: "status", Value: 1}},
+		Options: options.Index().SetName("content_forks_owner_session_status"),
+	}); err != nil {
+		return err
+	}
+
 	return nil
 }
 

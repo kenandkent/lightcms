@@ -36,10 +36,10 @@ const instanceLivenessCollection = "instance_liveness"
 // as "live" (and the TTL the index enforces server-side). Vars (not consts)
 // so tests can shrink the refresh interval.
 var (
-	instanceHeartbeatInterval     = 60 * time.Second
-	instanceLivenessWindow        = 600 * time.Second
-	instanceLivenessTTLSeconds    int32 = 600
-	instanceLivenessIndexName           = "instance_liveness_heartbeat_ttl"
+	instanceHeartbeatInterval        = 60 * time.Second
+	instanceLivenessWindow           = 600 * time.Second
+	instanceLivenessTTLSeconds int32 = 600
+	instanceLivenessIndexName        = "instance_liveness_heartbeat_ttl"
 )
 
 // newInstanceID builds a unique-per-boot instance identity from
@@ -99,8 +99,9 @@ func refreshInstanceHeartbeat(ctx context.Context, db *database.DB, coll, instan
 // fails when another instance holds a heartbeat within the liveness window.
 // On success it starts a background goroutine refreshing our heartbeat
 // every instanceHeartbeatInterval; the returned stop func halts it (stop is
-// idempotent and only stops the refresher — the record is left for TTL
-// expiry so a crash never looks like a clean leave).
+// idempotent) and best-effort deletes our own record so clean restarts never
+// meet their own pre-stop heartbeat (guarded by started_at; crashes still
+// rely on TTL expiry plus stale-local reaping).
 func enforceSingleInstance(ctx context.Context, db *database.DB, instanceID string, version string) (func(), error) {
 	return enforceSingleInstanceOnCollection(ctx, db, instanceLivenessCollection, instanceID, version)
 }
@@ -125,28 +126,59 @@ func enforceSingleInstanceOnCollection(ctx context.Context, db *database.DB, col
 	); err != nil {
 		return nil, fmt.Errorf("single-instance gate: register instance: %w", err)
 	}
-	// Any rival with a heartbeat inside the liveness window blocks boot.
-	var rival struct {
-		ID string `bson:"_id"`
-	}
-	rivalErr := db.Collection(coll).FindOne(ctx,
+	// Every rival with a heartbeat inside the liveness window blocks boot —
+	// EXCEPT stale incarnations on this host whose processes are gone
+	// (clean restarts must not trip over their own pre-stop heartbeat;
+	// crash recovery must not wait out the TTL). ALL fresh rivals are
+	// examined: reaping one stale local record must never green-light
+	// booting alongside a live one (split-brain).
+	var rivalIDs []string
+	cursor, cerr := db.Collection(coll).Find(ctx,
 		bson.M{
 			"_id":            bson.M{"$ne": instanceID},
 			"last_heartbeat": bson.M{"$gte": now.Add(-instanceLivenessWindow)},
 		},
-		options.FindOne().SetProjection(bson.M{"_id": 1}),
-	).Decode(&rival)
-	switch {
-	case rivalErr == nil:
+		options.Find().SetProjection(bson.M{"_id": 1}))
+	if cerr != nil {
+		_, _ = db.Collection(coll).DeleteOne(ctx, bson.M{"_id": instanceID})
+		return nil, fmt.Errorf("single-instance gate: list rival instances: %w", cerr)
+	}
+	for cursor.Next(ctx) {
+		var r struct {
+			ID string `bson:"_id"`
+		}
+		if derr := cursor.Decode(&r); derr != nil || r.ID == "" {
+			// Undecodable/foreign record: fail closed, count it live.
+			rivalIDs = append(rivalIDs, "<undecodable-liveness-record>")
+			continue
+		}
+		rivalIDs = append(rivalIDs, r.ID)
+	}
+	cursor.Close(ctx)
+	if cerr := cursor.Err(); cerr != nil {
+		_, _ = db.Collection(coll).DeleteOne(ctx, bson.M{"_id": instanceID})
+		return nil, fmt.Errorf("single-instance gate: list rival instances: %w", cerr)
+	}
+	var liveRivals []string
+	for _, rid := range rivalIDs {
+		if host, pid, ok := parseInstanceID(rid); ok && host == localHostname() && !pidAlive(pid) {
+			// Stale local incarnation: reap it and continue scanning.
+			// Best effort: a failed reap fails closed below.
+			if _, derr := db.Collection(coll).DeleteOne(ctx, bson.M{"_id": rid}); derr != nil {
+				liveRivals = append(liveRivals, rid+" (reap failed)")
+				continue
+			}
+			log.Printf("WARNING: single-instance gate reaped stale local incarnation %q (process %d gone); continuing scan", rid, pid)
+			continue
+		}
+		liveRivals = append(liveRivals, rid)
+	}
+	if len(liveRivals) > 0 {
 		// Remove our own probe so a rejected starter leaves no fresh
 		// heartbeat behind (otherwise the next restart would trip over
 		// our own litter and flap until the window passes).
 		_, _ = db.Collection(coll).DeleteOne(ctx, bson.M{"_id": instanceID})
-		return nil, fmt.Errorf("instance %q is already running: multi-instance deployment is unsupported: run a single instance", rival.ID)
-	case rivalErr == mongo.ErrNoDocuments:
-		// Sole live instance — proceed.
-	default:
-		return nil, fmt.Errorf("single-instance gate: check rival instances: %w", rivalErr)
+		return nil, fmt.Errorf("instance %q is already running: multi-instance deployment is unsupported: run a single instance", liveRivals[0])
 	}
 
 	interval := instanceHeartbeatInterval
@@ -157,6 +189,16 @@ func enforceSingleInstanceOnCollection(ctx context.Context, db *database.DB, col
 	var once sync.Once
 	stop := func() {
 		once.Do(func() { close(stopCh) })
+		// Best-effort self-removal so clean restarts never meet their own
+		// pre-stop heartbeat (crashes still rely on TTL + stale reaping).
+		// Guarded by started_at: never delete a newer incarnation that
+		// reused this ID. Uses a fresh context: the caller may already
+		// be shutting down.
+		dctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = db.Collection(coll).DeleteOne(dctx, bson.M{
+			"_id": instanceID, "started_at": bson.M{"$lte": now},
+		})
 	}
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -175,6 +217,49 @@ func enforceSingleInstanceOnCollection(ctx context.Context, db *database.DB, col
 		}
 	}()
 	return stop, nil
+}
+
+// localHostname returns the OS hostname or "unknown" (same fallback as
+// newInstanceID so the comparison matches what boot wrote).
+func localHostname() string {
+	host, _ := os.Hostname()
+	if strings.TrimSpace(host) == "" {
+		host = "unknown"
+	}
+	return host
+}
+
+// parseInstanceID splits a newInstanceID-shaped identity ("host-pid-ts")
+// from the right (hostnames may contain dashes). ok=false for foreign
+// shapes — those always fail closed.
+func parseInstanceID(id string) (host string, pid int, ok bool) {
+	i := strings.LastIndex(id, "-")
+	if i < 0 {
+		return "", 0, false
+	}
+	ts := id[i+1:]
+	j := strings.LastIndex(id[:i], "-")
+	if j < 0 {
+		return "", 0, false
+	}
+	var pid64 int64
+	var err error
+	host, pidStr := id[:j], id[j+1:i]
+	if host == "" || pidStr == "" || ts == "" {
+		return "", 0, false
+	}
+	for _, c := range []byte(pidStr + ts) {
+		if c < '0' || c > '9' {
+			return "", 0, false
+		}
+	}
+	var n int
+	if n, err = fmt.Sscanf(pidStr, "%d", &pid64); n != 1 || err != nil || pid64 <= 0 {
+		return "", 0, false
+	}
+	pid = int(pid64)
+	_ = ts
+	return host, pid, true
 }
 
 // requireProductionBaseURL enforces the R12 production startup rule:

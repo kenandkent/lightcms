@@ -478,3 +478,97 @@ func TestAdminPublishIdempotencyAndAttribution(t *testing.T) {
 		t.Fatalf("checkbox publish attribution = %v (want human/ui)", pub)
 	}
 }
+
+// Unpublish attribution: the unpublished row and the outbox event carry
+// actor/via/session (previously unattributed — blind to session rollback).
+func TestUnpublishAttribution(t *testing.T) {
+	ah, db, cleanup, ids := setup2APublish(t, 1)
+	defer cleanup()
+	ctx := context.Background()
+	admin := &auth.SessionUser{ID: primitive.NewObjectID().Hex(), Email: "admin@test", Role: "admin"}
+	id := ids[0]
+
+	pubCall := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/api/v1/content/"+id.Hex()+"/publish", strings.NewReader(""))
+		req = mux.SetURLVars(req, map[string]string{"id": id.Hex()})
+		req = req.WithContext(middleware.InjectAPIUser(req.Context(), admin))
+		req.Header.Set("Idempotency-Key", "k-unpub-attr")
+		req.Header.Set("X-Agent-Session", "sess-unpub")
+		rr := httptest.NewRecorder()
+		ah.APIPublishContent(rr, req)
+		return rr
+	}
+	if rr := pubCall(); rr.Code != http.StatusOK {
+		t.Fatalf("publish: got %d (%s)", rr.Code, rr.Body.String())
+	}
+	req := httptest.NewRequest("POST", "/api/v1/content/"+id.Hex()+"/unpublish", strings.NewReader(""))
+	req = mux.SetURLVars(req, map[string]string{"id": id.Hex()})
+	req = req.WithContext(middleware.InjectAPIUser(req.Context(), admin))
+	req.Header.Set("X-Agent-Session", "sess-unpub")
+	rr := httptest.NewRecorder()
+	ah.APIUnpublishContent(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unpublish: got %d (%s)", rr.Code, rr.Body.String())
+	}
+	var pub bson.M
+	if err := db.Collection("content_publications").FindOne(ctx,
+		bson.M{"content_id": id, "status": "unpublished"}).Decode(&pub); err != nil {
+		t.Fatalf("unpublished row: %v", err)
+	}
+	if pub["actor"] != "agent" || pub["via"] != "api" || pub["agent_session"] != "sess-unpub" {
+		t.Fatalf("unpublished attribution = %v (want agent/api/sess-unpub)", pub)
+	}
+	var evt bson.M
+	if err := db.Collection("webhook_outbox").FindOne(ctx,
+		bson.M{"event_type": "content.unpublish"}).Decode(&evt); err != nil {
+		t.Fatalf("unpublish outbox event: %v", err)
+	}
+	payload, _ := evt["payload"].(bson.M)
+	if payload["actor"] != "agent" || payload["agent_session"] != "sess-unpub" {
+		t.Fatalf("unpublish event payload = %v (want actor/session)", payload)
+	}
+}
+
+// Upsert restating an already-live flag is allowed (no state change);
+// flipping a draft via upsert is rejected like create.
+func TestUpsertRestatementAllowed(t *testing.T) {
+	ah, db, cleanup, ids := setup2APublish(t, 1)
+	defer cleanup()
+	ctx := context.Background()
+	admin := &auth.SessionUser{ID: primitive.NewObjectID().Hex(), Email: "admin@test", Role: "admin"}
+	var tpl bson.M
+	if err := db.Collection("templates").FindOne(ctx, bson.M{}).Decode(&tpl); err != nil {
+		t.Fatalf("template: %v", err)
+	}
+	callUpsert := func(slug string, published bool) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(map[string]any{
+			"template_id": tpl["_id"].(primitive.ObjectID).Hex(),
+			"title": "Upsert", "slug": slug, "folder_path": "/news",
+			"published": published, "upsert": true,
+		})
+		req := httptest.NewRequest("POST", "/api/v1/content", strings.NewReader(string(raw)))
+		req.Header.Set("Content-Type", "application/json")
+		req = req.WithContext(middleware.InjectAPIUser(req.Context(), admin))
+		rr := httptest.NewRecorder()
+		ah.APICreateContent(rr, req)
+		return rr
+	}
+	// New path + published:true via upsert → 400.
+	if rr := callUpsert("upsert-new", true); rr.Code != http.StatusBadRequest {
+		t.Fatalf("upsert flip on new path: got %d, want 400 (%s)", rr.Code, rr.Body.String())
+	}
+	// Live the row directly, then restate → allowed.
+	id := ids[0]
+	if _, err := db.Collection("content").UpdateOne(ctx, bson.M{"_id": id},
+		bson.M{"$set": bson.M{"published": true}}); err != nil {
+		t.Fatalf("pre-live: %v", err)
+	}
+	var live bson.M
+	if err := db.Collection("content").FindOne(ctx, bson.M{"_id": id}).Decode(&live); err != nil {
+		t.Fatalf("load live: %v", err)
+	}
+	slug, _ := live["slug"].(string)
+	if rr := callUpsert(slug, true); rr.Code != http.StatusOK {
+		t.Fatalf("upsert restatement on live row: got %d, want 200 (%s)", rr.Code, rr.Body.String())
+	}
+}

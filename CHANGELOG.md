@@ -56,6 +56,14 @@ All notable changes to LightCMS are documented here, organized by version.
 - **Serving + admin RBAC gaps**: `ServePage` filters soft-deleted rows; all mutating admin endpoints (assets, folders, collections, redirects, settings, keys, messages, link tools, search-replace) enforce their API-matrix permissions; copilot publish requires edit + publish; middleware 401s carry sibling codes.
 - **Provenance gaps closed**: REST single/batch publish, admin form/API publishes, comments, and deletes now attribute actor/via/session (or preserve middleware stamps); admin publish carries an idempotency key with takeover/resume; single-point writes reject `published:true` (fork rows exempt — the flag is inert there and merge clears it); CAS losses map to 409; embedding batch excludes forks and projects; legacy `printf "%q"` double-escape fixed.
 
+### Fixed — review-feedback round (same release)
+- **Lease fencing (R07 complete)**: `Complete`/`MarkTerminal`/`Bind`/`Freeze` CAS on the caller-owned lease generation (carried via context, backward compatible when absent) — a stale worker can no longer write onto a taken-over attempt (`IDEMPOTENCY_LEASE_LOST`); `Begin` retries the TTL-expiry race instead of handing out an unpersisted ID; publish-side binding failures release the lease.
+- **Unpublish attribution**: `UnpublishRequest` carries actor/via/session into the unpublished row and the outbox event; saga audit merges request provenance/session.
+- **Single-instance gate hardening (R10)**: multi-rival scan (a stale local reap never masks a live rival), same-host dead-pid reaping with fail-closed parsing, graceful self-removal guarded by `started_at`, `prod` env covered by the HTTPS gate.
+- **Error-code unification**: middleware table aligned to `defaultErrorCode` (403 `PERMISSION_DENIED`, 422 `VALIDATION_FAILED`, 503 `SERVICE_UNAVAILABLE`); bulk per-item failures carry machine codes; validation-cache replays rebuild their 422 with field details (BSON-safe decode).
+- **Background crash-takeover**: fixed the `PublishInternal` shadowed-op bug that wedged every scheduler crash retry on `IDEMPOTENCY_NOT_FOUND` — takeovers now converge with exactly one publication (pinned e2e verdicts revised to the fixed behavior).
+- Minor: `InsertStaged` tolerance compares path/template; admin `ACTIVATION_UNKNOWN` retryable; `content_forks` resolver index; embedding stats exclude forks; `lc:query`/snapshot drift documented; dead `publish()` removed.
+
 ---
 
 ## [7.2.2] - 2026-07-07

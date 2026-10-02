@@ -276,8 +276,20 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 	// Draft-only single-write rule (bulk parity): published:true would
 	// persist a live flag with no Publication record/outbox/idempotency.
 	// Fork-scoped creates are exempt: the flag is inert on fork rows
-	// (never served, never generated; merge clears it).
-	if req.ForkID == "" && a.rejectPublishedDirectWrite(w, false, req.Published) {
+	// (never served, never generated; merge clears it). Upsert restating
+	// an already-live flag is allowed (no state change, update parity) —
+	// the path math mirrors ContentService.UpsertContent exactly.
+	if req.ForkID == "" && req.Published && req.Upsert {
+		upsertPath := "/" + req.Slug
+		if req.FolderPath != "" && req.FolderPath != "/" {
+			upsertPath = req.FolderPath + "/" + req.Slug
+		}
+		if existing, uerr := a.contentService.GetContentByPath(r.Context(), upsertPath); uerr != nil || !existing.Published {
+			if a.rejectPublishedDirectWrite(w, false, true) {
+				return
+			}
+		}
+	} else if req.ForkID == "" && a.rejectPublishedDirectWrite(w, false, req.Published) {
 		return
 	}
 
@@ -579,6 +591,25 @@ func (a *APIHandler) contentWriteError(w http.ResponseWriter, err error) {
 	a.jsonError(w, http.StatusInternalServerError, err.Error())
 }
 
+// withBulkFailCode adds a machine-readable code to a batch-publish failure
+// entry (omitted when the error carries none).
+func withBulkFailCode(m map[string]string, code string) map[string]string {
+	if code != "" {
+		m["code"] = code
+	}
+	return m
+}
+
+// bulkItemCode attaches a machine-readable code to bulk per-item failures:
+// CAS losers map to CONFLICT (M11 parity with single writes); anything
+// else omits the code (the human message stays authoritative).
+func bulkItemCode(err error) string {
+	if errors.Is(err, services.ErrVersionConflict) {
+		return "CONFLICT"
+	}
+	return ""
+}
+
 // rejectPublishedDirectWrite enforces the draft-only single-write rule (Wave
 // 2B bulk parity): flipping published false→true outside the publish
 // endpoints would persist a live flag with no Publication record, no outbox
@@ -757,7 +788,10 @@ func (a *APIHandler) APIUnpublishContent(w http.ResponseWriter, r *http.Request)
 
 	// Task 16C: Unpublish is naturally idempotent — no Idempotency-Key.
 	if a.publicationService != nil {
-		if err := a.publicationService.Unpublish(r.Context(), publication.UnpublishRequest{ContentID: id}); err != nil {
+		pubActor, pubVia, pubSession := publishAttribution(r)
+		if err := a.publicationService.Unpublish(r.Context(), publication.UnpublishRequest{
+			ContentID: id, Actor: pubActor, Via: pubVia, AgentSession: pubSession,
+		}); err != nil {
 			f := a.publicationReqFields(r, "unpublish", t0)
 			f.ContentID = id.Hex()
 			f.StatusCode, f.ErrorCode = publicationHTTPStatus(err), publication.CodeOf(err)
@@ -1483,7 +1517,7 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 				itemPath := strings.TrimSuffix(strings.TrimSpace(r.URL.Path), "/") + "/items/" + id.Hex()
 				op, berr := a.idempotencyService.Begin(r.Context(), owner, r.Method, itemPath, key, nil)
 				if berr != nil {
-					failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(berr)})
+					failed = append(failed, withBulkFailCode(map[string]string{"id": id.Hex(), "error": sanitizeAPIError(berr)}, publication.CodeOf(berr)))
 					continue
 				}
 				if op.Replay && op.Response != nil {
@@ -1505,7 +1539,7 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 			}
 			res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID, Actor: pubActor, Via: pubVia, AgentSession: pubSession, AuthorIsAdmin: pubAdmin})
 			if perr != nil {
-				failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(perr)})
+				failed = append(failed, withBulkFailCode(map[string]string{"id": id.Hex(), "error": sanitizeAPIError(perr)}, publication.CodeOf(perr)))
 			} else {
 				if opID != nil && a.idempotencyService != nil {
 					_, _ = a.idempotencyService.Complete(r.Context(), *opID, opAttempt, 200, map[string]any{
@@ -1534,7 +1568,7 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 	}
 	for _, id := range ids {
 		if err := a.contentService.PublishContent(r.Context(), id); err != nil {
-			failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(err)})
+			failed = append(failed, withBulkFailCode(map[string]string{"id": id.Hex(), "error": sanitizeAPIError(err)}, publication.CodeOf(err)))
 		} else {
 			published = append(published, id.Hex())
 		}
@@ -2228,13 +2262,14 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 			Action   string `json:"action"`
 			Success  bool   `json:"success"`
 			Error    string `json:"error,omitempty"`
+			Code     string `json:"code,omitempty"`
 		}
 		results := make([]upsertResult, len(items))
 		succeeded := 0
 		for i, c := range items {
 			created, err := a.contentService.UpsertContent(r.Context(), c, req.VersionComment)
 			if err != nil {
-				results[i] = upsertResult{Index: i, Success: false, Error: sanitizeAPIError(err)}
+				results[i] = upsertResult{Index: i, Success: false, Error: sanitizeAPIError(err), Code: bulkItemCode(err)}
 			} else {
 				action := "updated"
 				if created {
@@ -2323,6 +2358,7 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 		ID      string `json:"id"`
 		Success bool   `json:"success"`
 		Error   string `json:"error,omitempty"`
+		Code    string `json:"code,omitempty"`
 	}
 
 	// Parse all IDs up front so we can batch-fetch content in one query.
@@ -2444,7 +2480,7 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 					}
 					var res UpdateResult
 					if err := a.contentService.UpdateContent(r.Context(), c, versionComment); err != nil {
-						res = UpdateResult{ID: job.upd.ID, Success: false, Error: sanitizeAPIError(err)}
+						res = UpdateResult{ID: job.upd.ID, Success: false, Error: sanitizeAPIError(err), Code: bulkItemCode(err)}
 					} else {
 						res = UpdateResult{ID: job.upd.ID, Success: true}
 					}
@@ -2574,6 +2610,7 @@ func (a *APIHandler) APIBulkFieldOperation(w http.ResponseWriter, r *http.Reques
 		Success  bool   `json:"success"`
 		HasValue bool   `json:"has_value,omitempty"` // dry_run only: whether the field currently has a non-empty value
 		Error    string `json:"error,omitempty"`
+		Code     string `json:"code,omitempty"`
 	}
 
 	results := make([]ItemResult, len(contents))
@@ -2635,7 +2672,7 @@ func (a *APIHandler) APIBulkFieldOperation(w http.ResponseWriter, r *http.Reques
 					c.Data[req.Field] = newVal
 					var res ItemResult
 					if err := a.contentService.UpdateContent(r.Context(), &c, versionComment); err != nil {
-						res = ItemResult{ID: c.ID.Hex(), Title: c.Title, FullPath: c.FullPath, Success: false, Error: sanitizeAPIError(err)}
+						res = ItemResult{ID: c.ID.Hex(), Title: c.Title, FullPath: c.FullPath, Success: false, Error: sanitizeAPIError(err), Code: bulkItemCode(err)}
 					} else {
 						res = ItemResult{ID: c.ID.Hex(), Title: c.Title, FullPath: c.FullPath, Success: true}
 					}

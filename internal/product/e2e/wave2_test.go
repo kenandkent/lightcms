@@ -184,6 +184,23 @@ func TestE2E_ValidationReplay(t *testing.T) {
 	if errorCodeOf(r1) != "FIELD_VALIDATION_FAILED" || errorCodeOf(r2) != "FIELD_VALIDATION_FAILED" {
 		t.Fatalf("codes = %q/%q", errorCodeOf(r1), errorCodeOf(r2))
 	}
+	// The replayed 422 carries the cached field details (BSON round trip
+	// preserves them — a details-stripped replay would hide which field
+	// failed). Errors nest under the "error" envelope key.
+	for i, r := range []map[string]any{r1, r2} {
+		env, ok := r["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("replay %d: error envelope missing: %v", i+1, r)
+		}
+		det, ok := env["details"].([]any)
+		if !ok || len(det) == 0 {
+			t.Fatalf("replay %d: details missing: %v", i+1, r)
+		}
+		first, ok := det[0].(map[string]any)
+		if !ok || first["field"] != "headline" {
+			t.Fatalf("replay %d: details[0] = %v, want headline field", i+1, det[0])
+		}
+	}
 	if n := e.count("content", bson.M{}); n != 0 {
 		t.Fatal("invalid publish created content")
 	}

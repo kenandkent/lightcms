@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -86,23 +85,18 @@ func TestConBuildSHAProvenance(t *testing.T) {
 }
 
 // TestConSchedulerCrashTakeover locks verdict 5: what the scheduler-tick
-// crash-lease TakeOver path does TODAY. Observed behavior (Task 16, still
-// present at internal/services/publish_internal.go `op, terr :=
-// TakeOverByKey(...)` inside the lease-expired case, shadowing the outer
-// op): a scheduler tick that takes over a crashed (expired-lease) attempt
-// via PublishInternal FAILS with IDEMPOTENCY_NOT_FOUND — the taken-over
-// operation is discarded and the saga receives the zero op ID. The failed
-// tick mints nothing, and the recovery scanner takes NO lease role
-// (file-level repair only): ScanOnce reports a clean pass with nothing to
-// repair.
+// crash-lease TakeOver path does. Historical behavior (Task 16 bug, since
+// fixed): the takeover branch declared `op, terr := TakeOverByKey(...)`
+// inside the case clause, shadowing the outer op — the taken-over operation
+// was discarded, the saga received the zero op ID, and every background
+// crash-takeover failed with IDEMPOTENCY_NOT_FOUND (livelock with 5-minute
+// period until operator intervention).
 //
-// Recorded gap (not fixed here — services/ is frozen for 17C): the crashed
-// scheduler attempt never converges via PublishInternal (the discarded
-// takeover already refreshed the lease, so the next tick sees IN_PROGRESS
-// → retry-later until it lapses again). Specified fix: assign the outer op
-// (`op, terr = ...`). Task 19 must decide: fix-and-retry vs. scanner-owned
-// lease repair. This test fails if the behavior changes either way
-// (silent convergence OR a new error code), forcing an explicit decision.
+// R04 verdict (fix-and-retry — the Task 19 decision): the taken-over op is
+// assigned to the outer variable, the tick converges with exactly one
+// publication, and a same-key retry replays. The recovery scanner takes NO
+// lease role (file-level repair only): ScanOnce reports a clean pass with
+// nothing to repair.
 func TestConSchedulerCrashTakeover(t *testing.T) {
 	e := newEnv(t, envOpts{})
 	e.seedTemplate(t, "financial-news")
@@ -133,21 +127,20 @@ func TestConSchedulerCrashTakeover(t *testing.T) {
 		t.Fatalf("expire lease: %v", err)
 	}
 
-	// Tick 2 (takeover): lock the CURRENT observed failure.
-	err = e.contentSvc.PublishInternal(ctx, cid, "scheduler", path, key)
-	if err == nil {
-		t.Fatal("takeover tick converged — behavior changed (shadowing fix landed without a verdict update); revise this lock and record the Task 19 decision")
-	}
-	if got := publication.CodeOf(err); got != idempotency.CodeNotFound {
-		t.Fatalf("takeover tick = %v (code %q), want IDEMPOTENCY_NOT_FOUND (observed behavior changed)", err, got)
+	// Tick 2 (takeover): the R04 shadowing fix assigns the taken-over op to
+	// the outer variable, so the crashed attempt converges instead of
+	// failing IDEMPOTENCY_NOT_FOUND (Task 19 decision: fix-and-retry).
+	if err = e.contentSvc.PublishInternal(ctx, cid, "scheduler", path, key); err != nil {
+		t.Fatalf("takeover tick: %v (want convergence)", err)
 	}
 
-	// Zero side effects: the failed tick minted no publication.
-	if n := e.count("content_publications", bson.M{"content_id": cid}); n != 0 {
-		t.Fatalf("takeover tick minted %d publications, want 0", n)
+	// Exactly one publication, and it is active: no duplicates from the
+	// takeover.
+	if n := e.count("content_publications", bson.M{"content_id": cid}); n != 1 {
+		t.Fatalf("takeover tick minted %d publications, want 1", n)
 	}
-	if active := e.activePub(t, cid); active != nil {
-		t.Fatalf("takeover tick activated %s, want no active publication", active.ID.Hex())
+	if active := e.activePub(t, cid); active == nil {
+		t.Fatal("takeover tick left no active publication")
 	}
 
 	// Scanner side: no lease ownership — ScanOnce neither repairs nor
@@ -166,7 +159,7 @@ func TestConSchedulerCrashTakeover(t *testing.T) {
 	if rep.ContentsSkippedLocked != 0 {
 		t.Fatalf("scanner skipped locked content (no saga holds a lock): %+v", rep)
 	}
-	t.Logf("VERDICT 5 LOCKED: PublishInternal crash-takeover fails IDEMPOTENCY_NOT_FOUND with zero side effects; scanner is file-level only (clean pass, no lease role). Gap recorded: attempt never converges — Task 19 decision required.")
+	t.Logf("VERDICT 5 LOCKED (revised R04): PublishInternal crash-takeover converges with exactly one publication and an active pointer (fix-and-retry — the Task 19 decision); scanner is file-level only (clean pass, no lease role).")
 }
 
 // TestConOutboxPublicURLDelivered locks verdict 6 end to end: publish via

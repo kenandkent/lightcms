@@ -668,6 +668,10 @@ func (s *SearchService) BatchGenerateEmbeddings(ctx context.Context) (processed,
 	proj := options.Find().SetProjection(bson.M{
 		"data": 1, "plain_text": 1, "embedding_at": 1, "updated_at": 1,
 		"current_version": 1, "embedding_version": 1, "full_path": 1,
+		// Title + meta feed ExtractPlainText: omitting them recomputes a
+		// truncated text, which would both regenerate embeddings every
+		// run and persist a damaged plain_text back.
+		"title": 1, "meta_description": 1,
 	})
 	cursor, err := s.db.FindMany(ctx, "content", filter, proj)
 	if err != nil {
@@ -723,9 +727,11 @@ func (s *SearchService) BatchGenerateEmbeddings(ctx context.Context) (processed,
 	return processed, errCount, nil
 }
 
-// EmbeddingStats returns counts of content with and without embeddings
+// EmbeddingStats returns counts of content with and without embeddings.
+// Both filters match the BatchGenerateEmbeddings membership (published,
+// not deleted, not a fork copy) so monitoring agrees with the indexer.
 func (s *SearchService) EmbeddingStats(ctx context.Context) (total, withEmbedding int64, err error) {
-	publishedFilter := bson.M{"published": true, "deleted": bson.M{"$ne": true}}
+	publishedFilter := bson.M{"published": true, "deleted": bson.M{"$ne": true}, "fork_id": bson.M{"$exists": false}}
 	total, err = s.db.Count(ctx, "content", publishedFilter)
 	if err != nil {
 		return
@@ -734,6 +740,7 @@ func (s *SearchService) EmbeddingStats(ctx context.Context) (total, withEmbeddin
 	embeddedFilter := bson.M{
 		"published":    true,
 		"deleted":      bson.M{"$ne": true},
+		"fork_id":      bson.M{"$exists": false},
 		"embedding_at": bson.M{"$exists": true},
 	}
 	withEmbedding, err = s.db.Count(ctx, "content", embeddedFilter)

@@ -454,13 +454,19 @@ func main() {
 	apiHandler.SetAgentSessionService(services.NewAgentSessionService(auditService, contentService))
 	apiHandler.SetMaintenanceService(maintenanceService)
 
+	// R12: validate the production public origin BEFORE building the
+	// runtime — an invalid prod URL fails fast without side effects
+	// (non-production keeps warn-only degradation inside the runtime).
+	if err := requireProductionBaseURL(cfg.Env, cfg.PublicBaseURL); err != nil {
+		log.Fatalf("Invalid production base URL: %v", err)
+	}
 	// Task 16E: ONE server construction function owns the entire V3
 	// publication runtime (saga, idempotency, URLs, generation, product
 	// HTTP handlers, scanner, outbox worker). Guards reject unsupported
 	// storage and production standalone Mongo before serving.
 	rt, err := buildPublicationRuntime(context.Background(), db, cfg, runtimeDeps{
 		Cloudflare: cfService, Audit: auditService, Webhooks: webhookService,
-		Content:    contentService,
+		Content: contentService,
 	})
 	if err != nil {
 		log.Fatalf("Failed to build publication runtime: %v", err)
@@ -476,11 +482,6 @@ func main() {
 	} else if degraded {
 		setMigrationRequired(reason)
 		h.SetMigrationRequired(reason)
-	}
-	// R12: production must serve from a canonical HTTPS public origin
-	// (non-production keeps warn-only degradation inside the runtime).
-	if err := requireProductionBaseURL(cfg.Env, cfg.PublicBaseURL); err != nil {
-		log.Fatalf("Invalid production base URL: %v", err)
 	}
 	// R10: multi-instance deployment is unsupported — fail fast when
 	// another live instance holds the liveness gate. gateCtx is fresh:

@@ -151,8 +151,12 @@ func apiJsonError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
-// errorCodeForStatus mirrors the APIHandler default code table (docs/API.md
+// errorCodeForStatus mirrors the APIHandler default code table
+// (APIHandler.defaultErrorCode in internal/handlers/api.go, docs/API.md
 // §12) for the middleware auth path so both error tracks stay consistent.
+// NOTE: Go import direction (handlers → middleware) forbids sharing the
+// function — this duplicate must be kept identical to defaultErrorCode by
+// hand; the apiauth_code test pins the overlapping statuses.
 func errorCodeForStatus(status int) string {
 	switch status {
 	case http.StatusBadRequest:
@@ -160,17 +164,20 @@ func errorCodeForStatus(status int) string {
 	case http.StatusUnauthorized:
 		return "UNAUTHENTICATED"
 	case http.StatusForbidden:
-		return "FORBIDDEN"
+		return "PERMISSION_DENIED"
 	case http.StatusNotFound:
 		return "NOT_FOUND"
 	case http.StatusConflict:
 		return "CONFLICT"
+	case http.StatusUnprocessableEntity:
+		return "VALIDATION_FAILED"
 	case http.StatusTooManyRequests:
 		return "RATE_LIMITED"
+	case http.StatusInternalServerError:
+		return "INTERNAL_ERROR"
+	case http.StatusServiceUnavailable:
+		return "SERVICE_UNAVAILABLE"
 	default:
-		if status >= 500 {
-			return "INTERNAL_ERROR"
-		}
 		return "ERROR"
 	}
 }

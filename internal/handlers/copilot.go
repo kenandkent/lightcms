@@ -329,9 +329,12 @@ func (h *Handler) executeCopilotTool(ctx context.Context, role, sessionID string
 		}
 
 	case "publish_content", "unpublish_content":
-		// REST parity (Wave 2A): publish requires content.edit +
-		// content.publish. Both are checked so the copilot matrix cannot
-		// drift from the REST matrix again.
+		// Copilot deliberately requires content.edit + content.publish for
+		// BOTH verbs — stricter than REST for unpublish (which requires
+		// only publish): the assistant acts with ambient authority and the
+		// tighter gate keeps the two matrices from drifting apart again.
+		// No current role distinguishes them (publish holders also hold
+		// edit), so this is defense-in-depth, not a behavior change.
 		if !auth.HasPermission(role, auth.PermContentEdit) {
 			return deny(auth.PermContentEdit)
 		}

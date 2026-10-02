@@ -98,6 +98,7 @@ func (s *Service) RestoreAndPublish(ctx context.Context, actor Actor, contentID 
 	if err != nil {
 		return zero, mapIdemBeginErr(err)
 	}
+	ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 	if op.Replay {
 		return restoreReplay(op)
 	}
@@ -224,6 +225,7 @@ func (s *Service) RevertLive(ctx context.Context, actor Actor, contentID, source
 	if err != nil {
 		return zero, mapIdemBeginErr(err)
 	}
+	ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 	if op.Replay {
 		return revertReplay(op)
 	}

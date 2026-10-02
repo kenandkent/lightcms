@@ -104,8 +104,19 @@ func NewRepository(db *database.DB, outbox OutboxInserter) *Repository {
 // eventPayload builds the webhook payload shared by all three lifecycle
 // events. PublicURL is unknown at the records layer (Task 8/13 resolve it
 // after activation); the payload carries the frozen render identity.
-func eventPayload(p *Publication) map[string]any {
-	payload := map[string]any{
+// withAttribution returns a copy of p carrying the unpublish caller
+// attribution for event payloads (the row update stamps the same fields;
+// the payload is built from the pre-update read, so it needs them here).
+func withAttribution(p *Publication, attr Attribution) *Publication {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	cp.Actor, cp.Via, cp.AgentSession = attr.Actor, attr.Via, attr.AgentSession
+	return &cp
+}
+
+func eventPayload(p *Publication) map[string]any {	payload := map[string]any{
 		"content_id":           p.ContentID.Hex(),
 		"publication_id":       p.ID.Hex(),
 		"content_version":      p.ContentVersion,
@@ -119,6 +130,17 @@ func eventPayload(p *Publication) map[string]any {
 	// rows written before this field existed).
 	if p.PublicURL != "" {
 		payload["public_url"] = p.PublicURL
+	}
+	// Caller attribution travels with both publish and unpublish events
+	// when present (omitted otherwise — never empty strings).
+	if p.Actor != "" {
+		payload["actor"] = p.Actor
+	}
+	if p.Via != "" {
+		payload["via"] = p.Via
+	}
+	if p.AgentSession != "" {
+		payload["agent_session"] = p.AgentSession
 	}
 	return payload
 }
@@ -170,14 +192,17 @@ func (r *Repository) InsertStaged(ctx context.Context, pub *Publication) error {
 		if isDupKey(err) {
 			// R11 resume: the same attempt re-staging its frozen
 			// publication after an uncertain commit must not fail —
-			// tolerate a byte-identical re-insert, conflict on
-			// divergence (a reused ID with different bytes is a bug).
+			// tolerate a re-insert that matches on identity + bytes.
+			// Anything else (reused ID, moved path/template, different
+			// bytes) conflicts loudly instead of being swallowed.
 			var existing Publication
 			if ferr := r.db.Collection(CollectionPublications).FindOne(ctx,
 				bson.M{"_id": pub.ID}).Decode(&existing); ferr == nil &&
 				existing.Status == StatusStaged &&
 				existing.ContentID == pub.ContentID &&
 				existing.ContentVersion == pub.ContentVersion &&
+				existing.FullPath == pub.FullPath &&
+				existing.TemplateVersionID == pub.TemplateVersionID &&
 				existing.ContentHash == pub.ContentHash {
 				return nil
 			}
@@ -399,7 +424,7 @@ func (r *Repository) activateCAS(ctx context.Context, contentID, newPublicationI
 // didUnpublish=false and inserts NO new event, so a second Unpublish is a
 // 200 with zero side effects. A non-nil expected ID that does not match the
 // current active yields CodeConflict with nothing changed.
-func (r *Repository) UnpublishCAS(ctx context.Context, contentID primitive.ObjectID, expectedActiveID *primitive.ObjectID) (didUnpublish bool, err error) {
+func (r *Repository) UnpublishCAS(ctx context.Context, contentID primitive.ObjectID, expectedActiveID *primitive.ObjectID, attr Attribution) (didUnpublish bool, err error) {
 	did := false
 	err = r.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
 		pubs := r.db.Collection(CollectionPublications)
@@ -417,9 +442,21 @@ func (r *Repository) UnpublishCAS(ctx context.Context, contentID primitive.Objec
 		}
 
 		now := time.Now()
+		// Attribution is omitempty-guarded: unattributed callers must not
+		// litter records with empty actor strings.
+		unpubSet := bson.M{"status": string(StatusUnpublished), "unpublished_at": now}
+		if attr.Actor != "" {
+			unpubSet["actor"] = attr.Actor
+		}
+		if attr.Via != "" {
+			unpubSet["via"] = attr.Via
+		}
+		if attr.AgentSession != "" {
+			unpubSet["agent_session"] = attr.AgentSession
+		}
 		res, txErr := pubs.UpdateOne(sc,
 			bson.M{"_id": current.ID, "status": string(StatusActive)},
-			bson.M{"$set": bson.M{"status": string(StatusUnpublished), "unpublished_at": now}},
+			bson.M{"$set": unpubSet},
 		)
 		if txErr != nil {
 			return txErr
@@ -442,7 +479,7 @@ func (r *Repository) UnpublishCAS(ctx context.Context, contentID primitive.Objec
 			return pubErr(CodeContentNotFound, "content "+contentID.Hex()+" not found", nil)
 		}
 
-		if txErr := r.outbox.InsertUnique(sc, EventUnpublished, current.ID, eventPayload(current)); txErr != nil {
+		if txErr := r.outbox.InsertUnique(sc, EventUnpublished, current.ID, eventPayload(withAttribution(current, attr))); txErr != nil {
 			return txErr
 		}
 		did = true

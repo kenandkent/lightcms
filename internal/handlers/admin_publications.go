@@ -411,6 +411,10 @@ var publishRetryableCodes = map[string]bool{
 	"PUBLICATION_VERIFY_FAILED":   true,
 	"PUBLICATION_ACTIVATE_FAILED": true,
 	"PAGE_PUBLISH_IN_PROGRESS":    true,
+	// Unknown commits converge via same-key retry (staged record retained,
+	// never compensated) — the retry must be offered, matching the API
+	// track's mapSagaErr → REQUEST_IN_PROGRESS mapping.
+	"ACTIVATION_UNKNOWN": true,
 }
 
 // PublishErrorRetryable reports whether an Admin publish failure is retryable.
@@ -882,6 +886,8 @@ func (h *Handler) AdminProductPublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		opID, opAttempt = &out.op.ID, out.op.Attempt
+		// Fence idem mutations below on the owned generation.
+		ctx = idempotency.WithLeaseGeneration(ctx, out.op.LeaseGeneration)
 		if out.resume {
 			// Takeover resume: the form's expectation may be stale (the
 			// crashed attempt could have committed). Re-read the live
@@ -1036,6 +1042,10 @@ func (h *Handler) adminCachedPublish(ctx context.Context, op idempotency.Operati
 		case int64:
 			return v
 		case int:
+			return int64(v)
+		case int32:
+			return int64(v)
+		case uint64:
 			return int64(v)
 		}
 		return 0

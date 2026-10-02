@@ -107,7 +107,7 @@ func FindActiveSandboxFork(ctx context.Context, db *database.DB, userIDHex, sess
 	var fork models.ContentFork
 	err = db.FindOne(ctx, "content_forks", bson.M{
 		"created_by": uid, "agent_session": session, "status": "active",
-	}, &fork, options.FindOne().SetSort(bson.M{"created_at": -1}))
+	}, &fork, options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}}))
 	if err != nil {
 		return nil, fmt.Errorf("no active sandbox fork for this session: %w", err)
 	}

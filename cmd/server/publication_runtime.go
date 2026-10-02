@@ -91,7 +91,27 @@ func buildPublicationRuntime(ctx context.Context, db *database.DB, cfg *config.C
 		}
 	}
 	pubAudit := func(ctx context.Context, action string, fields map[string]any) {
-		deps.Audit.LogAsync(models.AuditLog{Action: action, Resource: "publication", Details: fields})
+		entry := models.AuditLog{Action: action, Resource: "publication", Details: fields}
+		// Merge request provenance so the session ledger attributes saga
+		// operations (publish/unpublish/rollback) to their sessions: the
+		// /api/v1 middleware stamps provenance + editor email on ctx.
+		if prov, ok := services.ProvenanceFromContext(ctx); ok {
+			if prov.AgentSession != "" {
+				entry.AgentSession = prov.AgentSession
+			}
+			if fields != nil {
+				if _, exists := fields["actor"]; !exists && prov.Actor != "" {
+					fields["actor"] = prov.Actor
+				}
+				if _, exists := fields["via"]; !exists && prov.Via != "" {
+					fields["via"] = prov.Via
+				}
+			}
+		}
+		if email := services.EditorEmailFromContext(ctx); email != "" {
+			entry.UserEmail = email
+		}
+		deps.Audit.LogAsync(entry)
 	}
 	var snapshotRender publication.SnapshotRenderFunc
 	if deps.Content != nil {

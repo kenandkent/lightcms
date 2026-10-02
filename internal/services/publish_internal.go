@@ -92,8 +92,11 @@ func (s *ContentService) PublishInternal(ctx context.Context, contentID primitiv
 		switch code {
 		case idempotency.CodeLeaseExpired:
 			// Crashed worker: take over the same attempt (reuses the frozen
-			// execution snapshot — no duplicate publication).
-			op, terr := internalIdem.TakeOverByKey(ctx, owner, "POST", path, key)
+			// execution snapshot — no duplicate publication). Assigns to
+			// the OUTER op (a := here would shadow it and the saga below
+			// would run against a zero operation ID).
+			var terr error
+			op, terr = internalIdem.TakeOverByKey(ctx, owner, "POST", path, key)
 			if terr != nil {
 				return fmt.Errorf("%w: %v", ErrPublishRetryLater, terr)
 			}
@@ -106,6 +109,9 @@ func (s *ContentService) PublishInternal(ctx context.Context, contentID primitiv
 			return err
 		}
 	}
+	// Fence all idem mutations below on the owned generation: a takeover by
+	// a newer worker must fail loudly instead of writing onto its attempt.
+	ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 	if op.Replay {
 		// Same key already completed: no new Publication, no new outbox row.
 		return nil

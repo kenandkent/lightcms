@@ -54,3 +54,26 @@ func TestAPIAuthErrorsCarryCodes(t *testing.T) {
 		t.Fatalf("code = %v, want UNAUTHENTICATED", malformed["code"])
 	}
 }
+
+// TestErrorCodeTableParity pins errorCodeForStatus to the APIHandler default
+// table (defaultErrorCode): the two tracks must emit identical codes per
+// status (the function is duplicated because handlers → middleware forbids
+// sharing it — keep both in sync by hand).
+func TestErrorCodeTableParity(t *testing.T) {
+	for status, want := range map[int]string{
+		http.StatusBadRequest:          "INVALID_REQUEST",
+		http.StatusUnauthorized:        "UNAUTHENTICATED",
+		http.StatusForbidden:           "PERMISSION_DENIED",
+		http.StatusNotFound:            "NOT_FOUND",
+		http.StatusConflict:            "CONFLICT",
+		http.StatusUnprocessableEntity: "VALIDATION_FAILED",
+		http.StatusTooManyRequests:     "RATE_LIMITED",
+		http.StatusInternalServerError: "INTERNAL_ERROR",
+		http.StatusServiceUnavailable:  "SERVICE_UNAVAILABLE",
+		http.StatusTeapot:              "ERROR",
+	} {
+		if got := errorCodeForStatus(status); got != want {
+			t.Errorf("errorCodeForStatus(%d) = %q, want %q (api.go defaultErrorCode)", status, got, want)
+		}
+	}
+}

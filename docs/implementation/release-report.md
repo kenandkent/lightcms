@@ -207,3 +207,44 @@ lease-expiry 409 → takeover resume, stale-version-without-key 428).
 The §9 external reviews remain the release gate and should treat this
 round as in-scope additions — particularly the R01/R09 authz changes and
 the R02 renderer swap, which alter externally visible behavior by design.
+
+## 13. Review-feedback round (2026-10-02, same tree)
+
+Two independent read-only reviews of the §12 tree (admin/API surface +
+V3 core, `de943b7..53c0fbc`) returned 2 blockers + 9 majors + 15 minors.
+All were triaged; every real finding is fixed in this tree (one claim was
+disproven by code inspection — saga compensation is ctx-immune by
+signature, so no change was needed there):
+
+- Embeddings projection now includes title/meta (the truncated-text
+  corruption); stats agree with the indexer; fork index added.
+- Middleware error table aligned to `defaultErrorCode` (pinned by test).
+- Binding-failure paths release the lease; `Begin` retries the TTL gap.
+- Full lease-generation fencing on Complete/MarkTerminal/Bind/Freeze via
+  stashed context generation (backward compatible when absent) + test.
+- Unpublish attribution end to end (request → row → outbox event → audit
+  merge) + test; admin `ACTIVATION_UNKNOWN` retryable.
+- `InsertStaged` tolerance widened to path + template version.
+- Upsert restatement allowed on live rows (update parity) + test.
+- Bulk per-item machine codes (update/field-op/upsert + batch-publish maps).
+- `PublishInternal` shadowed-op fix (scheduler crash-takeover converges;
+  two pin tests revised from NOT_FOUND to convergence + replay).
+- Validation-cache replays rebuild their 422 with BSON-safe details
+  (e2e asserts details survive the round trip).
+- R10 gate: multi-rival scan, dead-pid reaping, guarded self-removal,
+  `prod` env, ts validation (a live restart-flap bug in the gate itself
+  was found by review, reproduced, fixed, and proven fixed by reboot).
+- Minor: int32/uint64 decoders, sandbox nil-fork guard, pub-versioned
+  resume cache, LeaseLost mapping, cutover/Windows/redirect-message docs,
+  `HasScope` deprecation, R12 ordering, fork sort/index, dead `publish()`
+  removal, render-drift documentation.
+- Out of scope (documented, not changed): checkbox-form full replay (needs
+  draft-save dedup; CAS guard holds the safety property), per-step
+  timeouts below remaining lease, cross-instance fencing (R10 gate
+  enforces single-instance instead), full snapshot-input freezing across
+  takeovers (documented drift bounds).
+
+Evidence: full regression `go test -p 1 ./... -count=1` on this tree →
+**exit 0, 29 packages ok, 0 FAIL**; `go vet ./...` clean. Log:
+`/tmp/review-fixes-regression-20261002-225337.log` (29 ok lines, zero
+FAIL). The §9 external reviews remain the release gate.
