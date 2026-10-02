@@ -28,12 +28,12 @@ import (
 
 // RestoreAndPublishResult is the new-publication outcome.
 type RestoreAndPublishResult struct {
-	ContentID     string `json:"content_id"`
-	ContentVersion int64 `json:"content_version"`
-	PublicationID string `json:"publication_id"`
-	FullPath      string `json:"full_path"`
-	PublicURL     string `json:"public_url"`
-	Mode          string `json:"mode"` // always "restore_and_publish"
+	ContentID      string `json:"content_id"`
+	ContentVersion int64  `json:"content_version"`
+	PublicationID  string `json:"publication_id"`
+	FullPath       string `json:"full_path"`
+	PublicURL      string `json:"public_url"`
+	Mode           string `json:"mode"` // always "restore_and_publish"
 }
 
 // RestoreAndPublish restores historical version data as a new draft version
@@ -43,7 +43,7 @@ func (s *Service) RestoreAndPublish(ctx context.Context, actor Actor, contentID 
 	if !actor.Authenticated {
 		return zero, genErr(CodeUnauthenticated, "authentication is required", nil)
 	}
-	if !actor.HasScope(ScopeContentEdit) || !actor.HasScope(ScopeContentPublish) {
+	if !actor.Can(ScopeContentEdit) || !actor.Can(ScopeContentPublish) {
 		return zero, genErr(CodePermissionDenied, "restore_and_publish requires content.edit + content.publish", nil)
 	}
 	ifem, hasIdem := IdempotencyFrom(ctx)
@@ -94,7 +94,7 @@ func (s *Service) RestoreAndPublish(ctx context.Context, actor Actor, contentID 
 	if path == "" {
 		path = "/api/v1/content/" + contentID.Hex() + "/restore-and-publish"
 	}
-	op, err := s.idem.Begin(ctx, owner, method, path, ifem.Key, body)
+	op, err := s.beginOrResume(ctx, owner, method, path, ifem.Key, body)
 	if err != nil {
 		return zero, mapIdemBeginErr(err)
 	}
@@ -152,6 +152,7 @@ func (s *Service) RestoreAndPublish(ctx context.Context, actor Actor, contentID 
 		IdempotencyRecord: &op.ID,
 		// Lane 2B: thread caller attribution into the minted record.
 		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
+		AuthorIsAdmin: actor.IsAdmin,
 	})
 	if err != nil {
 		s.completePublishError(ctx, op, err)
@@ -193,7 +194,7 @@ func (s *Service) RevertLive(ctx context.Context, actor Actor, contentID, source
 	if !actor.Authenticated {
 		return zero, genErr(CodeUnauthenticated, "authentication is required", nil)
 	}
-	if !actor.HasScope(ScopeContentEdit) || !actor.HasScope(ScopeContentPublish) {
+	if !actor.Can(ScopeContentEdit) || !actor.Can(ScopeContentPublish) {
 		return zero, genErr(CodePermissionDenied, "revert_live requires content.edit + content.publish", nil)
 	}
 	ifem, hasIdem := IdempotencyFrom(ctx)
@@ -219,7 +220,7 @@ func (s *Service) RevertLive(ctx context.Context, actor Actor, contentID, source
 	if path == "" {
 		path = "/api/v1/content/" + contentID.Hex() + "/revert-live"
 	}
-	op, err := s.idem.Begin(ctx, owner, method, path, ifem.Key, body)
+	op, err := s.beginOrResume(ctx, owner, method, path, ifem.Key, body)
 	if err != nil {
 		return zero, mapIdemBeginErr(err)
 	}
@@ -231,6 +232,7 @@ func (s *Service) RevertLive(ctx context.Context, actor Actor, contentID, source
 		ExpectedActiveID: expectedActiveID, IdempotencyRecord: &op.ID,
 		// Lane 2B: thread caller attribution into the minted record.
 		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
+		AuthorIsAdmin: actor.IsAdmin,
 	})
 	if err != nil {
 		s.completePublishError(ctx, op, err)

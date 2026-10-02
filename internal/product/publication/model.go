@@ -179,6 +179,10 @@ type PublishRequest struct {
 	Actor        string
 	Via          string
 	AgentSession string
+	// R02: whether the author is an admin — resolves script policy
+	// admin_only at plan time (admins render raw, everyone else strict).
+	// Zero value (false) is fail-closed.
+	AuthorIsAdmin bool
 }
 
 type PublicationResult struct {
@@ -206,6 +210,8 @@ type RollbackRequest struct {
 	Actor        string
 	Via          string
 	AgentSession string
+	// R02: admin authorship for the re-render path (same contract).
+	AuthorIsAdmin bool
 }
 
 // Error codes. PUBLICATION_CONFLICT matches spec §27; the remaining codes

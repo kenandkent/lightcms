@@ -118,7 +118,7 @@ func TestGetContentByPath_NeverReturnsFork(t *testing.T) {
 
 	// Real fork copy sharing the live full_path.
 	fs := NewForkService(svc.db, svc)
-	forkRec, err := fs.Create(ctx, "w1b-fork", "", primitive.NewObjectID(), "w1b@test")
+	forkRec, err := fs.Create(ctx, "w1b-fork", "", primitive.NewObjectID(), "w1b@test", "")
 	if err != nil {
 		t.Fatalf("fork create: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestGetContentByPath_ForkOnlyIsNotFound(t *testing.T) {
 		t.Fatalf("CreateContent: %v", err)
 	}
 	fs := NewForkService(svc.db, svc)
-	forkRec, err := fs.Create(ctx, "w1b-fork2", "", primitive.NewObjectID(), "w1b@test")
+	forkRec, err := fs.Create(ctx, "w1b-fork2", "", primitive.NewObjectID(), "w1b@test", "")
 	if err != nil {
 		t.Fatalf("fork create: %v", err)
 	}

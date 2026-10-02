@@ -3,6 +3,7 @@ package idempotency
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/database"
@@ -346,6 +347,49 @@ func (s *Service) FreezeExecution(ctx context.Context, opID primitive.ObjectID, 
 		return idemErr(CodeConflict, "attempt already frozen to a different publication; reuse the durable snapshot")
 	}
 	return idemErr(CodeConflict, "snapshot changed concurrently; re-read and retry")
+}
+
+// Heartbeat starts lease renewal for (opID, attempt, generation) until
+// stop is called (R07: spec §21.5 heartbeat). Renewals run every
+// lease/3 (clamped to 1s–60s). The FIRST failed renewal cancels the
+// returned context: a generation mismatch (or any loss) means a newer
+// worker owns the attempt — the caller must stop all side effects
+// immediately. Callers scope the child context to the long side-effect
+// section only (never the completion call itself); Completion gates on
+// ownership separately. Stopping is idempotent.
+func (s *Service) Heartbeat(ctx context.Context, opID primitive.ObjectID, attempt, generation int64) (context.Context, context.CancelFunc) {
+	hctx, cancel := context.WithCancel(ctx)
+	interval := s.lease / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	stop := func() {
+		once.Do(func() { close(done) })
+		cancel()
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-hctx.Done():
+				return
+			case <-t.C:
+				if _, err := s.RenewLease(hctx, opID, attempt, generation); err != nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return hctx, stop
 }
 
 // RenewLease is the worker heartbeat (every HeartbeatInterval): it CAS-extends

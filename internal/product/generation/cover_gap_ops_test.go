@@ -85,7 +85,7 @@ func TestCoverGapRollbackPublicationMatrix(t *testing.T) {
 	tv := gapSeedTemplate(t, tpls, "gaprb")
 	actor := authed()
 
-	if _, err := gen.RollbackPublication(ctx, generation.Actor{}, primitive.NewObjectID(), primitive.NewObjectID(), nil); generation.CodeOf(err) != generation.CodeUnauthenticated {
+	if _, err := gen.RollbackPublication(ctx, generation.Actor{Role: "admin"}, primitive.NewObjectID(), primitive.NewObjectID(), nil); generation.CodeOf(err) != generation.CodeUnauthenticated {
 		t.Fatalf("rollback unauth: %v", err)
 	}
 	scoped := authed("content.view")
@@ -156,10 +156,10 @@ func TestCoverGapRestoreRevertMatrix(t *testing.T) {
 	tv := gapSeedTemplate(t, tpls, "gaprestore")
 	actor := adminActor()
 
-	if _, err := gen.RestoreAndPublish(ctx, generation.Actor{}, primitive.NewObjectID(), 1, nil); generation.CodeOf(err) != generation.CodeUnauthenticated {
+	if _, err := gen.RestoreAndPublish(ctx, generation.Actor{Role: "admin"}, primitive.NewObjectID(), 1, nil); generation.CodeOf(err) != generation.CodeUnauthenticated {
 		t.Fatalf("restore unauth: %v", err)
 	}
-	if _, err := gen.RevertLive(ctx, generation.Actor{}, primitive.NewObjectID(), primitive.NewObjectID(), nil); generation.CodeOf(err) != generation.CodeUnauthenticated {
+	if _, err := gen.RevertLive(ctx, generation.Actor{Role: "admin"}, primitive.NewObjectID(), primitive.NewObjectID(), nil); generation.CodeOf(err) != generation.CodeUnauthenticated {
 		t.Fatalf("revert unauth: %v", err)
 	}
 	scoped := authed("content.view")
@@ -252,7 +252,7 @@ func TestCoverGapMigrateSlugMatrix(t *testing.T) {
 	admin := adminActor()
 	tplID, _, _ := mustCreateTpl(t, tpls, "gapmigrate")
 
-	if _, err := gen.MigrateSlug(ctx, generation.Actor{}, tplID, "x"); generation.CodeOf(err) != generation.CodeUnauthenticated {
+	if _, err := gen.MigrateSlug(ctx, generation.Actor{Role: "admin"}, tplID, "x"); generation.CodeOf(err) != generation.CodeUnauthenticated {
 		t.Fatalf("migrate unauth: %v", err)
 	}
 	if _, err := gen.MigrateSlug(ctx, authed(), tplID, "x"); generation.CodeOf(err) != generation.CodePermissionDenied {

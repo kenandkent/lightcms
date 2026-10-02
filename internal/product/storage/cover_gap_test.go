@@ -64,16 +64,10 @@ func TestCoverGapStoreErrorHelpers(t *testing.T) {
 	if _, err := s.Stage(ctx, StageRequest{}); err == nil {
 		t.Fatalf("Stage cancelled ctx: want error")
 	}
-	if previousFor("/c", nil) != "" {
-		t.Fatalf("previousFor(nil)")
-	}
 	id := primitive.NewObjectID()
-	if previousFor("/c", &id) != "/c.previous-"+id.Hex() {
-		t.Fatalf("previousFor(id)")
+	if previousPath("/c", id) != "/c.previous-"+id.Hex() {
+		t.Fatalf("previousPath(id)")
 	}
-	var rp FilesystemStore
-	rp.restorePrevious("/c", "", false)
-	rp.restorePrevious("/c", "/prev", false)
 }
 
 func TestCoverGapPathValidation(t *testing.T) {

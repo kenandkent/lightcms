@@ -145,5 +145,32 @@ func apiJsonError(w http.ResponseWriter, status int, message string) {
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": message,
+		// Wave-3B parity: machine-readable sibling code alongside the
+		// legacy string error (API.md §12; 401 maps to UNAUTHENTICATED).
+		"code": errorCodeForStatus(status),
 	})
+}
+
+// errorCodeForStatus mirrors the APIHandler default code table (docs/API.md
+// §12) for the middleware auth path so both error tracks stay consistent.
+func errorCodeForStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "INVALID_REQUEST"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "FORBIDDEN"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "CONFLICT"
+	case http.StatusTooManyRequests:
+		return "RATE_LIMITED"
+	default:
+		if status >= 500 {
+			return "INTERNAL_ERROR"
+		}
+		return "ERROR"
+	}
 }

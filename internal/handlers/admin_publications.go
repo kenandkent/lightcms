@@ -19,8 +19,10 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
@@ -37,6 +39,7 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/i18n"
 	"github.com/jonradoff/lightcms/v7/internal/models"
 	"github.com/jonradoff/lightcms/v7/internal/product/generation"
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 	"github.com/jonradoff/lightcms/v7/internal/product/storage"
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
@@ -616,6 +619,9 @@ func (h *Handler) adminActor(r *http.Request) generation.Actor {
 		a.ID = u.ID
 		a.Email = u.Email
 		a.IsAdmin = u.Role == "admin"
+		// R01: the V3 actor must carry the session role — an empty Role
+		// grants nothing under Actor.Can.
+		a.Role = u.Role
 	}
 	return a
 }
@@ -654,16 +660,19 @@ func adminRetryHidden(r *http.Request) url.Values {
 }
 
 // adminExpectedActive parses the expected_active_id form precondition.
-func adminExpectedActive(r *http.Request) *primitive.ObjectID {
+// Returns (nil, true) when absent, (id, true) when valid, (nil, false) when
+// present but malformed. Malformed values fail CLOSED (tampered preconditions
+// must not silently downgrade to unconstrained publishes).
+func adminExpectedActive(r *http.Request) (*primitive.ObjectID, bool) {
 	raw := strings.TrimSpace(r.FormValue("expected_active_id"))
 	if raw == "" {
-		return nil
+		return nil, true
 	}
 	id, err := primitive.ObjectIDFromHex(raw)
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	return &id
+	return &id, true
 }
 
 // adminGenerationService builds the same orchestrator REST uses (Task 12).
@@ -818,6 +827,15 @@ func (h *Handler) AdminProductPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	// Stamp editor identity + provenance (human/ui) so the minted
+	// Publication record attributes this admin publish (session rollback
+	// selects targets by provenance).
+	adminAuthor := false
+	if u, ok := h.auth.GetCurrentUser(r); ok {
+		ctx = services.WithEditorEmail(ctx, u.Email)
+		adminAuthor = u.Role == "admin"
+	}
+	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
 	var content models.Content
 	if err := h.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &content); err != nil {
 		http.Error(w, "Content not found", http.StatusNotFound)
@@ -835,19 +853,231 @@ func (h *Handler) AdminProductPublish(w http.ResponseWriter, r *http.Request) {
 			adminRetryHidden(r))))
 		return
 	}
-	expected := adminExpectedActive(r)
+	expected, ok := adminExpectedActive(r)
+	if !ok {
+		h.writeAdminProductPage(w, r, "发布", string(FailedPublishHTML(
+			h.adminPriorURL(r, contentID, content.FullPath), "EXPECTED_ACTIVE_ID_INVALID", false)))
+		return
+	}
 	svc := h.adminPublicationService()
+
+	// Idempotent admin publish (M6): the form carries a render-time
+	// idempotency_key. Same key + same body replays the cached result
+	// instead of minting a second Publication; an expired lease is taken
+	// over and resumed from the durable snapshot. Unwired installs (no
+	// idempotency service) keep the legacy direct publish.
+	var opID *primitive.ObjectID
+	var opAttempt int64
+	if h.idempotencyService != nil {
+		out := h.adminPublishIdem(ctx, r, content, tv.ID, expected)
+		if out.failCode != "" {
+			h.writeAdminProductPage(w, r, "发布", string(FailedPublishHTML(
+				h.adminPriorURL(r, contentID, content.FullPath), out.failCode,
+				out.failRetryable, adminRetryHidden(r))))
+			return
+		}
+		if out.replay != nil {
+			h.writeAdminProductPage(w, r, "发布", string(PublishResultHTML(
+				PublishDisplay{Result: *out.replay, TemplateVersion: tv.Version})))
+			return
+		}
+		opID, opAttempt = &out.op.ID, out.op.Attempt
+		if out.resume {
+			// Takeover resume: the form's expectation may be stale (the
+			// crashed attempt could have committed). Re-read the live
+			// active as the CAS expectation — ActivateCAS still enforces
+			// it atomically, so a concurrent publish conflicts instead of
+			// being silently superseded.
+			if live, lerr := publication.NewRepository(h.db, nil).GetActive(ctx, contentID); lerr == nil && live != nil {
+				id := live.ID
+				expected = &id
+			} else {
+				expected = nil
+			}
+		}
+	}
 	res, perr := svc.Publish(ctx, publication.PublishRequest{
 		ContentID: contentID, ContentVersion: content.CurrentVersion,
 		TemplateVersionID: tv.ID, ExpectedActiveID: expected, Reason: "admin publish",
+		Actor: "human", Via: "ui", AuthorIsAdmin: adminAuthor, IdempotencyRecord: opID,
 	})
 	if perr != nil {
+		if opID != nil {
+			// Release (never complete) the lease so the failure-page
+			// retry can take over the same attempt.
+			_, _ = h.idempotencyService.Complete(ctx, *opID, opAttempt,
+				adminPublishErrStatus(perr), map[string]any{"code": publication.CodeOf(perr)}, false)
+		}
 		h.writeAdminProductPage(w, r, "发布", string(FailedPublishHTML(
 			h.adminPriorURL(r, contentID, content.FullPath), publication.CodeOf(perr),
 			PublishErrorRetryable(perr), adminRetryHidden(r))))
 		return
 	}
+	if opID != nil {
+		cache := map[string]any{
+			"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
+			"full_path": res.FullPath, "content_version": float64(res.ContentVersion),
+			"content_id": res.ContentID.Hex(),
+		}
+		if _, cerr := h.idempotencyService.Complete(ctx, *opID, opAttempt, 200, cache, false); cerr != nil {
+			// A completed publish that fails to cache is still a success —
+			// the page is live. Surface the result; the retry will replay
+			// or take over.
+			log.Printf("admin publish: cache completion failed for op %s: %v", opID.Hex(), cerr)
+		}
+	}
 	h.writeAdminProductPage(w, r, "发布", string(PublishResultHTML(PublishDisplay{Result: res, TemplateVersion: tv.Version})))
+}
+
+// adminIdemOutcome is the resolved idempotency posture for an admin publish.
+type adminIdemOutcome struct {
+	op            idempotency.Operation // valid when proceeding
+	resume        bool                  // takeover resume: re-read the live active
+	replay        *publication.PublicationResult
+	failCode      string
+	failRetryable bool
+}
+
+// adminPublishIdem Begins (or takes over) the idempotency operation for an
+// admin publish POST carrying a render-time idempotency_key.
+func (h *Handler) adminPublishIdem(ctx context.Context, r *http.Request, content models.Content, tvID primitive.ObjectID, expected *primitive.ObjectID) adminIdemOutcome {
+	key := strings.TrimSpace(r.FormValue("idempotency_key"))
+	if key == "" {
+		// Fail closed: the form always renders a key; a missing key means
+		// a hand-built POST that would mint unrepeatable publications.
+		return adminIdemOutcome{failCode: generation.CodeIdempotencyKeyRequired}
+	}
+	owner := "admin-ui"
+	if u, ok := h.auth.GetCurrentUser(r); ok {
+		if u.ID != "" {
+			owner = "admin-ui:" + u.ID
+		} else if u.Email != "" {
+			owner = "admin-ui:" + u.Email
+		}
+	}
+	expHex := ""
+	if expected != nil {
+		expHex = expected.Hex()
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"content_id": content.ID.Hex(), "content_version": content.CurrentVersion,
+		"template_version_id": tvID.Hex(), "expected_active_id": expHex,
+	})
+	opPath := "/cm/content/" + content.ID.Hex() + "/publish"
+	op, berr := h.idempotencyService.Begin(ctx, owner, "POST", opPath, key, raw)
+	if berr == nil {
+		if op.Replay {
+			if res, ok := h.adminCachedPublish(ctx, op); ok {
+				return adminIdemOutcome{replay: res}
+			}
+			return adminIdemOutcome{failCode: string(publication.CodeInternal)}
+		}
+		return adminIdemOutcome{op: op}
+	}
+	if idempotency.CodeOf(berr) != idempotency.CodeLeaseExpired {
+		return adminIdemOutcome{
+			failCode:      adminIdemBeginCode(berr),
+			failRetryable: idempotency.CodeOf(berr) == idempotency.CodeInProgress,
+		}
+	}
+	// Expired lease: CAS-takeover and resume from the durable snapshot
+	// instead of wedging on REQUEST_IN_PROGRESS.
+	top, terr := h.idempotencyService.TakeOverByKey(ctx, owner, "POST", opPath, key)
+	if terr != nil {
+		if top.Replay {
+			if res, ok := h.adminCachedPublish(ctx, top); ok {
+				return adminIdemOutcome{replay: res}
+			}
+			return adminIdemOutcome{failCode: string(publication.CodeInternal)}
+		}
+		return adminIdemOutcome{
+			failCode:      adminIdemBeginCode(terr),
+			failRetryable: idempotency.CodeOf(terr) == idempotency.CodeInProgress,
+		}
+	}
+	if top.PublicationID != nil {
+		// The crashed attempt may already have committed: if its
+		// publication is active, cache the response and return it —
+		// never mint a second Publication.
+		if pub, gerr := publication.NewRepository(h.db, nil).GetByID(ctx, *top.PublicationID); gerr == nil && pub != nil && pub.Status == publication.StatusActive {
+			res := publication.PublicationResult{
+				PublicationID: pub.ID, ContentID: pub.ContentID,
+				ContentVersion: pub.ContentVersion, FullPath: pub.FullPath,
+				PublicURL: pub.PublicURL, ContentHash: pub.ContentHash,
+			}
+			_, _ = h.idempotencyService.Complete(ctx, top.ID, top.Attempt, 200, map[string]any{
+				"publication_id": pub.ID.Hex(), "public_url": pub.PublicURL,
+				"full_path": pub.FullPath, "content_version": float64(pub.ContentVersion),
+				"content_id": pub.ContentID.Hex(),
+			}, false)
+			return adminIdemOutcome{replay: &res}
+		}
+	}
+	return adminIdemOutcome{op: top, resume: true}
+}
+
+// adminCachedPublish rebuilds the success display from a replayed
+// idempotency response.
+func (h *Handler) adminCachedPublish(ctx context.Context, op idempotency.Operation) (*publication.PublicationResult, bool) {
+	m := op.Response
+	if m == nil {
+		return nil, false
+	}
+	str := func(k string) string {
+		if v, ok := m[k].(string); ok {
+			return v
+		}
+		return ""
+	}
+	num := func(k string) int64 {
+		switch v := m[k].(type) {
+		case float64:
+			return int64(v)
+		case int64:
+			return v
+		case int:
+			return int64(v)
+		}
+		return 0
+	}
+	pubID, err := primitive.ObjectIDFromHex(str("publication_id"))
+	if err != nil {
+		return nil, false
+	}
+	contentID, err := primitive.ObjectIDFromHex(str("content_id"))
+	if err != nil {
+		return nil, false
+	}
+	return &publication.PublicationResult{
+		PublicationID: pubID, ContentID: contentID,
+		ContentVersion: num("content_version"), FullPath: str("full_path"),
+		PublicURL: str("public_url"),
+	}, true
+}
+
+// adminIdemBeginCode maps idempotency Begin failures to admin failure codes.
+func adminIdemBeginCode(err error) string {
+	switch idempotency.CodeOf(err) {
+	case idempotency.CodeConflict:
+		return idempotency.CodeConflict
+	case idempotency.CodeInProgress:
+		return idempotency.CodeInProgress
+	default:
+		return string(publication.CodeInternal)
+	}
+}
+
+// adminPublishErrStatus maps saga failures to a release-only completion
+// status (the lease is released, never completed, so the retry takes over).
+func adminPublishErrStatus(err error) int {
+	switch publication.CodeOf(err) {
+	case string(publication.CodeConflict):
+		return 409
+	case string(publication.CodePagePublishInProgress):
+		return 429
+	default:
+		return 500
+	}
 }
 
 // AdminProductPublications lists publication history with active/failed state
@@ -1013,7 +1243,12 @@ func (h *Handler) AdminProductRestoreAndPublish(w http.ResponseWriter, r *http.R
 	// Same lost-update guard AdminProductPublish honors: a stale
 	// expected_active_id rejects the restore instead of racing a newer
 	// activation.
-	res, err := h.adminGenerationService().RestoreAndPublish(genCtx, actor, contentID, version, adminExpectedActive(r))
+	expected, ok := adminExpectedActive(r)
+	if !ok {
+		h.writeAdminProductPage(w, r, "恢复并发布", string(FailedPublishHTML("", "EXPECTED_ACTIVE_ID_INVALID", false)))
+		return
+	}
+	res, err := h.adminGenerationService().RestoreAndPublish(genCtx, actor, contentID, version, expected)
 	if err != nil {
 		var prior string
 		var probe models.Content
@@ -1065,7 +1300,12 @@ func (h *Handler) AdminProductRevertLive(w http.ResponseWriter, r *http.Request)
 		Path: "/cm/content/" + contentID.Hex() + "/publications/" + sourceID.Hex() + "/revert_live",
 		Key:  idemKey,
 	})
-	res, err := h.adminGenerationService().RevertLive(genCtx, actor, contentID, sourceID, adminExpectedActive(r))
+	expected, ok := adminExpectedActive(r)
+	if !ok {
+		h.writeAdminProductPage(w, r, "回滚线上", string(FailedPublishHTML("", "EXPECTED_ACTIVE_ID_INVALID", false)))
+		return
+	}
+	res, err := h.adminGenerationService().RevertLive(genCtx, actor, contentID, sourceID, expected)
 	if err != nil {
 		var prior string
 		var probe models.Content

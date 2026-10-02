@@ -302,10 +302,14 @@ func previousPath(canonical string, oldPublicationID primitive.ObjectID) string 
 	return canonical + ".previous-" + oldPublicationID.Hex()
 }
 
-// cutover performs the §17.4 activation file sequence: optional
-// canonical→previous rename, immutable→.next copy with verification,
-// .next→canonical rename, then directory fsync. On .next failure after the
-// previous rename it restores the previous file so the old page keeps serving.
+// cutover performs the §17.4 activation file sequence with zero serving
+// gap: the next bytes are fully prepared and verified while the old
+// canonical keeps serving, the old bytes are copied (not moved) to a
+// recoverable .previous backup, and a single atomic rename publishes the
+// new file. Readers observe the complete old or new file — never a missing
+// canonical, unlike the previous move-first sequence. Any failure before
+// the final rename leaves the canonical untouched (only .next/previous
+// leftovers, both scanner-convergent).
 func (s *FilesystemStore) cutover(obj StagedObject, canonical string, oldID *primitive.ObjectID) error {
 	canonExisted := true
 	if _, err := os.Stat(canonical); err != nil {
@@ -318,45 +322,47 @@ func (s *FilesystemStore) cutover(obj StagedObject, canonical string, oldID *pri
 		return storeErr(CodeNeedsPreviousID, "canonical exists; use ActivateWithPrevious with the old publication ID", canonical, nil)
 	}
 
-	movedPrevious := false
-	if canonExisted {
-		prev := previousPath(canonical, *oldID)
-		if err := os.Rename(canonical, prev); err != nil {
-			return storeErr(CodeIO, "rename canonical to previous backup", canonical, err)
-		}
-		movedPrevious = true
-	}
-
 	next := nextPath(canonical, obj.PublicationID)
 	_ = os.Remove(next) // clear a leftover from a crashed cutover
 	src, err := os.ReadFile(obj.Path)
 	if err != nil {
-		s.restorePrevious(canonical, previousFor(canonical, oldID), movedPrevious)
 		if isNotExist(err) {
 			return storeErr(CodeNotFound, "immutable object is missing", obj.Path, err)
 		}
 		return storeErr(CodeIO, "read immutable object", obj.Path, err)
 	}
 	if shaHex(src) != strings.ToLower(obj.SHA256) {
-		s.restorePrevious(canonical, previousFor(canonical, oldID), movedPrevious)
 		return storeErr(CodeHashMismatch, "immutable object failed verification; canonical untouched", obj.Path, nil)
 	}
 	if err := writeSyncFile(next, src, s.MaxWriteBytes); err != nil {
 		_ = os.Remove(next)
-		s.restorePrevious(canonical, previousFor(canonical, oldID), movedPrevious)
 		return storeErr(CodeIO, "write next cutover file", next, err)
 	}
 	if _, landed, _, verr := hashFile(next); verr != nil || landed != strings.ToLower(obj.SHA256) {
 		_ = os.Remove(next)
-		s.restorePrevious(canonical, previousFor(canonical, oldID), movedPrevious)
 		if verr != nil {
 			return storeErr(CodeIO, "verify next cutover file", next, verr)
 		}
-		return storeErr(CodeHashMismatch, "cutover copy failed verification; canonical restored", next, nil)
+		return storeErr(CodeHashMismatch, "cutover copy failed verification; canonical untouched", next, nil)
 	}
+
+	if canonExisted {
+		// Recoverable backup of the old bytes. A copy (not a move) keeps
+		// the old page serving until the atomic rename below.
+		prev := previousPath(canonical, *oldID)
+		if err := copyFile(prev, canonical); err != nil {
+			_ = os.Remove(next)
+			return storeErr(CodeIO, "back up canonical to previous", prev, err)
+		}
+		if err := syncDir(filepath.Dir(canonical)); err != nil {
+			_ = os.Remove(next)
+			_ = os.Remove(prev)
+			return storeErr(CodeIO, "fsync canonical directory", canonical, err)
+		}
+	}
+
 	if err := os.Rename(next, canonical); err != nil {
 		_ = os.Remove(next)
-		s.restorePrevious(canonical, previousFor(canonical, oldID), movedPrevious)
 		return storeErr(CodeIO, "rename next file to canonical", canonical, err)
 	}
 	if err := syncDir(filepath.Dir(canonical)); err != nil {
@@ -365,23 +371,27 @@ func (s *FilesystemStore) cutover(obj StagedObject, canonical string, oldID *pri
 	return nil
 }
 
-func previousFor(canonical string, oldID *primitive.ObjectID) string {
-	if oldID == nil {
-		return ""
+// copyFile copies src to dst with an fsync before close, so the backup is
+// durable once the call returns.
+func copyFile(dst, src string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
 	}
-	return previousPath(canonical, *oldID)
-}
-
-// restorePrevious best-effort renames a moved previous file back to canonical.
-func (s *FilesystemStore) restorePrevious(canonical, prev string, moved bool) {
-	if !moved || prev == "" {
-		return
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
 	}
-	if _, err := os.Stat(canonical); err == nil {
-		return // something already serves; do not clobber
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
 	}
-	_ = os.Rename(prev, canonical)
-	_ = syncDir(filepath.Dir(canonical))
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // Activate performs a first-publish cutover. It verifies the staged object,

@@ -53,7 +53,23 @@ func (s *Service) publishWithOp(ctx context.Context, actor Actor, tv templatecon
 	var contentID primitive.ObjectID
 	var contentVersion int64
 	var isCreate bool
-	if live == nil {
+	if op.ContentID != nil && op.ContentVersion > 0 {
+		// R04 resume: a taken-over op whose content write already committed
+		// carries the binding — never re-execute the write (same key must
+		// not bump versions or duplicate version rows). The binding exists
+		// iff the write committed (bound in the same transaction), so a
+		// missing or moved row is corruption: fail loudly, never rewrite.
+		var bound models.Content
+		if err := s.db.FindOne(ctx, "content", bson.M{"_id": *op.ContentID}, &bound); err != nil {
+			return zero, genErr(CodeInternal, "idempotency-bound content is missing; refusing to rewrite", err)
+		}
+		if bound.CurrentVersion != op.ContentVersion {
+			return zero, genErr(CodeContentVersionConflict,
+				fmt.Sprintf("bound content version %d moved to %d; retry with a new key", op.ContentVersion, bound.CurrentVersion), nil)
+		}
+		contentID, contentVersion = *op.ContentID, op.ContentVersion
+		isCreate = contentVersion == 1
+	} else if live == nil {
 		isCreate = true
 		contentID = primitive.NewObjectID()
 		contentVersion = 1
@@ -93,6 +109,7 @@ func (s *Service) publishWithOp(ctx context.Context, actor Actor, tv templatecon
 		TemplateVersionID: tv.ID, ExpectedActiveID: expectedActive,
 		Reason: "page_generation publish", IdempotencyRecord: &op.ID,
 		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
+		AuthorIsAdmin: actor.IsAdmin,
 	})
 	if err != nil {
 		// Terminal pre-activation failures are already MarkedTerminal by the
@@ -124,6 +141,12 @@ func (s *Service) publishWithOp(ctx context.Context, actor Actor, tv templatecon
 		"mode": out.Mode, "published": out.Published, "requires_publish": out.RequiresPublish,
 		"public_url": publicURL, "content_version": float64(out.ContentVersion),
 		"template_version": float64(out.TemplateVersion), "publication_id": pubHex,
+	}
+	// R07 fencing: complete only while this worker still owns the attempt —
+	// after a lease takeover, Completing would stamp our response onto the
+	// new owner's attempt (the takeover path completes it instead).
+	if oerr := s.assertOpOwned(ctx, *op); oerr != nil {
+		return zero, oerr
 	}
 	if _, cerr := s.idem.Complete(ctx, op.ID, op.Attempt, status, cache, false); cerr != nil {
 		// A completed publish that fails to cache is still a success — the
@@ -191,7 +214,7 @@ func (s *Service) replaceLiveForPublish(ctx context.Context, actor Actor, tv tem
 				"template_id": tv.TemplateID, "template_name": tv.Name,
 				"title": title, "slug": slug, "folder_path": folderPath, "full_path": fullPath,
 				"canonical_full_path": newCanonical,
-				"data": data, "current_version": next, "updated_at": now,
+				"data":                data, "current_version": next, "updated_at": now,
 			}})
 		if err != nil {
 			return mapDupKey(err, CodePathConflict, "page path conflicts at "+fullPath)
@@ -247,7 +270,7 @@ func mapIdemBeginErr(err error) error {
 	switch code {
 	case idempotency.CodeConflict:
 		return genErr(CodeIdempotencyConflict, "same Idempotency-Key with a different request body", err)
-	case idempotency.CodeInProgress:
+	case idempotency.CodeInProgress, idempotency.CodeLeaseActive:
 		return &Error{Code: CodeRequestInProgress, Message: "operation is already being executed", RetryAfter: 5, Err: err}
 	case idempotency.CodeLeaseExpired:
 		return &Error{Code: CodeRequestInProgress, Message: "worker lease expired; retry to take over the same attempt", RetryAfter: 1, Err: err}
@@ -263,6 +286,11 @@ func mapSagaErr(err error) error {
 	switch code {
 	case publication.CodePagePublishInProgress:
 		return &Error{Code: CodePagePublishInProgress, Message: msg, RetryAfter: 5, Err: err}
+	case publication.CodeActivationUnknown:
+		// Unknown commits converge via same-key retry (the staged record
+		// is retained, never compensated): report in-progress so the
+		// client retries into takeover/resume instead of minting anew.
+		return &Error{Code: CodeRequestInProgress, Message: msg, RetryAfter: 5, Err: err}
 	case publication.CodeStageFailed, publication.CodeVerifyFailed, publication.CodeActivateFailed,
 		publication.CodeUnpublishStageFailed:
 		// Static-store / cutover failures are retryable 503s.

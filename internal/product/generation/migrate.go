@@ -20,10 +20,10 @@ import (
 
 // MigrateSlugResult is the admin guidance returned by MigrateSlug.
 type MigrateSlugResult struct {
-	TemplateID   string `json:"template_id"`
-	OldSlug      string `json:"old_slug"`
-	NewSlug      string `json:"new_slug"`
-	AffectedPages int64 `json:"affected_pages"`
+	TemplateID    string `json:"template_id"`
+	OldSlug       string `json:"old_slug"`
+	NewSlug       string `json:"new_slug"`
+	AffectedPages int64  `json:"affected_pages"`
 	// Guidance for external integrations (MCP/REST/API clients): the slug is
 	// a machine identifier, not a page URL — no redirect is created.
 	Guidance []string `json:"guidance"`
@@ -37,7 +37,7 @@ func (s *Service) MigrateSlug(ctx context.Context, actor Actor, templateID primi
 	if !actor.Authenticated {
 		return zero, genErr(CodeUnauthenticated, "authentication is required", nil)
 	}
-	if !actor.IsAdmin || !actor.HasScope(ScopeTemplateEdit) {
+	if !actor.IsAdmin || !actor.Can(ScopeTemplateEdit) {
 		return zero, genErr(CodePermissionDenied, "migrate-slug requires an admin with template.edit", nil)
 	}
 	if err := templatecontract.ValidateSlug(newSlug); err != nil {

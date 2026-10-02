@@ -1562,6 +1562,7 @@ var adminTemplates = map[string]string{
             <input type="hidden" name="create_redirect" id="create_redirect" value="">
             <input type="hidden" name="slug_rename_enabled" id="slug_rename_enabled" value="">
             <input type="hidden" name="version_comment" id="version_comment" value="">
+            {{if .ActivePublicationID}}<input type="hidden" name="expected_active_id" value="{{.ActivePublicationID}}">{{end}}
 
             {{if not .IsNew}}
             <div class="form-group" style="background: var(--bg-tertiary); padding: 1rem; border-radius: var(--radius); margin-bottom: 1.5rem;">
@@ -1743,6 +1744,7 @@ var adminTemplates = map[string]string{
             <form method="POST" action="/cm/content/{{.Content.ID.Hex}}/publish">
                 {{$.CSRFField}}
                 {{if .ActivePublicationID}}<input type="hidden" name="expected_active_id" value="{{.ActivePublicationID}}">{{end}}
+                {{if .IdempotencyKey}}<input type="hidden" name="idempotency_key" value="{{.IdempotencyKey}}">{{end}}
                 <button type="submit" class="btn btn-primary">{{i18n "content_form.publish_now" "发布上线" $.Lang}}</button>
             </form>
             <a href="/cm/content/{{.Content.ID.Hex}}/publications" class="btn btn-outline">{{i18n "content_form.publication_history" "发布历史" $.Lang}}</a>
@@ -2180,7 +2182,7 @@ var adminTemplates = map[string]string{
             return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         }
 
-        const currentUserRole = {{printf "%q" .CurrentUserRole}};
+        const currentUserRole = {{.CurrentUserRole}};
         </script>
         {{end}}
 

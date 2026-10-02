@@ -713,11 +713,11 @@ func (db *DB) InsertManyUnordered(ctx context.Context, collection string, docs [
 	return db.database.Collection(collection).InsertMany(ctx, docs, opts)
 }
 
-func (db *DB) FindOne(ctx context.Context, collection string, filter interface{}, result interface{}) error {
+func (db *DB) FindOne(ctx context.Context, collection string, filter interface{}, result interface{}, opts ...*options.FindOneOptions) error {
 	if err := db.fault("FindOne", collection); err != nil {
 		return err
 	}
-	return db.database.Collection(collection).FindOne(ctx, filter).Decode(result)
+	return db.database.Collection(collection).FindOne(ctx, filter, opts...).Decode(result)
 }
 
 func (db *DB) FindMany(ctx context.Context, collection string, filter interface{}, opts ...*options.FindOptions) (*mongo.Cursor, error) {

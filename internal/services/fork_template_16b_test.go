@@ -94,7 +94,7 @@ func Test16B_ForkMergeLeavesLiveUnchanged(t *testing.T) {
 
 	uid := live.ID // any ObjectID for merged_by
 	_ = uid
-	fork, err := fs.Create(ctx, "f", "", live.ID, "e@x.com")
+	fork, err := fs.Create(ctx, "f", "", live.ID, "e@x.com", "")
 	if err != nil {
 		t.Fatalf("Create fork: %v", err)
 	}

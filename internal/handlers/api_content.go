@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -272,6 +273,13 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
+	// Draft-only single-write rule (bulk parity): published:true would
+	// persist a live flag with no Publication record/outbox/idempotency.
+	// Fork-scoped creates are exempt: the flag is inert on fork rows
+	// (never served, never generated; merge clears it).
+	if req.ForkID == "" && a.rejectPublishedDirectWrite(w, false, req.Published) {
+		return
+	}
 
 	if req.TemplateID == "" || req.Title == "" || req.Slug == "" {
 		a.jsonError(w, http.StatusBadRequest, "template_id, title, and slug are required")
@@ -360,7 +368,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 	if req.Upsert {
 		created, err := a.contentService.UpsertContent(r.Context(), content, comment)
 		if err != nil {
-			a.jsonError(w, http.StatusInternalServerError, err.Error())
+			a.contentWriteError(w, err)
 			return
 		}
 		action := "updated"
@@ -386,7 +394,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		args = append(args, comment)
 	}
 	if err := a.contentService.CreateContent(r.Context(), content, args...); err != nil {
-		a.jsonError(w, http.StatusInternalServerError, err.Error())
+		a.contentWriteError(w, err)
 		return
 	}
 
@@ -411,6 +419,7 @@ func (a *APIHandler) APIUpdateContent(w http.ResponseWriter, r *http.Request) {
 		a.jsonError(w, http.StatusNotFound, "content not found")
 		return
 	}
+	wasPublished := content.Published
 
 	// Sandbox-only keys may write to fork copies only, never live pages.
 	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && content.ForkID == nil {
@@ -507,8 +516,11 @@ func (a *APIHandler) APIUpdateContent(w http.ResponseWriter, r *http.Request) {
 	if versionComment != "" {
 		args = append(args, versionComment)
 	}
+	if content.ForkID == nil && a.rejectPublishedDirectWrite(w, wasPublished, content.Published) {
+		return
+	}
 	if err := a.contentService.UpdateContent(r.Context(), content, args...); err != nil {
-		a.jsonError(w, http.StatusInternalServerError, err.Error())
+		a.contentWriteError(w, err)
 		return
 	}
 
@@ -556,16 +568,55 @@ func (a *APIHandler) APIRestoreContent(w http.ResponseWriter, r *http.Request) {
 	a.jsonResponse(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
+// contentWriteError maps content-service write failures to HTTP: a lost CAS
+// race (services.ErrVersionConflict) is a 409 CONFLICT for reload + retry —
+// never a 500. All other errors keep the legacy 500 with the raw message.
+func (a *APIHandler) contentWriteError(w http.ResponseWriter, err error) {
+	if errors.Is(err, services.ErrVersionConflict) {
+		a.jsonErrorCode(w, http.StatusConflict, "CONFLICT", "content changed concurrently; reload and retry")
+		return
+	}
+	a.jsonError(w, http.StatusInternalServerError, err.Error())
+}
+
+// rejectPublishedDirectWrite enforces the draft-only single-write rule (Wave
+// 2B bulk parity): flipping published false→true outside the publish
+// endpoints would persist a live flag with no Publication record, no outbox
+// event, and no idempotency. Round-trips that restate an already-live flag
+// are allowed (no state change); everything else must go through
+// POST /api/v1/content/{id}/publish or batch-publish.
+func (a *APIHandler) rejectPublishedDirectWrite(w http.ResponseWriter, wasPublished, wantPublished bool) bool {
+	if !wasPublished && wantPublished {
+		a.jsonError(w, http.StatusBadRequest, "published:true is not accepted on content write (it would bypass publication records, outbox delivery, and idempotency) — save as a draft, then publish via POST /api/v1/content/{id}/publish or POST /api/v1/content/batch-publish")
+		return true
+	}
+	return false
+}
+
+// publishAttribution resolves saga attribution for the legacy REST publish
+// paths (single + batch): actor human|agent from the agent-session header,
+// via "api", session passthrough. Without this the minted Publication
+// records carry no attribution and session rollback (which selects targets
+// by provenance) is blind to REST-driven publishes.
+func publishAttribution(r *http.Request) (actor, via, session string) {
+	session = r.Header.Get("X-Agent-Session")
+	actor, via = "human", "api"
+	if session != "" {
+		actor = "agent"
+	}
+	return actor, via, session
+}
+
 // publicationReqFields builds the Task 16F structured log fields for a
 // legacy publish/unpublish request: actor from the API user + agent
 // session header, request ID passthrough, stage and duration.
 func (a *APIHandler) publicationReqFields(r *http.Request, stage string, t0 time.Time) observe.Fields {
 	f := observe.Fields{
-		RequestID:   r.Header.Get("X-Request-ID"),
+		RequestID:    r.Header.Get("X-Request-ID"),
 		AgentSession: r.Header.Get("X-Agent-Session"),
-		Actor:       "human",
-		Stage:       stage,
-		DurationMS:  time.Since(t0).Milliseconds(),
+		Actor:        "human",
+		Stage:        stage,
+		DurationMS:   time.Since(t0).Milliseconds(),
 	}
 	if f.AgentSession != "" {
 		f.Actor = "agent"
@@ -645,7 +696,12 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 			opID = &op.ID
 			opAttempt = op.Attempt
 		}
-		res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID})
+		pubActor, pubVia, pubSession := publishAttribution(r)
+		pubAdmin := false
+		if u := a.getAPIUser(r); u != nil && u.Role == "admin" {
+			pubAdmin = true
+		}
+		res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID, Actor: pubActor, Via: pubVia, AgentSession: pubSession, AuthorIsAdmin: pubAdmin})
 		if perr != nil {
 			f := a.publicationReqFields(r, "publish", t0)
 			f.ContentID = id.Hex()
@@ -1442,13 +1498,18 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 				opID = &op.ID
 				opAttempt = op.Attempt
 			}
-			res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID})
+			pubActor, pubVia, pubSession := publishAttribution(r)
+			pubAdmin := false
+			if u := a.getAPIUser(r); u != nil && u.Role == "admin" {
+				pubAdmin = true
+			}
+			res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID, Actor: pubActor, Via: pubVia, AgentSession: pubSession, AuthorIsAdmin: pubAdmin})
 			if perr != nil {
 				failed = append(failed, map[string]string{"id": id.Hex(), "error": sanitizeAPIError(perr)})
 			} else {
 				if opID != nil && a.idempotencyService != nil {
 					_, _ = a.idempotencyService.Complete(r.Context(), *opID, opAttempt, 200, map[string]any{
-						"success": true,
+						"success":        true,
 						"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
 						"content_id": res.ContentID.Hex(), "full_path": res.FullPath,
 					}, false)
@@ -1549,6 +1610,7 @@ func (a *APIHandler) APIUpdateContentByPath(w http.ResponseWriter, r *http.Reque
 		a.jsonError(w, http.StatusNotFound, "content not found at path: "+path)
 		return
 	}
+	wasPublished := content.Published
 
 	// Sandbox-only keys may write to fork copies only, never live pages.
 	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && content.ForkID == nil {
@@ -1605,8 +1667,11 @@ func (a *APIHandler) APIUpdateContentByPath(w http.ResponseWriter, r *http.Reque
 	if versionComment != "" {
 		args = append(args, versionComment)
 	}
+	if content.ForkID == nil && a.rejectPublishedDirectWrite(w, wasPublished, content.Published) {
+		return
+	}
 	if err := a.contentService.UpdateContent(r.Context(), content, args...); err != nil {
-		a.jsonError(w, http.StatusInternalServerError, err.Error())
+		a.contentWriteError(w, err)
 		return
 	}
 

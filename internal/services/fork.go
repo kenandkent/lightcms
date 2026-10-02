@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/database"
@@ -67,7 +68,7 @@ func generatePreviewToken() (string, error) {
 }
 
 // Create creates a new fork workspace.
-func (s *ForkService) Create(ctx context.Context, name, description string, userID primitive.ObjectID, userEmail string) (*models.ContentFork, error) {
+func (s *ForkService) Create(ctx context.Context, name, description string, userID primitive.ObjectID, userEmail string, session string) (*models.ContentFork, error) {
 	token, err := generatePreviewToken()
 	if err != nil {
 		return nil, fmt.Errorf("generate preview token: %w", err)
@@ -81,12 +82,37 @@ func (s *ForkService) Create(ctx context.Context, name, description string, user
 		PreviewToken:   token,
 		CreatedBy:      userID,
 		CreatedByEmail: userEmail,
+		AgentSession:   session,
 		CreatedAt:      now,
 	}
 	if _, err := s.db.InsertOne(ctx, "content_forks", fork); err != nil {
 		return nil, fmt.Errorf("insert fork: %w", err)
 	}
 	return fork, nil
+}
+
+// FindActiveSandboxFork resolves the caller's active agent-sandbox fork by
+// (owner, session) — the R09 server-side binding for V3 mode=sandbox. Only a
+// fork that is still active AND created by this user in this session
+// resolves; merged/archived forks, other users' forks, and empty sessions
+// never do. Callers must fail closed when this errors.
+func FindActiveSandboxFork(ctx context.Context, db *database.DB, userIDHex, session string) (*primitive.ObjectID, error) {
+	if strings.TrimSpace(session) == "" {
+		return nil, fmt.Errorf("agent session is required for sandbox resolution")
+	}
+	uid, err := primitive.ObjectIDFromHex(strings.TrimSpace(userIDHex))
+	if err != nil {
+		return nil, fmt.Errorf("invalid user ID for sandbox resolution: %w", err)
+	}
+	var fork models.ContentFork
+	err = db.FindOne(ctx, "content_forks", bson.M{
+		"created_by": uid, "agent_session": session, "status": "active",
+	}, &fork, options.FindOne().SetSort(bson.M{"created_at": -1}))
+	if err != nil {
+		return nil, fmt.Errorf("no active sandbox fork for this session: %w", err)
+	}
+	id := fork.ID
+	return &id, nil
 }
 
 // GetByID returns a fork by its ObjectID.

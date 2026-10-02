@@ -67,27 +67,27 @@ type UpgradePreview struct {
 
 // UpgradeJob is the durable record.
 type UpgradeJob struct {
-	ID            primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	TemplateID    primitive.ObjectID `bson:"template_id" json:"template_id"`
-	TemplateSlug  string             `bson:"template_slug" json:"template_slug"`
-	FromVersion   int64              `bson:"from_version" json:"from_version"`
-	ToVersion     int64              `bson:"to_version" json:"to_version"`
+	ID              primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TemplateID      primitive.ObjectID `bson:"template_id" json:"template_id"`
+	TemplateSlug    string             `bson:"template_slug" json:"template_slug"`
+	FromVersion     int64              `bson:"from_version" json:"from_version"`
+	ToVersion       int64              `bson:"to_version" json:"to_version"`
 	TargetVersionID primitive.ObjectID `bson:"target_version_id" json:"target_version_id"`
-	Status        UpgradeJobStatus   `bson:"status" json:"status"`
-	Items         []UpgradeJobItem   `bson:"items" json:"items"`
-	CreatedBy     string             `bson:"created_by" json:"created_by"`
-	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
-	UpdatedAt     time.Time          `bson:"updated_at" json:"updated_at"`
+	Status          UpgradeJobStatus   `bson:"status" json:"status"`
+	Items           []UpgradeJobItem   `bson:"items" json:"items"`
+	CreatedBy       string             `bson:"created_by" json:"created_by"`
+	CreatedAt       time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt       time.Time          `bson:"updated_at" json:"updated_at"`
 }
 
 // UpgradeJobItem is one page's outcome.
 type UpgradeJobItem struct {
-	ContentID     primitive.ObjectID `bson:"content_id" json:"content_id"`
-	FullPath      string             `bson:"full_path" json:"full_path"`
-	Status        UpgradeItemStatus  `bson:"status" json:"status"`
-	Attempts      int                `bson:"attempts" json:"attempts"`
+	ContentID     primitive.ObjectID  `bson:"content_id" json:"content_id"`
+	FullPath      string              `bson:"full_path" json:"full_path"`
+	Status        UpgradeItemStatus   `bson:"status" json:"status"`
+	Attempts      int                 `bson:"attempts" json:"attempts"`
 	PublicationID *primitive.ObjectID `bson:"publication_id,omitempty" json:"publication_id,omitempty"`
-	Error         string             `bson:"error,omitempty" json:"error,omitempty"`
+	Error         string              `bson:"error,omitempty" json:"error,omitempty"`
 }
 
 // PreviewUpgrade lists pages referencing slug at their frozen versions.
@@ -97,7 +97,7 @@ func (s *Service) PreviewUpgrade(ctx context.Context, actor Actor, slug string) 
 	if !actor.Authenticated {
 		return zero, genErr(CodeUnauthenticated, "authentication is required", nil)
 	}
-	if !actor.HasScope(ScopeTemplateView) {
+	if !actor.Can(ScopeTemplateView) {
 		return zero, genErr(CodePermissionDenied, "missing required scope template.view", nil)
 	}
 	tpl, err := s.templatesRepo().FindTemplateBySlug(ctx, slug)
@@ -167,11 +167,11 @@ func (s *Service) StartUpgradeJob(ctx context.Context, actor Actor, slug string)
 	if !actor.Authenticated {
 		return zero, genErr(CodeUnauthenticated, "authentication is required", nil)
 	}
-	if !actor.IsAdmin || !actor.HasScope(ScopeTemplateEdit) {
+	if !actor.IsAdmin || !actor.Can(ScopeTemplateEdit) {
 		return zero, genErr(CodePermissionDenied, "upgrade jobs require an admin with template.edit", nil)
 	}
 	preview, err := s.PreviewUpgrade(ctx, Actor{
-		Authenticated: true, IsAdmin: actor.IsAdmin, Scopes: []string{},
+		Authenticated: true, IsAdmin: actor.IsAdmin, Role: actor.Role, Scopes: []string{},
 		Email: actor.Email, ID: actor.ID,
 	}, slug)
 	if err != nil {
@@ -218,7 +218,7 @@ func (s *Service) GetUpgradeJob(ctx context.Context, actor Actor, jobID primitiv
 	if !actor.Authenticated {
 		return zero, genErr(CodeUnauthenticated, "authentication is required", nil)
 	}
-	if !actor.HasScope(ScopeTemplateView) {
+	if !actor.Can(ScopeTemplateView) {
 		return zero, genErr(CodePermissionDenied, "missing required scope template.view", nil)
 	}
 	var job UpgradeJob
@@ -241,7 +241,7 @@ func (s *Service) RunUpgradeJob(ctx context.Context, actor Actor, jobID primitiv
 	if !actor.Authenticated {
 		return zero, genErr(CodeUnauthenticated, "authentication is required", nil)
 	}
-	if !actor.HasScope(ScopeContentPublish) || !actor.HasScope(ScopeContentEdit) {
+	if !actor.Can(ScopeContentPublish) || !actor.Can(ScopeContentEdit) {
 		return zero, genErr(CodePermissionDenied, "upgrade run requires content.edit + content.publish", nil)
 	}
 	job, err := s.GetUpgradeJob(ctx, actor, jobID)
@@ -345,6 +345,7 @@ func (s *Service) publishUpgradeItem(ctx context.Context, actor Actor, job Upgra
 		Reason: "template upgrade job " + job.ID.Hex(),
 		// Lane 2B: thread caller attribution into the minted record.
 		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
+		AuthorIsAdmin: actor.IsAdmin,
 	}
 	if s.idem == nil {
 		return s.pubs.Publish(ctx, req)
@@ -352,7 +353,7 @@ func (s *Service) publishUpgradeItem(ctx context.Context, actor Actor, job Upgra
 	owner := actor.Owner()
 	path := "/internal/upgrade-jobs/" + job.ID.Hex() + "/publish"
 	key := "upgrade/" + job.ID.Hex() + "/" + contentID.Hex()
-	op, berr := s.idem.Begin(ctx, owner, "POST", path, key, nil)
+	op, berr := s.beginOrResume(ctx, owner, "POST", path, key, nil)
 	if berr != nil {
 		return publication.PublicationResult{}, mapIdemBeginErr(berr)
 	}

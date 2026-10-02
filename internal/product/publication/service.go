@@ -106,6 +106,12 @@ const (
 	// (errors.Is(err, ErrStopAfterRename)): no compensation ran and the
 	// on-disk files are preserved for Task 10 restart repair.
 	CodeCrashStop = "CRASH_STOP_AFTER_RENAME"
+	// CodeActivationUnknown marks an indeterminate commit (R11): the
+	// activation transaction errored AND the read-back failed too, so the
+	// commit may or may not have landed. Nothing is compensated and the
+	// staged record is kept — the scanner or a same-key retry converges.
+	// Callers must retry the same key, never mint a new operation.
+	CodeActivationUnknown = "ACTIVATION_UNKNOWN"
 	// CodeInternal marks unexpected saga failures (never leaks driver detail).
 	CodeInternal = "INTERNAL_ERROR"
 )
@@ -128,6 +134,10 @@ var ErrStopAfterRename = errors.New("publication saga: stop after canonical rena
 // and before the Mongo activation transaction.
 type Faults struct {
 	BeforeCommit func(ctx context.Context) error
+	// CommitReadError, when non-nil, replaces the post-commit read-back
+	// error (R11 unknown-path test seam): combined with a failing commit
+	// it deterministically exercises the indeterminate-commit branch.
+	CommitReadError error
 }
 
 // Options wires the saga. DB, Repo and Store are required; everything else
@@ -139,10 +149,16 @@ type Options struct {
 	Idem      *idempotency.Service
 	URLs      *publicurl.Resolver
 	Renderer  Renderer
-	Purge     func(ctx context.Context, urls []string) error
-	Audit     func(ctx context.Context, action string, fields map[string]any)
-	Faults    Faults
-	Now       func() time.Time
+	// SnapshotRender, when non-nil, replaces Renderer for plan builds with
+	// the frozen snapshot pipeline (PlanSnapshot + RenderDetailed: Markdown,
+	// sanitizer policy, snippets, wikilinks, TOC). R02: production MUST set
+	// this — the minimal DefaultRenderer marks every string trusted HTML
+	// with no sanitization. Tests keep passing explicit Renderer fakes.
+	SnapshotRender SnapshotRenderFunc
+	Purge          func(ctx context.Context, urls []string) error
+	Audit          func(ctx context.Context, action string, fields map[string]any)
+	Faults         Faults
+	Now            func() time.Time
 
 	RendererVersion string
 	BuildSHA        string
@@ -159,6 +175,7 @@ type Service struct {
 	idem      *idempotency.Service
 	urls      *publicurl.Resolver
 	renderer  Renderer
+	snapshot  SnapshotRenderFunc
 	purge     func(ctx context.Context, urls []string) error
 	audit     func(ctx context.Context, action string, fields map[string]any)
 	faults    Faults
@@ -195,7 +212,7 @@ func NewService(db *database.DB, repo *Repository, store storage.Store, opts Opt
 	return &Service{
 		db: db, repo: repo, store: store,
 		templates: templates, idem: opts.Idem, urls: opts.URLs,
-		renderer: render, purge: opts.Purge, audit: opts.Audit,
+		renderer: render, snapshot: opts.SnapshotRender, purge: opts.Purge, audit: opts.Audit,
 		faults: opts.Faults, now: now,
 		rendererVersion: rendererVersion, buildSHA: buildSHA,
 	}
@@ -291,6 +308,30 @@ func (s *Service) Unpublish(ctx context.Context, req UnpublishRequest) error {
 
 	did, err := s.repo.UnpublishCAS(ctx, req.ContentID, req.ExpectedActiveID)
 	if err != nil {
+		// R11 symmetric with publish: determine whether the transaction
+		// took effect before touching files. Still-active ⇒ the txn did
+		// not commit and restoring the backup is safe. Read failure ⇒
+		// UNKNOWN: never resurrect (the txn may have committed) — leave
+		// the backup for the scanner and report retryable unknown.
+		// No active record ⇒ the unpublish took effect despite the error
+		// (or a concurrent one did): converge by dropping the backup.
+		cur, rerr := s.repo.GetActive(ctx, req.ContentID)
+		if rerr != nil {
+			s.auditf(ctx, "publication.unpublish_unknown", map[string]any{
+				"content_id": req.ContentID.Hex(), "full_path": targetPath,
+			})
+			return sagaErr(CodeActivationUnknown,
+				"unpublish transaction result unknown; backup retained for recovery — retry", err)
+		}
+		if cur == nil {
+			_ = s.store.RemoveUnpublishBackup(ctx, targetPath, active.ID)
+			s.bestEffortPurge(ctx, []string{targetPath})
+			s.auditf(ctx, "publication.unpublish", map[string]any{
+				"content_id": content.ID.Hex(), "publication_id": active.ID.Hex(),
+				"full_path": targetPath, "converged_after_error": true,
+			})
+			return nil
+		}
 		if backedUp {
 			if rerr := s.store.RestoreUnpublishBackup(ctx, targetPath, active.ID); rerr != nil {
 				return sagaErr(CodeUnpublishStageFailed,

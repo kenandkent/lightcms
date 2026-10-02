@@ -47,11 +47,11 @@ func newExtraSetup(t *testing.T) (*generation.Service, *httpapi.Handlers, genera
 	if _, _, err := tpls.Create(ctx, templatecontract.TemplateInput{
 		Slug: "financial-news", Name: "FN", Category: "news", Status: "active",
 		HTMLLayout: extraLayout,
-		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+		Fields:     []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	admin := generation.Actor{ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}}
+	admin := generation.Actor{Role: "admin", ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}}
 	h := &httpapi.Handlers{Gen: gen,
 		ActorExtractor: func(r *http.Request) (generation.Actor, error) { return admin, nil },
 		IdempotencyExtractor: func(r *http.Request) (string, bool) {
@@ -96,7 +96,7 @@ func TestHTTP_StaleVersionZeroMutation(t *testing.T) {
 	_, err := tpls.Update(ctx, tplRec.ID, 1, templatecontract.TemplateInput{
 		Slug: "financial-news", Name: "FN", Category: "news", Status: "active",
 		HTMLLayout: extraLayout + "<!-- v2 -->",
-		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+		Fields:     []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
 	})
 	if err != nil {
 		t.Fatalf("bump: %v", err)
@@ -131,7 +131,7 @@ func TestHTTP_RestoreRevertDistinct(t *testing.T) {
 	raw := []byte(`{"t":1}`)
 	pctx := generation.WithIdempotency(ctx, generation.IdempotencyParams{Owner: "a1", Method: "POST", Path: "/api/v1/page-generation", Key: "k-rr-http-1", Body: raw})
 	v1 := int64(1)
-	r1, err := gen.Generate(pctx, generation.Actor{ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}},
+	r1, err := gen.Generate(pctx, generation.Actor{Role: "admin", ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}},
 		generation.GenerateRequest{Template: "financial-news", Title: "RR", Slug: "rr-http", FolderPath: "/n",
 			Mode: "publish", ExpectedTemplateVersion: &v1, Data: map[string]any{"headline": "v1"}})
 	if err != nil {
@@ -141,7 +141,7 @@ func TestHTTP_RestoreRevertDistinct(t *testing.T) {
 	pid := *r1.PublicationID
 	raw2 := []byte(`{"t":2}`)
 	pctx2 := generation.WithIdempotency(ctx, generation.IdempotencyParams{Owner: "a1", Method: "POST", Path: "/api/v1/page-generation", Key: "k-rr-http-2", Body: raw2})
-	_, err = gen.Generate(pctx2, generation.Actor{ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}},
+	_, err = gen.Generate(pctx2, generation.Actor{Role: "admin", ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}},
 		generation.GenerateRequest{Template: "financial-news", Title: "RR", Slug: "rr-http", FolderPath: "/n",
 			Mode: "publish", Upsert: true, ExpectedTemplateVersion: &v1, Data: map[string]any{"headline": "v2"}})
 	if err != nil {

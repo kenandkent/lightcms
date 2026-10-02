@@ -22,6 +22,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/net/proxy"
 )
 
@@ -584,6 +585,12 @@ func (s *SearchService) UpdateContentEmbeddingForVersion(ctx context.Context, co
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &content); err != nil {
 		return false, fmt.Errorf("content not found: %w", err)
 	}
+	if content.ForkID != nil {
+		// Defense in depth: fork copies share the live full_path and must
+		// never enter the embedding index. Callers already guard, but a
+		// direct call with a fork ID must be a no-op, not an index write.
+		return false, nil
+	}
 
 	plainText := ExtractPlainText(&content)
 	if plainText == "" {
@@ -648,18 +655,32 @@ func (s *SearchService) BatchGenerateEmbeddings(ctx context.Context) (processed,
 		return 0, 0, fmt.Errorf("no embedding provider configured (set VOYAGE_API_KEY or LIGHTCMS_EMBEDDINGS_PROVIDER=ollama)")
 	}
 
-	// Find all published, non-deleted content
+	// Find all published, non-deleted, non-fork content. Fork copies share
+	// the live full_path and must never enter the embedding index; the
+	// projection keeps the ~4KB embedding vector (and every other large
+	// field) off the wire — only the inputs to ExtractPlainText and the
+	// version-pin comparisons are loaded.
 	filter := bson.M{
 		"published": true,
 		"deleted":   bson.M{"$ne": true},
+		"fork_id":   bson.M{"$exists": false},
 	}
-
-	var contents []models.Content
-	if err := s.db.FindAll(ctx, "content", filter, &contents); err != nil {
+	proj := options.Find().SetProjection(bson.M{
+		"data": 1, "plain_text": 1, "embedding_at": 1, "updated_at": 1,
+		"current_version": 1, "embedding_version": 1, "full_path": 1,
+	})
+	cursor, err := s.db.FindMany(ctx, "content", filter, proj)
+	if err != nil {
 		return 0, 0, fmt.Errorf("failed to list content: %w", err)
 	}
+	defer cursor.Close(ctx)
 
-	for _, c := range contents {
+	for cursor.Next(ctx) {
+		var c models.Content
+		if derr := cursor.Decode(&c); derr != nil {
+			errCount++
+			continue
+		}
 		plainText := ExtractPlainText(&c)
 		if plainText == "" {
 			continue
@@ -694,6 +715,9 @@ func (s *SearchService) BatchGenerateEmbeddings(ctx context.Context) (processed,
 		if embedded {
 			processed++
 		}
+	}
+	if cerr := cursor.Err(); cerr != nil {
+		return processed, errCount + 1, fmt.Errorf("content cursor failed: %w", cerr)
 	}
 
 	return processed, errCount, nil

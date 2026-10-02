@@ -166,3 +166,44 @@ clean; `bin/lightcms-mcp` rebuilt (122 tools unchanged — verified by source co
 `/tmp/wave5-regression-20261002-020908.log`. The §9 external reviews should treat the
 wave 1–4 deltas as in-scope additions — security review in particular now covers the new
 RBAC gates and saga-delegated form saves.
+
+## 12. Post-review hardening round — R01–R12 + admin/API findings (2026-10-02)
+
+An independent implementation review (`docs/reviews/2026-10-02-code-implementation-review.md`,
+12 findings R01–R12 against `de943b7`) plus a self-review of the wave 1–4
+surface (5 blockers + 9 majors) were verified claim-by-claim against the
+code — every cited location reproduced — and fixed together in this tree:
+
+- **R01/R09 (authz)**: `generation.Actor` carries `Role`; all checks use
+  `Can()` (role ∩ sandbox ∩ scopes); extractors populate it; sandbox mode
+  resolves the owned active fork by (user, session) with fork-session
+  attribution on creation.
+- **R02 (render)**: production saga renders via the frozen snapshot
+  pipeline (`SnapshotRender`, wired in `buildPublicationRuntime`);
+  `AuthorIsAdmin` threaded from every publish caller; provenance from the
+  actual result.
+- **R03 (cutover)**: prepare-verify-copy-then-single-rename; concurrent-stat
+  test proves zero missing-window.
+- **R04–R07 (idempotency)**: takeover + resume (skip-written-content,
+  complete-cached-when-active), auth-before-Begin, replay-before-gates,
+  422-rebuild, stable hashes, heartbeat + ownership fencing.
+- **R08/R11 (commit)**: redirect in activation txn; unknown-commit
+  no-compensation + idempotent re-stage; symmetric unpublish.
+- **R10/R12 (deploy)**: single-instance liveness gate; production HTTPS
+  base-URL fail-fast (incl. `prod` env).
+- **Admin/API**: ServePage deleted filter; 22 mutating admin endpoints
+  gated; copilot edit+publish; middleware 401 codes; REST/admin/comment/
+  delete provenance; admin publish idempotency keys; single-point
+  draft-only (fork-exempt); 409 CAS mapping; fork-free embeddings with
+  projections; MCP description accuracy; `%q` escape fix.
+
+Evidence: full regression `go test -p 1 ./... -count=1` on this tree →
+**exit 0, 29 packages ok, 0 FAIL**; `go vet ./...` clean; both MCP and
+server binaries rebuild from this tree. Log:
+`/tmp/review-fixes-regression-20261002-190543.log`. New regression tests
+were added per fix (see commit file list); three pre-existing tests were
+updated to the corrected semantics (poison-lease wedge → no-lease 403,
+lease-expiry 409 → takeover resume, stale-version-without-key 428).
+The §9 external reviews remain the release gate and should treat this
+round as in-scope additions — particularly the R01/R09 authz changes and
+the R02 renderer swap, which alter externally visible behavior by design.

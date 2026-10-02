@@ -23,7 +23,7 @@ func TestForkService_Merge_CreateUpdateConflict(t *testing.T) {
 
 	liveID := seedLiveContent(t, db, "Live Original", "/merge-live")
 
-	fork, err := fs.Create(ctx, "merge-fork", "", uid, "ed@x.com")
+	fork, err := fs.Create(ctx, "merge-fork", "", uid, "ed@x.com", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestForkService_Merge_Errors(t *testing.T) {
 	}
 
 	// InsertOne failure while creating a new live page.
-	fork, err := fs.Create(ctx, "err-fork", "", uid, "ed@x.com")
+	fork, err := fs.Create(ctx, "err-fork", "", uid, "ed@x.com", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestForkService_Merge_Errors(t *testing.T) {
 
 	// UpdateOne failure while updating an existing live page.
 	liveID := seedLiveContent(t, db, "Live Err", "/err-live")
-	fork2, err := fs.Create(ctx, "err-fork-2", "", uid, "ed@x.com")
+	fork2, err := fs.Create(ctx, "err-fork-2", "", uid, "ed@x.com", "")
 	if err != nil {
 		t.Fatalf("Create 2: %v", err)
 	}

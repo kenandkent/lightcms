@@ -120,6 +120,7 @@ func (s *ContentService) PublishInternal(ctx context.Context, contentID primitiv
 	_, perr := legacyPublicationSaga.Publish(ctx, publication.PublishRequest{
 		ContentID: contentID, IdempotencyRecord: &op.ID,
 		Actor: actor, Via: via, AgentSession: session,
+		AuthorIsAdmin: AuthorIsAdminFromContext(ctx),
 	})
 	if perr != nil {
 		// Pre-activation failure: mark terminal so the next same-key Begin

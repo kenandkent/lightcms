@@ -67,6 +67,22 @@ func ProvenanceFromContext(ctx context.Context) (Provenance, bool) {
 	return p, ok
 }
 
+type authorIsAdminContextKey struct{}
+
+// WithAuthorIsAdmin carries the publishing principal's admin flag for
+// script-policy resolution (R02: policy admin_only renders raw only for
+// admins). Fail-closed default: unstamped contexts render strict.
+func WithAuthorIsAdmin(ctx context.Context, isAdmin bool) context.Context {
+	return context.WithValue(ctx, authorIsAdminContextKey{}, isAdmin)
+}
+
+// AuthorIsAdminFromContext extracts the admin flag stored by
+// WithAuthorIsAdmin (false when unstamped).
+func AuthorIsAdminFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(authorIsAdminContextKey{}).(bool)
+	return v
+}
+
 // ContentService centralizes all content operations with automatic versioning
 type ContentService struct {
 	db               *database.DB
@@ -751,6 +767,7 @@ func (s *ContentService) PublishContent(ctx context.Context, id primitive.Object
 		actor, via, session := publishAttributionFromContext(ctx)
 		_, err := legacyPublicationSaga.Publish(ctx, publication.PublishRequest{
 			ContentID: id, Actor: actor, Via: via, AgentSession: session,
+			AuthorIsAdmin: AuthorIsAdminFromContext(ctx),
 		})
 		return err
 	}
@@ -860,6 +877,17 @@ func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectI
 	_ = content
 
 	return nil
+}
+
+// RecordVersion persists a version snapshot for a row the caller already
+// mutated through a bespoke path (e.g. the admin soft-delete, which bypasses
+// UpdateContent but must still leave an attributed version for history and
+// session rollback). content is the post-mutation row, original the
+// pre-mutation row, comment the version comment. Actor/provenance come from
+// ctx (WithEditorEmail / WithProvenance); without them the version is
+// unattributed.
+func (s *ContentService) RecordVersion(ctx context.Context, content *models.Content, original *models.Content, comment string) error {
+	return s.saveVersion(ctx, content, original, comment)
 }
 
 // RestoreContent restores soft-deleted content

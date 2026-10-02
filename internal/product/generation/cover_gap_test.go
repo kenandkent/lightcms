@@ -101,7 +101,7 @@ func TestCoverGapGenerateValidation(t *testing.T) {
 	if _, err := gen.Generate(ctx, authed(), generation.GenerateRequest{Mode: "bogus"}); generation.CodeOf(err) != generation.CodeInvalidRequest {
 		t.Fatalf("unknown mode: %v", err)
 	}
-	if _, err := gen.Generate(ctx, generation.Actor{}, gapDraftReq("gapval", "T", "", nil)); generation.CodeOf(err) != generation.CodeUnauthenticated {
+	if _, err := gen.Generate(ctx, generation.Actor{Role: "admin"}, gapDraftReq("gapval", "T", "", nil)); generation.CodeOf(err) != generation.CodeUnauthenticated {
 		t.Fatalf("unauthenticated: %v", err)
 	}
 	if _, err := gen.Generate(ctx, authed(), generation.GenerateRequest{Mode: "draft"}); generation.CodeOf(err) != generation.CodeFieldValidationFailed {
@@ -125,7 +125,12 @@ func TestCoverGapGenerateValidation(t *testing.T) {
 	stale := tv + 5
 	pubStale := pubNoVer
 	pubStale.ExpectedTemplateVersion = &stale
-	if _, err := gen.Generate(ctx, authed(), pubStale); generation.CodeOf(err) != generation.CodeTemplateVersionChanged {
+	// R06 ordering: the key-presence 428 precedes the version-value check,
+	// so the stale expectation needs a key to reach the 409.
+	staleCtx := generation.WithIdempotency(ctx, generation.IdempotencyParams{
+		Owner: "cover", Method: "POST", Path: "/p", Key: "k-gap-stale",
+	})
+	if _, err := gen.Generate(staleCtx, authed(), pubStale); generation.CodeOf(err) != generation.CodeTemplateVersionChanged {
 		t.Fatalf("stale version: %v", err)
 	}
 	pubNoKey := pubNoVer
@@ -202,7 +207,7 @@ func TestCoverGapGenerateValidation(t *testing.T) {
 		Data: map[string]any{"headline": "h"}}); err != nil {
 		t.Fatalf("preview with view scope: %v", err)
 	}
-	sandboxOnly := generation.Actor{ID: "a", Email: "a@e", Authenticated: true, SandboxOnly: true,
+	sandboxOnly := generation.Actor{Role: "admin", ID: "a", Email: "a@e", Authenticated: true, SandboxOnly: true,
 		Scopes: []string{"content.create", "content.edit", "content.publish", "content.view"}}
 	if _, err := gen.Generate(ctx, sandboxOnly, gapDraftReq("gapval", "T", "", nil)); generation.CodeOf(err) != generation.CodePermissionDenied {
 		t.Fatalf("sandbox-only draft: %v", err)
@@ -291,7 +296,7 @@ func TestCoverGapForkSandboxAndIdemMatrix(t *testing.T) {
 
 	// Sandbox flow with a real sandbox fork ID.
 	forkID := primitive.NewObjectID()
-	sandboxActor := generation.Actor{ID: "ag", Email: "ag@e", Authenticated: true,
+	sandboxActor := generation.Actor{Role: "admin", ID: "ag", Email: "ag@e", Authenticated: true,
 		Scopes: []string{}, SandboxForkID: &forkID, ActorKind: "agent"}
 	sbReq := generation.GenerateRequest{Template: "gapfork", Title: "Sandbox Me", Slug: "sandbox-me",
 		FolderPath: "/news", Mode: "sandbox", Data: map[string]any{"headline": "s1"}}
@@ -338,7 +343,10 @@ func TestCoverGapForkSandboxAndIdemMatrix(t *testing.T) {
 		t.Fatalf("in progress: %v", err)
 	}
 	// Expire the manual op lease, then Begin-equivalent via Generate with the
-	// same body: lease-expired → 409 + Retry-After.
+	// same body: the expired lease is CAS-taken-over and resumed (R04) —
+	// nothing was ever written under it, so the publish completes instead
+	// of wedging on REQUEST_IN_PROGRESS. Same key retried again replays
+	// the minted publication.
 	if _, err := db.Collection("idempotency_records").UpdateOne(ctx,
 		bson.M{"owner": actor.Owner(), "key": "k-gap-idem"},
 		bson.M{"$set": bson.M{"processing_expires_at": time.Now().Add(-time.Minute)}}); err != nil {
@@ -347,8 +355,19 @@ func TestCoverGapForkSandboxAndIdemMatrix(t *testing.T) {
 	expCtx := generation.WithIdempotency(ctx, generation.IdempotencyParams{
 		Owner: actor.Owner(), Method: "POST", Path: "/p", Key: "k-gap-idem", Body: rawA,
 	})
-	if _, err := gen.Generate(expCtx, actor, cReq); generation.CodeOf(err) != generation.CodeRequestInProgress {
-		t.Fatalf("lease expired: %v", err)
+	toRes, err := gen.Generate(expCtx, actor, cReq)
+	if err != nil {
+		t.Fatalf("lease takeover resume: %v", err)
+	}
+	if toRes.PublicationID == nil {
+		t.Fatal("takeover resume must mint a publication")
+	}
+	toAgain, err := gen.Generate(expCtx, actor, cReq)
+	if err != nil {
+		t.Fatalf("post-takeover replay: %v", err)
+	}
+	if toAgain.PublicationID == nil || *toAgain.PublicationID != *toRes.PublicationID {
+		t.Fatal("post-takeover retry must replay the same publication")
 	}
 
 	// Publish validation caching: invalid data + key → 422 (cached as

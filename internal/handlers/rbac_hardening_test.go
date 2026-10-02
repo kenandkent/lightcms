@@ -258,7 +258,7 @@ func TestRBAC_ForkWrite_ViewerForbidden(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	fork, err := h.forkService.Create(ctx, "RBAC WS", "d", primitive.NewObjectID(), "admin@test.local")
+	fork, err := h.forkService.Create(ctx, "RBAC WS", "d", primitive.NewObjectID(), "admin@test.local", "")
 	if err != nil {
 		t.Fatalf("seed fork: %v", err)
 	}

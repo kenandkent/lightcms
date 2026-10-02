@@ -59,7 +59,7 @@ func TestForkService_Merge(t *testing.T) {
 	uid := primitive.NewObjectID()
 
 	liveID := seedLiveContent(t, db, "Home", "/home")
-	fork, err := fs.Create(ctx, "WS", "", uid, "e@x.com")
+	fork, err := fs.Create(ctx, "WS", "", uid, "e@x.com", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

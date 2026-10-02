@@ -152,6 +152,13 @@ var sandboxAllowedPerms = map[string]bool{
 	PermDiscussionPost: true,
 }
 
+// SandboxPermitted reports whether perm is available to sandbox-only API
+// keys (exported for the V3 generation actor check, which mirrors
+// UserHasPermission without importing session state).
+func SandboxPermitted(perm string) bool {
+	return sandboxAllowedPerms[perm]
+}
+
 // UserHasPermission checks a permission against the user's role, then
 // narrows by the API key's scopes (when set) and sandbox-only restriction.
 func UserHasPermission(u *SessionUser, perm string) bool {

@@ -75,7 +75,26 @@ func (a *APIHandler) APICreateComment(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	comment, err := a.commentService.Create(r.Context(), id, userID, userEmail, displayName,
+	// Stamp editor identity + provenance so agent API comments carry
+	// Via/Session (the service defaults to human/empty otherwise, leaving
+	// session rollback blind to this path). Never clobber middleware-stamped
+	// provenance: the /api/v1 chain stamps first and is authoritative.
+	cctx := r.Context()
+	if _, ok := services.ProvenanceFromContext(cctx); !ok {
+		if userEmail != "" {
+			cctx = services.WithEditorEmail(cctx, userEmail)
+		}
+		actor := "human"
+		if session := r.Header.Get("X-Agent-Session"); session != "" {
+			actor = "agent"
+			cctx = services.WithProvenance(cctx, services.Provenance{Actor: actor, Via: "api", AgentSession: session})
+		} else {
+			cctx = services.WithProvenance(cctx, services.Provenance{Actor: actor, Via: "api"})
+		}
+	} else if userEmail != "" && services.EditorEmailFromContext(cctx) == "" {
+		cctx = services.WithEditorEmail(cctx, userEmail)
+	}
+	comment, err := a.commentService.Create(cctx, id, userID, userEmail, displayName,
 		strings.TrimSpace(req.Text), mentionIDs)
 	if err != nil {
 		// Lane 2C fix 2: orphan comments are 404, not 500.

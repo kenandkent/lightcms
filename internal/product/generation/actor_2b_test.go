@@ -17,7 +17,8 @@ func TestPublishCarriesActorAttribution(t *testing.T) {
 	_, _, tv := s.seedTemplate(t, "financial-news", "", nil)
 
 	actor := generation.Actor{
-		ID: "agent-7", Email: "agent@example.com", Authenticated: true,
+		Role: "admin",
+		ID:   "agent-7", Email: "agent@example.com", Authenticated: true,
 		IsAdmin: true, Scopes: []string{},
 		ActorKind: "agent", Via: "api", AgentSession: "sess-2b-actor",
 	}

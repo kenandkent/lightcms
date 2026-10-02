@@ -460,6 +460,7 @@ func main() {
 	// storage and production standalone Mongo before serving.
 	rt, err := buildPublicationRuntime(context.Background(), db, cfg, runtimeDeps{
 		Cloudflare: cfService, Audit: auditService, Webhooks: webhookService,
+		Content:    contentService,
 	})
 	if err != nil {
 		log.Fatalf("Failed to build publication runtime: %v", err)
@@ -476,6 +477,22 @@ func main() {
 		setMigrationRequired(reason)
 		h.SetMigrationRequired(reason)
 	}
+	// R12: production must serve from a canonical HTTPS public origin
+	// (non-production keeps warn-only degradation inside the runtime).
+	if err := requireProductionBaseURL(cfg.Env, cfg.PublicBaseURL); err != nil {
+		log.Fatalf("Invalid production base URL: %v", err)
+	}
+	// R10: multi-instance deployment is unsupported — fail fast when
+	// another live instance holds the liveness gate. gateCtx is fresh:
+	// the connect-scoped ctx above may already be past its deadline.
+	instanceID := newInstanceID()
+	gateCtx, gateCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stopGate, gateErr := enforceSingleInstance(gateCtx, db, instanceID, build.GetVersion())
+	gateCancel()
+	if gateErr != nil {
+		log.Fatalf("Single-instance gate: %v", gateErr)
+	}
+	defer stopGate()
 	// Legacy ContentService.PublishContent/UnpublishContent delegate to the
 	// saga; background jobs publish under stable operation keys (16D).
 	services.SetPublicationPublisher(rt.Pubs)

@@ -18,7 +18,7 @@ func (h *Handlers) HandleListPublications(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	if !actor.HasScope(generation.ScopeContentView) && len(actor.Scopes) != 0 {
+	if !actor.Can(generation.ScopeContentView) {
 		WriteError(w, r, &generation.Error{Code: generation.CodePermissionDenied, Message: "missing required scope content.view"})
 		return
 	}
@@ -42,7 +42,7 @@ func (h *Handlers) HandleGetPublication(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if !actor.HasScope(generation.ScopeContentView) && len(actor.Scopes) != 0 {
+	if !actor.Can(generation.ScopeContentView) {
 		WriteError(w, r, &generation.Error{Code: generation.CodePermissionDenied, Message: "missing required scope content.view"})
 		return
 	}

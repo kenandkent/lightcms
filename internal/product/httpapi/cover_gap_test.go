@@ -51,7 +51,7 @@ func TestCoverGapUpgradeJobHandlers(t *testing.T) {
 	}
 	// Non-admin actor → 403 service error.
 	plain := gapAdminHandlers(t, gen,
-		generation.Actor{ID: "u", Email: "u@e.com", Authenticated: true, Scopes: []string{"template.edit"}},
+		generation.Actor{Role: "admin", ID: "u", Email: "u@e.com", Authenticated: true, Scopes: []string{"template.edit"}},
 		nil)
 	if rr := doExtra(plain.HandleStartUpgradeJob, "POST", "/x", nil, nil, map[string]string{"slug": "financial-news"}); rr.Code != 403 {
 		t.Fatalf("start non-admin: %d %s", rr.Code, rr.Body.String())
@@ -108,17 +108,17 @@ func TestCoverGapUpgradeJobHandlers(t *testing.T) {
 func TestCoverGapActorBranches(t *testing.T) {
 	gen, _, _ := newExtraSetup(t)
 	// Extractor error → 401.
-	badEx := gapAdminHandlers(t, gen, generation.Actor{}, func(r *http.Request) (string, bool) {
+	badEx := gapAdminHandlers(t, gen, generation.Actor{Role: "admin"}, func(r *http.Request) (string, bool) {
 		return "", false
 	})
 	badEx.ActorExtractor = func(r *http.Request) (generation.Actor, error) {
-		return generation.Actor{}, errors.New("no token")
+		return generation.Actor{Role: "admin"}, errors.New("no token")
 	}
 	if rr := doExtra(badEx.HandleGenerate, "POST", "/x", map[string]any{"template": "t"}, nil, nil); rr.Code != 401 {
 		t.Fatalf("extractor error: %d", rr.Code)
 	}
 	// Unauthenticated actor → 401.
-	anon := gapAdminHandlers(t, gen, generation.Actor{}, nil)
+	anon := gapAdminHandlers(t, gen, generation.Actor{Role: "admin"}, nil)
 	if rr := doExtra(anon.HandleListPublications, "GET", "/x", nil, nil,
 		map[string]string{"id": primitive.NewObjectID().Hex()}); rr.Code != 401 {
 		t.Fatalf("anonymous: %d", rr.Code)
@@ -129,7 +129,7 @@ func TestCoverGapActorBranches(t *testing.T) {
 	req := httptest.NewRequest("GET", "/x", nil)
 	req = mux.SetURLVars(req, map[string]string{"id": "zzz"})
 	ctx := generation.WithActor(req.Context(),
-		generation.Actor{ID: "u", Authenticated: true, Scopes: []string{}})
+		generation.Actor{Role: "admin", ID: "u", Authenticated: true, Scopes: []string{}})
 	req = req.WithContext(ctx)
 	rr := httptest.NewRecorder()
 	nilEx.HandleListPublications(rr, req)
@@ -208,7 +208,7 @@ func TestCoverGapSchemaAndMigrateBranches(t *testing.T) {
 	gen, h, _ := newExtraSetup(t)
 	// Scope-denied actor → 403.
 	denied := gapAdminHandlers(t, gen,
-		generation.Actor{ID: "u", Email: "u@e.com", Authenticated: true, Scopes: []string{"content.view"}}, nil)
+		generation.Actor{Role: "admin", ID: "u", Email: "u@e.com", Authenticated: true, Scopes: []string{"content.view"}}, nil)
 	if rr := doExtra(denied.HandleTemplateSchema, "GET", "/x", nil, nil, map[string]string{"slug": "financial-news"}); rr.Code != 403 {
 		t.Fatalf("schema scope denied: %d", rr.Code)
 	}

@@ -330,7 +330,7 @@ func TestE2E_ForkPageScopeBug(t *testing.T) {
 	ctx := context.Background()
 
 	uid := primitive.NewObjectID()
-	fork, err := e.forks.Create(ctx, "e2e-fork", "scope bug probe", uid, "admin@e2e.test")
+	fork, err := e.forks.Create(ctx, "e2e-fork", "scope bug probe", uid, "admin@e2e.test", "")
 	if err != nil {
 		t.Fatalf("fork create: %v", err)
 	}
@@ -1650,7 +1650,7 @@ func TestE2E_DuplicateTemplateSlug(t *testing.T) {
 		t.Fatal("duplicate slug minted a version")
 	}
 	// generation.Actor scope helpers behave (scope-matrix unit surface).
-	a := generation.Actor{Authenticated: true, Scopes: []string{"content.view"}}
+	a := generation.Actor{Role: "admin", Authenticated: true, Scopes: []string{"content.view"}}
 	if !a.HasScopes("content.view") || a.HasScopes("content.view", "content.edit") {
 		t.Fatal("HasScopes matrix wrong")
 	}

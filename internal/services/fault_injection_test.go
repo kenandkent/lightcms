@@ -86,7 +86,7 @@ func TestFaultInjection_Services(t *testing.T) {
 
 	// ForkService: create fork ok, then archive/delete write fails.
 	fs := NewForkService(db, cs)
-	fork, err := fs.Create(ctx, "F", "", primitive.NewObjectID(), "e@x.com")
+	fork, err := fs.Create(ctx, "F", "", primitive.NewObjectID(), "e@x.com", "")
 	if err != nil {
 		t.Fatalf("seed fork: %v", err)
 	}

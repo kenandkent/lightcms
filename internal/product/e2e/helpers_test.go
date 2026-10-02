@@ -291,7 +291,8 @@ type testEnv struct {
 // defaultActor is the full-owner admin actor (empty scopes = owner).
 func defaultActor() generation.Actor {
 	return generation.Actor{
-		ID: "e2e-admin", Email: "admin@e2e.test", Authenticated: true,
+		Role: "admin",
+		ID:   "e2e-admin", Email: "admin@e2e.test", Authenticated: true,
 		IsAdmin: true, Scopes: []string{}, Via: "api", ActorKind: "human",
 	}
 }
@@ -362,7 +363,7 @@ func (e *testEnv) wire(opts envOpts, first bool) {
 	e.tpls = templatecontract.NewService(e.db)
 	e.saga = publication.NewService(e.db, e.repo, e.store, publication.Options{
 		Templates: e.tpls, Idem: e.idem, URLs: e.resolver,
-		Renderer:  opts.renderer, Faults: opts.faults,
+		Renderer: opts.renderer, Faults: opts.faults,
 		Purge: func(ctx context.Context, urls []string) error {
 			e.mu.Lock()
 			defer e.mu.Unlock()
@@ -380,7 +381,7 @@ func (e *testEnv) wire(opts envOpts, first bool) {
 			e.mu.Lock()
 			defer e.mu.Unlock()
 			if e.anon {
-				return generation.Actor{}, fmt.Errorf("authentication is required")
+				return generation.Actor{Role: "admin"}, fmt.Errorf("authentication is required")
 			}
 			return e.actor, nil
 		},

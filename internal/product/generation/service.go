@@ -32,6 +32,7 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
@@ -56,6 +57,13 @@ type Options struct {
 	Now            func() time.Time
 	Limiter        RateLimiter
 	StoreAvailable func(ctx context.Context) error
+	// SandboxForkResolver binds a mode=sandbox request to the caller's
+	// active agent-sandbox fork by (userID, agentSession). R09: the server
+	// must never trust a client-supplied fork ID on its own — resolution
+	// verifies ownership + active status. Nil means no sandbox support
+	// (mode=sandbox is rejected, preserving pre-R09 behavior for embedded
+	// and unit-test services).
+	SandboxForkResolver func(ctx context.Context, userID, agentSession string) (*primitive.ObjectID, error)
 }
 
 // Service is the one-command generation orchestrator.
@@ -70,6 +78,8 @@ type Service struct {
 	now       func() time.Time
 	limiter   RateLimiter
 	storeOK   func(ctx context.Context) error
+	// forkResolve is Options.SandboxForkResolver (nil = no sandbox support).
+	forkResolve func(ctx context.Context, userID, agentSession string) (*primitive.ObjectID, error)
 }
 
 // NewService builds the orchestrator. Templates/Repo default to DB-backed
@@ -92,6 +102,7 @@ func NewService(db *database.DB, opts Options) *Service {
 		db: db, templates: tpls, pubs: opts.Pubs, pubRepo: repo,
 		idem: opts.Idem, urls: opts.URLs, audit: opts.Audit, now: now,
 		limiter: opts.Limiter, storeOK: opts.StoreAvailable,
+		forkResolve: opts.SandboxForkResolver,
 	}
 }
 
@@ -145,16 +156,15 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 	}
 
 	// Publish preconditions (§20.2, §21): optimistic expected version +
-	// Idempotency-Key, both 428 with zero mutation when absent, 409 on stale.
+	// Idempotency-Key, both 428 with zero mutation when absent. Only the
+	// PRESENCE checks run here; the expected-version VALUE check runs after
+	// the replay branch (R06) so a completed request replays from cache
+	// even after the template moved on.
 	var idemParams IdempotencyParams
 	var hasIdem bool
 	if mode == ModePublish {
 		if req.ExpectedTemplateVersion == nil {
 			return zero, genErr(CodeTemplatePreconditionRequired, "mode=publish requires expected_template_version", nil)
-		}
-		if *req.ExpectedTemplateVersion != tv.Version {
-			return zero, genErr(CodeTemplateVersionChanged,
-				fmt.Sprintf("template %s is at version %d, expected %d", tv.Slug, tv.Version, *req.ExpectedTemplateVersion), nil)
 		}
 		idemParams, hasIdem = IdempotencyFrom(ctx)
 		if !hasIdem {
@@ -170,24 +180,6 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 	if err := checkDataCap(data); err != nil {
 		return zero, err
 	}
-
-	// Strict validation against the immutable version (Task 4).
-	verrs, warns := templatecontract.ValidateData(tv, data)
-	if len(verrs) > 0 {
-		details := make([]FieldDetail, 0, len(verrs))
-		for _, e := range verrs {
-			details = append(details, FieldDetail{Code: e.Code, Field: e.Field, Message: e.Message})
-		}
-		// Pure validation failure on the publish path is replay-cacheable:
-		// Complete the idempotency record when we own one.
-		if mode == ModePublish && hasIdem && s.idem != nil {
-			s.completeValidation(ctx, idemParams, 422, req, tv)
-		}
-		return zero, &Error{Code: CodeFieldValidationFailed, Message: "content data does not match the template", Details: details}
-	}
-	// Materialize server-side defaults for missing keys (mirrors
-	// ValidateData's FIELD_DEFAULT_APPLIED contract).
-	data = materializeDefaults(tv, data)
 
 	// Title is required on create (request shape, not a template field).
 	title := strings.TrimSpace(req.Title)
@@ -217,28 +209,10 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 	published := active != nil
 	targetExists := live != nil
 
-	// Publish replay precedence (§21.3): same key + same body replays the
-	// completed response even if the target state moved (create → exists) or
-	// the caller's scopes would now differ. Check replay BEFORE the mutable
-	// scope/upsert gates; non-replay attempts still enforce them with zero
-	// mutation. Non-publish modes never touch idempotency.
-	var earlyOp *idempotency.Operation
-	if mode == ModePublish {
-		op, berr := s.beginForPublish(ctx, actor, req, tv, idemParams)
-		if berr != nil {
-			return zero, berr
-		}
-		if op.Replay {
-			resp, rerr := responseFromCache(op)
-			if rerr != nil {
-				return zero, genErr(CodeInternal, "decode idempotency replay", rerr)
-			}
-			return resp, nil
-		}
-		earlyOp = &op
-	}
-
-	// Scope matrix (§22.2) + sandbox_only enforcement — before any mutation.
+	// Authorization BEFORE any idempotency write (R05): scope matrix,
+	// sandbox_only, sandbox fork. A 403 here creates no lease, so an
+	// authorized retry of the same key proceeds immediately instead of
+	// wedging on REQUEST_IN_PROGRESS. (Scope matrix §22.2.)
 	if err := checkScopes(actor, mode, targetExists); err != nil {
 		return zero, err
 	}
@@ -246,15 +220,16 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 		return zero, genErr(CodePermissionDenied, "sandbox-only key must use mode=sandbox", nil)
 	}
 	if mode == ModeSandbox {
-		if actor.SandboxForkID == nil || actor.SandboxForkID.IsZero() {
-			return zero, genErr(CodeAgentSandboxRequired, "mode=sandbox requires an active agent sandbox", nil)
+		forkID, ferr := s.resolveSandboxFork(ctx, actor)
+		if ferr != nil {
+			return zero, ferr
+		}
+		if forkID != nil {
+			actor.SandboxForkID = forkID
 		}
 	}
 
-	// Upsert gate (not for preview — preview never writes).
-	if mode != ModePreview && targetExists && !req.Upsert {
-		return zero, genErr(CodePathConflict, fmt.Sprintf("page %s already exists (upsert=false)", fullPath), nil)
-	}
+	// Title checks (pure request-shape validation) stay shared and early.
 	if targetExists && title == "" {
 		// Full-replace keeps title required even on upsert hits: an empty
 		// title would silently blank the page heading.
@@ -264,6 +239,78 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 	if !targetExists && title == "" {
 		return zero, &Error{Code: CodeFieldValidationFailed, Message: "title is required",
 			Details: []FieldDetail{{Code: "FIELD_REQUIRED", Field: "title", Message: "title is required"}}}
+	}
+
+	// Publish idempotency AFTER auth (R05: no lease exists before this
+	// point). Begin, replay short-circuit, or lease takeover + resume
+	// (R04). Replay precedes the template-value precondition, validation,
+	// the upsert gate, and every mutation (R06): same key + same body
+	// replays the completed response even after the template moved on.
+	// Replay requires the CURRENT caller to be authorized (checked above) —
+	// a permission change never resurrects another identity's cached result.
+	//
+	// Every failure exit below releases the lease (R05: 403/409/422/5xx all
+	// release) via completePublishError so the same key retries cleanly.
+	var earlyOp *idempotency.Operation
+	releaseOp := func(perr error) {
+		if earlyOp != nil && s.idem != nil {
+			s.completePublishError(ctx, *earlyOp, perr)
+		}
+	}
+	if mode == ModePublish {
+		op, replayResp, berr := s.beginOrResumePublish(ctx, actor, req, tv, idemParams)
+		if berr != nil {
+			return zero, berr
+		}
+		if replayResp != nil {
+			return *replayResp, nil
+		}
+		earlyOp = &op
+		if *req.ExpectedTemplateVersion != tv.Version {
+			verr := genErr(CodeTemplateVersionChanged,
+				fmt.Sprintf("template %s is at version %d, expected %d", tv.Slug, tv.Version, *req.ExpectedTemplateVersion), nil)
+			releaseOp(verr)
+			return zero, verr
+		}
+	}
+
+	// Strict validation against the immutable version (Task 4). Runs after
+	// replay for publish (R06) and after auth everywhere (R05: the 422
+	// cache write below is an operation write and must not precede
+	// authorization).
+	verrs, warns := templatecontract.ValidateData(tv, data)
+	if len(verrs) > 0 {
+		details := make([]FieldDetail, 0, len(verrs))
+		for _, e := range verrs {
+			details = append(details, FieldDetail{Code: e.Code, Field: e.Field, Message: e.Message})
+		}
+		// Pure validation failure on the publish path is replay-cacheable:
+		// Complete the owned record (earlyOp exists exactly when this
+		// attempt owns one).
+		if mode == ModePublish && earlyOp != nil && s.idem != nil {
+			s.completeValidationOp(ctx, earlyOp, 422, req, tv, details)
+		}
+		return zero, &Error{Code: CodeFieldValidationFailed, Message: "content data does not match the template", Details: details}
+	}
+	// Materialize server-side defaults for missing keys (mirrors
+	// ValidateData's FIELD_DEFAULT_APPLIED contract).
+	data = materializeDefaults(tv, data)
+
+	// Upsert gate (not for preview — preview never writes; not for publish
+	// — publish checks it above after replay). Positioned after validation
+	// to preserve the pre-R05 422-before-409 precedence.
+	if mode != ModePreview && mode != ModePublish && targetExists && !req.Upsert {
+		return zero, genErr(CodePathConflict, fmt.Sprintf("page %s already exists (upsert=false)", fullPath), nil)
+	}
+
+	// Publish upsert gate AFTER replay and validation (same 422-before-409
+	// precedence as before): a replay never trips on the page its first
+	// attempt created, and a fresh conflict releases the lease (R05) so the
+	// same key retries cleanly once the caller fixes upsert/body.
+	if mode == ModePublish && targetExists && !req.Upsert {
+		uerr := genErr(CodePathConflict, fmt.Sprintf("page %s already exists (upsert=false)", fullPath), nil)
+		releaseOp(uerr)
+		return zero, uerr
 	}
 
 	switch mode {
@@ -277,6 +324,44 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 		return s.publishWithOp(ctx, actor, tv, live, active, published, targetExists, fullPath, slug, folderPath, title, canonical, data, warns, req, idemParams, earlyOp)
 	}
 	return zero, genErr(CodeInternal, "unreachable mode", nil)
+}
+
+// resolveSandboxFork binds a mode=sandbox request to the caller's active
+// fork (R09). A pre-set SandboxForkID is re-verified against the resolver
+// when one is configured — a client-supplied fork ID is never trusted on
+// its own. Otherwise the resolver maps (userID, agentSession) to the owned
+// active fork and the resolved ID is returned for the caller to inject. No
+// resolver, no session, or no owned active fork → AgentSandboxRequired
+// (fail closed). A nil return with nil error means the pre-set fork was
+// verified in place.
+func (s *Service) resolveSandboxFork(ctx context.Context, actor Actor) (*primitive.ObjectID, error) {
+	verify := func(want *primitive.ObjectID) error {
+		owned, err := s.forkResolve(ctx, actor.ID, actor.AgentSession)
+		if err != nil {
+			return genErr(CodeAgentSandboxRequired, "mode=sandbox requires an active agent sandbox", err)
+		}
+		if *owned != *want {
+			return genErr(CodePermissionDenied, "sandbox fork does not belong to this session", nil)
+		}
+		return nil
+	}
+	if actor.SandboxForkID != nil && !actor.SandboxForkID.IsZero() {
+		if s.forkResolve == nil {
+			return nil, nil
+		}
+		if err := verify(actor.SandboxForkID); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if s.forkResolve == nil {
+		return nil, genErr(CodeAgentSandboxRequired, "mode=sandbox requires an active agent sandbox", nil)
+	}
+	forkID, err := s.forkResolve(ctx, actor.ID, actor.AgentSession)
+	if err != nil {
+		return nil, genErr(CodeAgentSandboxRequired, "mode=sandbox requires an active agent sandbox", err)
+	}
+	return forkID, nil
 }
 
 // checkDataCap enforces the 5 MiB Data cap owned by Task 12.
@@ -431,7 +516,7 @@ func checkScopes(actor Actor, mode string, targetExists bool) error {
 		}
 	}
 	for _, s := range need {
-		if !actor.HasScope(s) {
+		if !actor.Can(s) {
 			return genErr(CodePermissionDenied, fmt.Sprintf("missing required scope %q for mode=%s", s, mode), nil)
 		}
 	}
@@ -476,32 +561,190 @@ func (s *Service) preview(ctx context.Context, actor Actor, tv templatecontract.
 	}, nil
 }
 
-// beginForPublish owns the idempotency Begin for publish (Task 11 handoff).
-// It never TakesOver (not even on lease expiry — the caller maps expiry to
-// 409 + Retry-After and the client retries), and it never Completes here;
-// completion belongs to publishWithOp / completeValidation.
-func (s *Service) beginForPublish(ctx context.Context, actor Actor, req GenerateRequest, tv templatecontract.TemplateVersion, p IdempotencyParams) (idempotency.Operation, error) {
-	if s.idem == nil {
-		return idempotency.Operation{}, genErr(CodeInternal, "idempotency service is not wired", nil)
-	}
-	owner := p.Owner
+// publishIdemIdentity derives the stable idempotency coordinates shared by
+// Begin and TakeOverByKey so both address the same record.
+func publishIdemIdentity(actor Actor, p IdempotencyParams) (owner, method, path, key string) {
+	owner = p.Owner
 	if owner == "" {
 		owner = actor.Owner()
 	}
-	method := p.Method
+	method = p.Method
 	if method == "" {
 		method = "POST"
 	}
-	path := p.Path
+	path = p.Path
 	if path == "" {
 		path = "/api/v1/page-generation"
 	}
+	return owner, method, path, p.Key
+}
+
+// beginOrResume starts the idempotency operation, transparently taking over
+// an expired lease (R04) instead of wedging the caller on
+// REQUEST_IN_PROGRESS. Completed operations return with Replay=true; live
+// leases still report REQUEST_IN_PROGRESS. A terminal attempt is advanced
+// via a fresh Begin (same semantics as a first retry).
+func (s *Service) beginOrResume(ctx context.Context, owner, method, path, key string, body []byte) (idempotency.Operation, error) {
+	if s.idem == nil {
+		return idempotency.Operation{}, genErr(CodeInternal, "idempotency service is not wired", nil)
+	}
+	op, err := s.idem.Begin(ctx, owner, method, path, key, body)
+	if err == nil {
+		return op, nil
+	}
+	if idempotency.CodeOf(err) != idempotency.CodeLeaseExpired {
+		return idempotency.Operation{}, err
+	}
+	top, terr := s.idem.TakeOverByKey(ctx, owner, method, path, key)
+	if terr != nil {
+		switch idempotency.CodeOf(terr) {
+		case idempotency.CodeStaleAttempt, idempotency.CodeNotFound:
+			// Terminal attempt (retry advances it) or vanished record
+			// (TTL edge): a fresh Begin converges either way.
+			return s.idem.Begin(ctx, owner, method, path, key, body)
+		default:
+			return idempotency.Operation{}, terr
+		}
+	}
+	return top, nil
+}
+
+// beginOrResumePublish Begins the publish operation AFTER authorization
+// (R05: no lease exists before auth, so 403 creates nothing). Same key +
+// same body on a completed operation replays; an expired lease is
+// CAS-taken-over and resumed from the durable snapshot (R04). It returns
+// the operation to execute under, or a cached replay response when no new
+// work remains (including the taken-over attempt whose publication already
+// went active — completing its cache instead of minting a duplicate).
+func (s *Service) beginOrResumePublish(ctx context.Context, actor Actor, req GenerateRequest, tv templatecontract.TemplateVersion, p IdempotencyParams) (idempotency.Operation, *GenerateResponse, error) {
+	owner, method, path, key := publishIdemIdentity(actor, p)
 	body := p.Body
 	if len(body) == 0 {
 		raw, _ := json.Marshal(canonicalGenerateBody(req, tv))
 		body = raw
 	}
-	op, err := s.idem.Begin(ctx, owner, method, path, p.Key, body)
+	op, err := s.beginOrResume(ctx, owner, method, path, key, body)
+	if err != nil {
+		return idempotency.Operation{}, nil, mapIdemBeginErr(err)
+	}
+	if op.Replay {
+		return s.replayOpResponse(op)
+	}
+	if op.PublicationID != nil && op.Attempt > 0 && s.pubRepo != nil && s.idem != nil {
+		// Takeover resume: the crashed attempt froze a Publication ID.
+		// If that publication already went active, cache the response and
+		// return it — never mint a second Publication for one operation.
+		if pub, gerr := s.pubRepo.GetByID(ctx, *op.PublicationID); gerr == nil && pub != nil &&
+			pub.Status == publication.StatusActive {
+			if resp, rerr := s.completeResumedActive(ctx, op, *pub, tv); rerr == nil {
+				return op, resp, nil
+			}
+			// Cache completion lost a race (another worker finished it):
+			// report in-progress so the retry replays the cached result.
+			return idempotency.Operation{}, nil, &Error{
+				Code: CodeRequestInProgress, Message: "operation completed concurrently; retry to replay",
+				RetryAfter: 1,
+			}
+		}
+	}
+	return op, nil, nil
+}
+
+// replayOpResponse rebuilds the replayable outcome for a completed op.
+// Validation-cache replays become their 422 error (with cached field
+// details) — a cached failure must never degrade to a 200-empty success.
+// Success caches become the stored response.
+func (s *Service) replayOpResponse(op idempotency.Operation) (idempotency.Operation, *GenerateResponse, error) {
+	if op.ValidationReplay {
+		var details []FieldDetail
+		if raw, ok := op.Response["details"]; ok {
+			if list, ok := raw.([]any); ok {
+				for _, item := range list {
+					if m, ok := item.(map[string]any); ok {
+						str := func(k string) string {
+							if v, ok := m[k].(string); ok {
+								return v
+							}
+							return ""
+						}
+						details = append(details, FieldDetail{Code: str("code"), Field: str("field"), Message: str("message")})
+					}
+				}
+			}
+		}
+		return idempotency.Operation{}, nil, &Error{
+			Code: CodeFieldValidationFailed,
+			Message: "content data does not match the template",
+			Details: details,
+		}
+	}
+	resp, rerr := responseFromCache(op)
+	if rerr != nil {
+		return idempotency.Operation{}, nil, genErr(CodeInternal, "decode idempotency replay", rerr)
+	}
+	return op, &resp, nil
+}
+
+// completeResumedActive caches the success response for a taken-over attempt
+// whose publication is already active and returns the replayable response.
+func (s *Service) completeResumedActive(ctx context.Context, op idempotency.Operation, pub publication.Publication, tv templatecontract.TemplateVersion) (*GenerateResponse, error) {
+	action, status := "updated", 200
+	if pub.ContentVersion <= 1 {
+		action, status = "created", 201
+	}
+	cache := map[string]any{
+		"id": pub.ContentID.Hex(), "action": action, "template": tv.Slug,
+		"full_path": pub.FullPath, "mode": ModePublish, "published": true,
+		"requires_publish": false, "public_url": pub.PublicURL,
+		"content_version":  float64(pub.ContentVersion),
+		"template_version": float64(pub.TemplateVersion),
+		"publication_id":   pub.ID.Hex(),
+	}
+	if _, cerr := s.idem.Complete(ctx, op.ID, op.Attempt, status, cache, false); cerr != nil {
+		return nil, cerr
+	}
+	fake := op
+	fake.Response = cache
+	resp, rerr := responseFromCache(fake)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return &resp, nil
+}
+
+// assertOpOwned verifies this worker still owns the attempt before
+// completing it (R07 fencing): after a lease takeover, Completing would
+// write a response onto another worker's attempt.
+func (s *Service) assertOpOwned(ctx context.Context, op idempotency.Operation) error {
+	if s.idem == nil {
+		return nil
+	}
+	cur, err := s.idem.Get(ctx, op.ID)
+	if err != nil {
+		return genErr(CodeRequestInProgress, "idempotency lease lost; retry to take over", err)
+	}
+	if cur.State != idempotency.StateProcessing || cur.AttemptState != idempotency.AttemptProcessing ||
+		cur.Attempt != op.Attempt || cur.LeaseGeneration != op.LeaseGeneration {
+		return genErr(CodeRequestInProgress, "idempotency lease lost to a newer worker; retry to take over", nil)
+	}
+	return nil
+}
+
+// beginForPublish owns the idempotency Begin for publish (Task 11 handoff).
+// Prefer beginOrResumePublish (takeover-aware); this raw Begin stays for
+// callers that manage leases themselves. It never Completes here;
+// completion belongs to publishWithOp / completeValidationOp.
+func (s *Service) beginForPublish(ctx context.Context, actor Actor, req GenerateRequest, tv templatecontract.TemplateVersion, p IdempotencyParams) (idempotency.Operation, error) {
+	if s.idem == nil {
+		return idempotency.Operation{}, genErr(CodeInternal, "idempotency service is not wired", nil)
+	}
+	owner, method, path, key := publishIdemIdentity(actor, p)
+	body := p.Body
+	if len(body) == 0 {
+		raw, _ := json.Marshal(canonicalGenerateBody(req, tv))
+		body = raw
+	}
+	op, err := s.idem.Begin(ctx, owner, method, path, key, body)
 	if err != nil {
 		return idempotency.Operation{}, mapIdemBeginErr(err)
 	}

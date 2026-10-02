@@ -9,6 +9,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // SchedulerService runs a background ticker that publishes content whose
@@ -74,7 +75,10 @@ func (s *SchedulerService) runOnce(ctx context.Context) {
 		"pending_approval": bson.M{"$ne": true},
 	}
 
-	cursor, err := s.db.FindMany(runCtx, "content", filter)
+	cursor, err := s.db.FindMany(runCtx, "content", filter,
+		// The loop only reads _id + current_version: project so the ~4KB
+		// embedding vector (and the full data map) never crosses the wire.
+		options.Find().SetProjection(bson.M{"current_version": 1}))
 	if err != nil {
 		log.Printf("[scheduler] query failed: %v", err)
 		return

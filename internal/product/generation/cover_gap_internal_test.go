@@ -200,32 +200,32 @@ func TestCoverGapReplayDecoders(t *testing.T) {
 	if forkIDValue(&models.Content{ForkID: &fid}) != fid {
 		t.Fatalf("forkIDValue")
 	}
-	if actorKind(Actor{ActorKind: "agent"}) != "agent" {
+	if actorKind(Actor{Role: "admin", ActorKind: "agent"}) != "agent" {
 		t.Fatalf("actorKind explicit")
 	}
-	if actorKind(Actor{AgentSession: "s"}) != "agent" {
+	if actorKind(Actor{Role: "admin", AgentSession: "s"}) != "agent" {
 		t.Fatalf("actorKind session")
 	}
-	if actorKind(Actor{}) != "human" {
+	if actorKind(Actor{Role: "admin"}) != "human" {
 		t.Fatalf("actorKind default")
 	}
 }
 
 func TestCoverGapNilServiceBranches(t *testing.T) {
 	var s Service
-	if _, err := s.beginForPublish(context.Background(), Actor{}, GenerateRequest{}, templatecontract.TemplateVersion{}, IdempotencyParams{}); CodeOf(err) != CodeInternal {
+	if _, err := s.beginForPublish(context.Background(), Actor{Role: "admin"}, GenerateRequest{}, templatecontract.TemplateVersion{}, IdempotencyParams{}); CodeOf(err) != CodeInternal {
 		t.Fatalf("beginForPublish nil idem: %v", err)
 	}
-	s.completeValidation(context.Background(), IdempotencyParams{}, 422, GenerateRequest{}, templatecontract.TemplateVersion{})
+	s.completeValidationOp(context.Background(), &idempotency.Operation{}, 422, GenerateRequest{}, templatecontract.TemplateVersion{}, nil)
 	s.auditf(context.Background(), "x", nil)
 
 	// publishWithOp wiring guards.
-	if _, err := s.publishWithOp(context.Background(), Actor{}, templatecontract.TemplateVersion{}, nil, nil, false, false, "", "", "", "", "", nil, nil, GenerateRequest{}, IdempotencyParams{}, nil); CodeOf(err) != CodeInternal {
+	if _, err := s.publishWithOp(context.Background(), Actor{Role: "admin"}, templatecontract.TemplateVersion{}, nil, nil, false, false, "", "", "", "", "", nil, nil, GenerateRequest{}, IdempotencyParams{}, nil); CodeOf(err) != CodeInternal {
 		t.Fatalf("publishWithOp nil idem: %v", err)
 	}
 	op := idempotency.Operation{}
 	s2 := Service{idem: &idempotency.Service{}}
-	if _, err := s2.publishWithOp(context.Background(), Actor{}, templatecontract.TemplateVersion{}, nil, nil, false, false, "", "", "", "", "", nil, nil, GenerateRequest{}, IdempotencyParams{}, &op); CodeOf(err) != CodeInternal {
+	if _, err := s2.publishWithOp(context.Background(), Actor{Role: "admin"}, templatecontract.TemplateVersion{}, nil, nil, false, false, "", "", "", "", "", nil, nil, GenerateRequest{}, IdempotencyParams{}, &op); CodeOf(err) != CodeInternal {
 		t.Fatalf("publishWithOp nil pubs: %v", err)
 	}
 }
@@ -247,11 +247,11 @@ func TestCoverGapFaultFindBranches(t *testing.T) {
 		t.Fatalf("SchemaForSlug empty fault db: %v", err)
 	}
 	// GetUpgradeJob via the generic FindOne → transport error.
-	if _, err := svc.GetUpgradeJob(ctx, Actor{ID: "a", Authenticated: true, Scopes: []string{}}, primitive.NewObjectID()); err == nil {
+	if _, err := svc.GetUpgradeJob(ctx, Actor{Role: "admin", ID: "a", Authenticated: true, Scopes: []string{}}, primitive.NewObjectID()); err == nil {
 		t.Fatalf("GetUpgradeJob fault: want error")
 	}
 	fdb.SetFaultHook(nil)
-	if _, err := svc.GetUpgradeJob(ctx, Actor{ID: "a", Authenticated: true, Scopes: []string{}}, primitive.NewObjectID()); CodeOf(err) != CodeUpgradeJobNotFound {
+	if _, err := svc.GetUpgradeJob(ctx, Actor{Role: "admin", ID: "a", Authenticated: true, Scopes: []string{}}, primitive.NewObjectID()); CodeOf(err) != CodeUpgradeJobNotFound {
 		t.Fatalf("GetUpgradeJob missing: %v", err)
 	}
 }

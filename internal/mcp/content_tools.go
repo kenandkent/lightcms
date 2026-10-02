@@ -532,7 +532,7 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 
 Returns publication_id, public_url, full_path, and content_version for the new publication.
 
-Requires content.edit + content.publish for an existing page; publishing a newly created page requires content.create + content.publish.`,
+This tool publishes by content ID and always requires content.edit + content.publish. To publish a brand-new page, create it first with create_content (which requires content.create), then publish it here.`,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Publish Content",
 			ReadOnlyHint:    false,
@@ -720,7 +720,7 @@ Examples:
 
 Returns published_count, the published IDs, per-item publications ({id, publication_id, public_url}), and any failed entries ({id, error}).
 
-Each item is an existing page: requires content.edit + content.publish. Publishing newly created pages requires content.create + content.publish.`,
+Each item is an existing page (by ID) and always requires content.edit + content.publish. To publish brand-new pages, create them first with create_content (which requires content.create), then publish them here.`,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Publish Multiple",
 			ReadOnlyHint:    false,

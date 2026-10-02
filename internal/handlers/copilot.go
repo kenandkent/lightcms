@@ -119,7 +119,7 @@ func (h *Handler) executeCopilotTool(ctx context.Context, role, sessionID string
 		return string(b), action
 	}
 
-	ctx = servicesWithCopilotProvenance(ctx, sessionID)
+	ctx = servicesWithCopilotProvenance(ctx, sessionID, role == "admin")
 
 	switch name {
 	case "search_content":
@@ -329,6 +329,12 @@ func (h *Handler) executeCopilotTool(ctx context.Context, role, sessionID string
 		}
 
 	case "publish_content", "unpublish_content":
+		// REST parity (Wave 2A): publish requires content.edit +
+		// content.publish. Both are checked so the copilot matrix cannot
+		// drift from the REST matrix again.
+		if !auth.HasPermission(role, auth.PermContentEdit) {
+			return deny(auth.PermContentEdit)
+		}
 		if !auth.HasPermission(role, auth.PermContentPublish) {
 			return deny(auth.PermContentPublish)
 		}
@@ -540,8 +546,11 @@ func (h *Handler) copilotCallAnthropic(ctx context.Context, msgs []anthropicMess
 }
 
 // servicesWithCopilotProvenance stamps copilot provenance on tool contexts.
-func servicesWithCopilotProvenance(ctx context.Context, sessionID string) context.Context {
-	return services.WithProvenance(ctx, services.Provenance{
+func servicesWithCopilotProvenance(ctx context.Context, sessionID string, isAdmin bool) context.Context {
+	ctx = services.WithProvenance(ctx, services.Provenance{
 		Actor: "agent", Via: "copilot", AgentSession: sessionID,
 	})
+	// R02: the publishing principal's admin flag resolves script policy
+	// admin_only for service-layer renders (fail-closed when unknown).
+	return services.WithAuthorIsAdmin(ctx, isAdmin)
 }

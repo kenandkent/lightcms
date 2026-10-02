@@ -34,6 +34,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jonradoff/lightcms/v7/internal/auth"
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -80,17 +81,48 @@ const (
 // Actor carries the already-authenticated caller identity for scope/sandbox
 // decisions. Handlers populate it from the existing /api/v1 auth middleware
 // (Task 16 wiring); tests construct it directly.
+//
+// Role is the caller's RBAC role (viewer/contributor/editor/admin) and is
+// the PRIMARY authorization input: Can intersects the role permission set
+// with the sandbox-only restriction and the key scope allowlist. An empty
+// Role grants nothing — extractors must always populate it from the
+// authenticated session/API key.
 type Actor struct {
 	ID            string
 	Email         string
 	Authenticated bool
 	IsAdmin       bool
+	Role          string
 	Scopes        []string
 	SandboxOnly   bool
 	SandboxForkID *primitive.ObjectID
 	AgentSession  string
 	Via           string
 	ActorKind     string // "human" | "agent"
+}
+
+// Can reports whether the actor holds permission p: the role must grant it,
+// sandbox-only keys are further narrowed to the sandbox allowlist, and a
+// non-empty Scopes allowlist must contain it. This mirrors
+// auth.UserHasPermission for the V3 actor shape (which cannot import session
+// state); every generation authorization check must use Can, never the
+// legacy scope-only HasScope.
+func (a Actor) Can(p string) bool {
+	if !auth.HasPermission(a.Role, p) {
+		return false
+	}
+	if a.SandboxOnly && !auth.SandboxPermitted(p) {
+		return false
+	}
+	if len(a.Scopes) > 0 {
+		for _, s := range a.Scopes {
+			if s == p {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 // HasScope reports whether the actor carries scope s. An empty Scopes
@@ -145,38 +177,38 @@ const (
 // Error codes (spec §27 + generation mappings). HTTP mapping lives in
 // httpapi/errors.go via StatusForCode; service tests assert codes.
 const (
-	CodeUnauthenticated                 = "UNAUTHENTICATED"
-	CodePermissionDenied                = "PERMISSION_DENIED"
-	CodeTemplateNotFound                = "TEMPLATE_NOT_FOUND"
-	CodeTemplateNotActive               = "TEMPLATE_NOT_ACTIVE"
-	CodeTemplateSchemaInvalid           = "TEMPLATE_SCHEMA_INVALID"
-	CodeTemplateVersionNotFound         = "TEMPLATE_VERSION_NOT_FOUND"
-	CodeTemplateVersionChanged          = "TEMPLATE_VERSION_CHANGED"
-	CodeTemplatePreconditionRequired    = "TEMPLATE_VERSION_PRECONDITION_REQUIRED"
-	CodeTemplateVersionConflict         = "TEMPLATE_VERSION_CONFLICT"
-	CodeFieldValidationFailed           = "FIELD_VALIDATION_FAILED"
-	CodeDataTooLarge                    = "DATA_TOO_LARGE"
-	CodePathInvalid                     = "PATH_INVALID"
-	CodePathConflict                    = "PATH_CONFLICT"
-	CodeContentCreateFailed             = "CONTENT_CREATE_FAILED"
-	CodeContentUpdateFailed             = "CONTENT_UPDATE_FAILED"
-	CodeContentVersionConflict          = "CONTENT_VERSION_CONFLICT"
-	CodeContentNotFound                 = "CONTENT_NOT_FOUND"
-	CodePublicationNotFound             = "PUBLICATION_NOT_FOUND"
-	CodePublicationConflict             = "PUBLICATION_CONFLICT"
-	CodePagePublishInProgress           = "PAGE_PUBLISH_IN_PROGRESS"
-	CodePublicURLFailed                 = "PUBLIC_URL_RESOLUTION_FAILED"
-	CodeIdempotencyConflict             = "IDEMPOTENCY_CONFLICT"
-	CodeIdempotencyKeyRequired          = "IDEMPOTENCY_KEY_REQUIRED"
-	CodeRequestInProgress               = "REQUEST_IN_PROGRESS"
-	CodeAgentSandboxRequired            = "AGENT_SANDBOX_REQUIRED"
-	CodeRateLimited                     = "RATE_LIMITED"
-	CodeStoreUnavailable                = "PUBLICATION_STAGE_FAILED"
-	CodeInternal                        = "INTERNAL_ERROR"
-	CodeInvalidRequest                  = "INVALID_REQUEST"
-	CodeUpgradeJobNotFound              = "UPGRADE_JOB_NOT_FOUND"
-	CodeUpgradeJobConflict              = "UPGRADE_JOB_CONFLICT"
-	CodeRestorePreconditionFailed       = "RESTORE_PRECONDITION_FAILED"
+	CodeUnauthenticated              = "UNAUTHENTICATED"
+	CodePermissionDenied             = "PERMISSION_DENIED"
+	CodeTemplateNotFound             = "TEMPLATE_NOT_FOUND"
+	CodeTemplateNotActive            = "TEMPLATE_NOT_ACTIVE"
+	CodeTemplateSchemaInvalid        = "TEMPLATE_SCHEMA_INVALID"
+	CodeTemplateVersionNotFound      = "TEMPLATE_VERSION_NOT_FOUND"
+	CodeTemplateVersionChanged       = "TEMPLATE_VERSION_CHANGED"
+	CodeTemplatePreconditionRequired = "TEMPLATE_VERSION_PRECONDITION_REQUIRED"
+	CodeTemplateVersionConflict      = "TEMPLATE_VERSION_CONFLICT"
+	CodeFieldValidationFailed        = "FIELD_VALIDATION_FAILED"
+	CodeDataTooLarge                 = "DATA_TOO_LARGE"
+	CodePathInvalid                  = "PATH_INVALID"
+	CodePathConflict                 = "PATH_CONFLICT"
+	CodeContentCreateFailed          = "CONTENT_CREATE_FAILED"
+	CodeContentUpdateFailed          = "CONTENT_UPDATE_FAILED"
+	CodeContentVersionConflict       = "CONTENT_VERSION_CONFLICT"
+	CodeContentNotFound              = "CONTENT_NOT_FOUND"
+	CodePublicationNotFound          = "PUBLICATION_NOT_FOUND"
+	CodePublicationConflict          = "PUBLICATION_CONFLICT"
+	CodePagePublishInProgress        = "PAGE_PUBLISH_IN_PROGRESS"
+	CodePublicURLFailed              = "PUBLIC_URL_RESOLUTION_FAILED"
+	CodeIdempotencyConflict          = "IDEMPOTENCY_CONFLICT"
+	CodeIdempotencyKeyRequired       = "IDEMPOTENCY_KEY_REQUIRED"
+	CodeRequestInProgress            = "REQUEST_IN_PROGRESS"
+	CodeAgentSandboxRequired         = "AGENT_SANDBOX_REQUIRED"
+	CodeRateLimited                  = "RATE_LIMITED"
+	CodeStoreUnavailable             = "PUBLICATION_STAGE_FAILED"
+	CodeInternal                     = "INTERNAL_ERROR"
+	CodeInvalidRequest               = "INVALID_REQUEST"
+	CodeUpgradeJobNotFound           = "UPGRADE_JOB_NOT_FOUND"
+	CodeUpgradeJobConflict           = "UPGRADE_JOB_CONFLICT"
+	CodeRestorePreconditionFailed    = "RESTORE_PRECONDITION_FAILED"
 )
 
 // FieldDetail is one field-level diagnostic inside a 422 envelope.
@@ -281,7 +313,7 @@ const (
 // IdempotencyParams is the external live-changing precondition (§21).
 type IdempotencyParams struct {
 	Owner, Method, Path, Key string
-	Body                    []byte
+	Body                     []byte
 }
 
 // WithActor stores the actor in ctx for handler → service plumbing.

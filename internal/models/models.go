@@ -126,6 +126,11 @@ type ContentFork struct {
 	PreviewToken   string              `bson:"preview_token" json:"preview_token"` // random token for cookie-based preview
 	CreatedBy      primitive.ObjectID  `bson:"created_by" json:"created_by"`
 	CreatedByEmail string              `bson:"created_by_email" json:"created_by_email"`
+	// AgentSession binds a fork to the AI-agent session that created it
+	// (from the X-Agent-Session header). The V3 sandbox resolver uses it
+	// to inject only caller-owned active forks — never trust a client
+	// supplied fork ID on its own.
+	AgentSession   string              `bson:"agent_session,omitempty" json:"agent_session,omitempty"`
 	CreatedAt      time.Time           `bson:"created_at" json:"created_at"`
 	MergedAt       *time.Time          `bson:"merged_at,omitempty" json:"merged_at,omitempty"`
 	MergedBy       *primitive.ObjectID `bson:"merged_by,omitempty" json:"merged_by,omitempty"`

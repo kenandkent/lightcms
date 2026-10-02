@@ -36,7 +36,7 @@ func (h *Handlers) HandleTemplateSchema(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if !actor.HasScope(generation.ScopeTemplateView) && len(actor.Scopes) != 0 {
+	if !actor.Can(generation.ScopeTemplateView) {
 		WriteError(w, r, &generation.Error{Code: generation.CodePermissionDenied, Message: "missing required scope template.view"})
 		return
 	}

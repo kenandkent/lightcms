@@ -75,7 +75,7 @@ func TestBrokenDB_Services(t *testing.T) {
 	if _, err := fs.List(ctx); err == nil {
 		t.Error("fork List: expected error")
 	}
-	if _, err := fs.Create(ctx, "n", "d", id, "e"); err == nil {
+	if _, err := fs.Create(ctx, "n", "d", id, "e", ""); err == nil {
 		t.Error("fork Create: expected error")
 	}
 

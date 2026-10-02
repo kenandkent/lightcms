@@ -32,6 +32,8 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/product/storage"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 	"net/http"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // publicationRuntime is the single wired V3 service set. Built once by
@@ -50,11 +52,14 @@ type publicationRuntime struct {
 }
 
 // runtimeDeps are the pre-existing services the runtime integrates with
-// (CDN purge, audit trail, durable webhook delivery).
+// (CDN purge, audit trail, durable webhook delivery, snapshot rendering).
 type runtimeDeps struct {
 	Cloudflare *services.CloudflareService
 	Audit      *services.AuditService
 	Webhooks   *services.WebhookService
+	// Content provides the production snapshot renderer (R02). Nil keeps
+	// the minimal DefaultRenderer (unit-test fallback only).
+	Content *services.ContentService
 }
 
 // buildPublicationRuntime constructs every V3 publication service exactly
@@ -88,19 +93,33 @@ func buildPublicationRuntime(ctx context.Context, db *database.DB, cfg *config.C
 	pubAudit := func(ctx context.Context, action string, fields map[string]any) {
 		deps.Audit.LogAsync(models.AuditLog{Action: action, Resource: "publication", Details: fields})
 	}
+	var snapshotRender publication.SnapshotRenderFunc
+	if deps.Content != nil {
+		// R02: production renders through the frozen snapshot pipeline
+		// (Markdown, sanitizer policy, snippets, wikilinks, TOC) — never
+		// the minimal renderer that marks every string trusted HTML.
+		snapshotRender = deps.Content.SagaSnapshotRender
+	}
 	pubs := publication.NewService(db, pubRepo, store, publication.Options{
 		Idem: idem,
 		URLs: urls,
 		Purge: func(ctx context.Context, urls []string) error {
 			return deps.Cloudflare.PurgeByURLs(ctx, urls)
 		},
-		Audit:    pubAudit,
-		BuildSHA: publicationBuildSHA(),
+		Audit:          pubAudit,
+		BuildSHA:       publicationBuildSHA(),
+		SnapshotRender: snapshotRender,
 	})
 	gen := generation.NewService(db, generation.Options{
 		Pubs: pubs, PubRepo: pubRepo,
 		Idem: idem, URLs: urls, Audit: pubAudit,
 		Limiter: newPublicationRateLimiter(cfg.PageGenerationRateLimit),
+		// R09: mode=sandbox resolves the caller's owned active fork by
+		// (user, agent session) — a client-supplied fork ID alone is
+		// never trusted.
+		SandboxForkResolver: func(ctx context.Context, userID, session string) (*primitive.ObjectID, error) {
+			return services.FindActiveSandboxFork(ctx, db, userID, session)
+		},
 	})
 
 	productAPI := &httpapi.Handlers{
@@ -117,7 +136,7 @@ func buildPublicationRuntime(ctx context.Context, db *database.DB, cfg *config.C
 			}
 			return generation.Actor{
 				ID: u.ID, Email: u.Email, Authenticated: true,
-				IsAdmin: u.Role == models.RoleAdmin, Scopes: u.Scopes,
+				IsAdmin: u.Role == models.RoleAdmin, Role: u.Role, Scopes: u.Scopes,
 				SandboxOnly: u.SandboxOnly, AgentSession: session,
 				Via: "api", ActorKind: kind,
 			}, nil

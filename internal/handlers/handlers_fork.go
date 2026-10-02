@@ -97,7 +97,7 @@ func (h *Handler) CreateFork(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	userID, _ := primitive.ObjectIDFromHex(user.ID)
-	fork, err := h.forkService.Create(ctx, name, description, userID, user.Email)
+	fork, err := h.forkService.Create(ctx, name, description, userID, user.Email, r.Header.Get("X-Agent-Session"))
 	if err != nil {
 		h.renderAdmin(w, r, "fork_form", map[string]interface{}{
 			"Error": fmt.Sprintf("Failed to create fork: %v", err),

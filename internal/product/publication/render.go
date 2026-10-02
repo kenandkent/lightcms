@@ -713,6 +713,29 @@ func expandSnippetDepthFrozen(text string, snippets map[string]string, data map[
 
 var lcQueryREFrozen = regexp.MustCompile(`(?s)<!--\s*lc:query\b(.*?)-->`)
 
+// ExtractLCQueryDirectives returns the raw directive comment strings the
+// frozen expander will look up in LCQueryCache. Snapshot builders MUST key
+// expansions by these exact (TrimSpace-normalized) strings — the frozen
+// expander matches on them verbatim, so any other keying silently yields
+// placeholder comments.
+func ExtractLCQueryDirectives(layout string) []string {
+	if !strings.Contains(layout, "lc:query") {
+		return nil
+	}
+	raw := lcQueryREFrozen.FindAllString(layout, -1)
+	out := make([]string, 0, len(raw))
+	seen := map[string]struct{}{}
+	for _, m := range raw {
+		k := strings.TrimSpace(m)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, m)
+	}
+	return out
+}
+
 func expandLCQueryFrozen(layout string, cache map[string]string) string {
 	if !strings.Contains(layout, "lc:query") {
 		return layout

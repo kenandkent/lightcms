@@ -91,7 +91,7 @@ func (a *APIHandler) APICreateFork(w http.ResponseWriter, r *http.Request) {
 		userID, _ = primitive.ObjectIDFromHex(user.ID)
 		userEmail = user.Email
 	}
-	fork, err := a.forkService.Create(r.Context(), body.Name, body.Description, userID, userEmail)
+	fork, err := a.forkService.Create(r.Context(), body.Name, body.Description, userID, userEmail, r.Header.Get("X-Agent-Session"))
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return

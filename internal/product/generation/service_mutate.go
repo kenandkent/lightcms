@@ -2,11 +2,11 @@ package generation
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/models"
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 
@@ -354,26 +354,34 @@ func forkIDValue(c *models.Content) primitive.ObjectID {
 	return primitive.NilObjectID
 }
 
-// completeValidation caches a pure 422 for the publish idempotency record.
-func (s *Service) completeValidation(ctx context.Context, p IdempotencyParams, status int, req GenerateRequest, tv templatecontract.TemplateVersion) {
-	if s.idem == nil {
-		return
-	}
-	// Best effort: Begin first so we own the attempt, then Complete as
-	// validation-only. Failures here never block the 422 itself.
-	raw, _ := json.Marshal(canonicalGenerateBody(req, tv))
-	op, err := s.idem.Begin(ctx, p.Owner, p.Method, p.Path, p.Key, raw)
-	if err != nil {
-		return
-	}
-	if op.Replay {
+// completeValidationOp caches a pure 422 for the owned publish idempotency
+// record (the caller Begin/took-over the op before validating, so no second
+// Begin is needed — and a second Begin would wedge on our own live lease).
+// Field details ride along so a same-key replay rebuilds the identical 422
+// instead of degrading to a code-only error.
+func (s *Service) completeValidationOp(ctx context.Context, op *idempotency.Operation, status int, req GenerateRequest, tv templatecontract.TemplateVersion, details []FieldDetail) {
+	if s.idem == nil || op == nil {
 		return
 	}
 	resp := map[string]any{"code": CodeFieldValidationFailed, "template": tv.Slug, "template_version": tv.Version}
+	if len(details) > 0 {
+		det := make([]any, 0, len(details))
+		for _, e := range details {
+			det = append(det, map[string]any{"code": e.Code, "field": e.Field, "message": e.Message})
+		}
+		resp["details"] = det
+	}
 	_, _ = s.idem.Complete(ctx, op.ID, op.Attempt, status, resp, true)
 }
 
-// canonicalGenerateBody is the idempotency hash input for publish.
+// canonicalGenerateBody is the idempotency hash input for publish. It must
+// be stable across template upgrades for the same logical request (R06):
+// the caller's expected_template_version is hashed (different expectations
+// are different requests), but the RESOLVED current version is not —
+// otherwise every upgrade turns same-key retries into false conflicts
+// instead of replays. (Pre-R06 hashes included the resolved version; keys
+// begun before this change 409 on retry-after-upgrade instead of replaying
+// — fail-closed, never a duplicate publication.)
 func canonicalGenerateBody(req GenerateRequest, tv templatecontract.TemplateVersion) map[string]any {
 	m := map[string]any{
 		"template": req.Template, "title": req.Title, "slug": req.Slug,
@@ -383,7 +391,6 @@ func canonicalGenerateBody(req GenerateRequest, tv templatecontract.TemplateVers
 	if req.ExpectedTemplateVersion != nil {
 		m["expected_template_version"] = *req.ExpectedTemplateVersion
 	}
-	m["template_version_resolved"] = tv.Version
 	return m
 }
 

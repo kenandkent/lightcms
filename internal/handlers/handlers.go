@@ -1175,8 +1175,9 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 	if published && auth.HasPermission(user.Role, auth.PermContentPublish) {
 		if h.publicationService != nil {
 			res, perr := h.publicationService.Publish(ctx, publication.PublishRequest{
-				ContentID: id,
-				Reason:    "admin form save",
+				ContentID:     id,
+				Reason:        "admin form save",
+				AuthorIsAdmin: user.Role == "admin",
 			})
 			if perr != nil {
 				// Draft stays draft; report the publication code below.
@@ -1366,6 +1367,11 @@ func (h *Handler) EditContent(w http.ResponseWriter, r *http.Request) {
 		"PageViews7d":         pageViews7d,
 		"PageReferrersJSON":   pageReferrersJSON,
 		"ActivePublicationID": activePublicationID,
+		// Per-render idempotency key for the standalone 发布上线 button:
+		// a double-submit of the same page replays instead of minting a
+		// second Publication (M6). Empty only if crypto/rand fails, in
+		// which case the publish handler rejects the submit fail-closed.
+		"IdempotencyKey": newIdempotencyKey(),
 	})
 }
 
@@ -1397,6 +1403,17 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	// Inject editor identity + provenance into context for version history
 	ctx = services.WithEditorEmail(ctx, user.Email)
 	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
+	// Lost-update guard for the checkbox publish below (M6): the edit form
+	// renders the active publication ID at page load; a double-submit (or a
+	// concurrent publish in another tab) sees a stale expectation and gets a
+	// 409 instead of minting a duplicate Publication. Malformed values fail
+	// closed — the value is server-rendered, so anything unparsable is
+	// tampering, not a missing precondition.
+	formExpectedActive, expectedActiveOK := adminExpectedActive(r)
+	if !expectedActiveOK {
+		http.Error(w, "Invalid expected_active_id", http.StatusBadRequest)
+		return
+	}
 	var existingContent models.Content
 	if err := h.db.FindOne(ctx, "content", bson.M{"_id": id}, &existingContent); err != nil {
 		http.Error(w, "Content not found", http.StatusNotFound)
@@ -1756,15 +1773,21 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	publishFailed := false
 	publishFailureCode := ""
 	if intentPublish {
-		if _, perr := h.publicationService.Publish(r.Context(), publication.PublishRequest{
+		// ctx carries the stamped editor identity + provenance (human/ui):
+		// the minted Publication record must attribute this admin-form
+		// publish, otherwise session rollback is blind to it.
+		if _, perr := h.publicationService.Publish(ctx, publication.PublishRequest{
 			ContentID: id,
 			Reason:    "admin form save",
+			Actor:     "human", Via: "ui",
+			AuthorIsAdmin:    user.Role == "admin",
+			ExpectedActiveID: formExpectedActive,
 		}); perr != nil {
 			publishFailed = true
 			publishFailureCode = publication.CodeOf(perr)
 		}
 	} else if intentUnpublish {
-		if perr := h.publicationService.Unpublish(r.Context(), publication.UnpublishRequest{
+		if perr := h.publicationService.Unpublish(ctx, publication.UnpublishRequest{
 			ContentID: id,
 		}); perr != nil {
 			publishFailed = true
@@ -1885,13 +1908,42 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Regenerate sitemap after content deletion
-	go h.RegenerateSitemap(context.Background())
-
-	// Regenerate index pages — the deleted item may have appeared in lc:query results
+	// Provenance + audit + webhook parity with the service delete path:
+	// without these the delete is invisible to the session ledger (which
+	// selects rollback targets by provenance) and to webhook consumers.
+	// content still holds the PRE-delete row here (path/title for the record).
+	delCtx := services.WithEditorEmail(ctx, user.Email)
+	sessionID := r.Header.Get("X-Agent-Session")
+	if sessionID != "" {
+		delCtx = services.WithProvenance(delCtx, services.Provenance{Actor: "agent", Via: "ui", AgentSession: sessionID})
+	} else {
+		delCtx = services.WithProvenance(delCtx, services.Provenance{Actor: "human", Via: "ui"})
+	}
 	if h.contentService != nil {
+		var postDelete models.Content
+		if gerr := h.db.FindOne(delCtx, "content", bson.M{"_id": id}, &postDelete); gerr == nil {
+			_ = h.contentService.RecordVersion(delCtx, &postDelete, &content, "删除页面")
+		}
 		h.contentService.TriggerIndexRegen()
 	}
+	if h.auditService != nil {
+		userOID, _ := primitive.ObjectIDFromHex(user.ID)
+		h.auditService.LogAsync(models.AuditLog{
+			UserID: userOID, UserEmail: user.Email,
+			Action: "content.delete", Resource: "content", ResourceID: id.Hex(),
+			AgentSession: sessionID,
+			Details:      map[string]interface{}{"path": content.FullPath, "title": content.Title},
+			IPAddress:    r.RemoteAddr,
+		})
+	}
+	if h.webhookService != nil {
+		h.webhookService.FireEvent(delCtx, "content.delete", map[string]interface{}{
+			"id": id.Hex(), "title": content.Title, "path": content.FullPath,
+		})
+	}
+
+	// Regenerate sitemap after content deletion
+	go h.RegenerateSitemap(context.Background())
 
 	http.Redirect(w, r, "/cm/content", http.StatusSeeOther)
 }
@@ -1899,6 +1951,9 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) UndeleteContent(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermContentDelete) {
 		return
 	}
 
@@ -2092,6 +2147,9 @@ func (h *Handler) ChangeTemplatePreview(w http.ResponseWriter, r *http.Request) 
 func (h *Handler) ConfirmChangeTemplate(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermTemplateEdit) {
 		return
 	}
 
@@ -2500,6 +2558,9 @@ func (h *Handler) CreateCollection(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
+		return
+	}
 
 	r.ParseForm()
 	itemsPerPage := 10
@@ -2559,6 +2620,9 @@ func (h *Handler) UpdateCollection(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -2597,6 +2661,9 @@ func (h *Handler) UpdateCollection(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteCollection(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -2659,6 +2726,9 @@ func (h *Handler) NewFolder(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreateFolder(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -2750,6 +2820,9 @@ func (h *Handler) UpdateFolder(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -2828,6 +2901,9 @@ func (h *Handler) UpdateFolder(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteFolder(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -3416,6 +3492,9 @@ func (h *Handler) DeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermAPIKeyManage) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -3485,6 +3564,9 @@ func (h *Handler) UpdateSiteConfiguration(w http.ResponseWriter, r *http.Request
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
+		return
+	}
 
 	r.ParseForm()
 	ctx := r.Context()
@@ -3525,6 +3607,9 @@ func (h *Handler) UpdateSiteConfiguration(w http.ResponseWriter, r *http.Request
 func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermAssetUpload) {
 		return
 	}
 
@@ -3747,10 +3832,10 @@ func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
 
 	// Look up content from database - try full_path first, fall back to slug for legacy
 	var content models.Content
-	filter := bson.M{"published": true, "full_path": fullPath, "fork_id": bson.M{"$exists": false}}
+	filter := bson.M{"published": true, "full_path": fullPath, "fork_id": bson.M{"$exists": false}, "deleted": bson.M{"$ne": true}}
 	if err := h.db.FindOne(ctx, "content", filter, &content); err != nil {
 		// Fall back to legacy slug lookup
-		legacyFilter := bson.M{"published": true, "slug": slug, "fork_id": bson.M{"$exists": false}}
+		legacyFilter := bson.M{"published": true, "slug": slug, "fork_id": bson.M{"$exists": false}, "deleted": bson.M{"$ne": true}}
 		if err := h.db.FindOne(ctx, "content", legacyFilter, &content); err != nil {
 			// Paths are case-insensitive: try a case-insensitive match and
 			// 301 to the canonical casing (e.g. /claude.md -> /CLAUDE.md).
@@ -3758,6 +3843,7 @@ func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
 				"published": true,
 				"full_path": bson.M{"$regex": "^" + regexp.QuoteMeta(fullPath) + "$", "$options": "i"},
 				"fork_id":   bson.M{"$exists": false},
+				"deleted":   bson.M{"$ne": true},
 			}
 			if err := h.db.FindOne(ctx, "content", ciFilter, &content); err == nil && content.FullPath != fullPath {
 				w.Header().Set("Cache-Control", "public, max-age=3600")
@@ -4665,6 +4751,9 @@ func (h *Handler) CreateRedirect(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
+		return
+	}
 
 	fromPath := r.FormValue("from_path")
 	toPath := r.FormValue("to_path")
@@ -4737,6 +4826,9 @@ func (h *Handler) UpdateRedirect(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -4784,6 +4876,9 @@ func (h *Handler) UpdateRedirect(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteRedirect(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -4934,6 +5029,9 @@ func (h *Handler) ViewContactMessage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -4966,6 +5064,9 @@ func (h *Handler) DeleteContactMessage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermContentDelete) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -4989,6 +5090,10 @@ func (h *Handler) MarkAllMessagesRead(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit) {
+		return
+	}
+
 	h.db.Collection("contact_messages").UpdateMany(r.Context(), bson.M{"read": false}, bson.M{"$set": bson.M{"read": true}}) //nolint:errcheck
 	http.Redirect(w, r, "/cm/messages", http.StatusSeeOther)
 }
@@ -5053,6 +5158,9 @@ func (h *Handler) AssetUploadForm(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AssetUpload(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermAssetUpload) {
 		return
 	}
 
@@ -5309,6 +5417,9 @@ func (h *Handler) DeleteAsset(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermAssetDelete) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -5451,6 +5562,9 @@ func (h *Handler) BrokenLinkFinder(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) BrokenLinkScan(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit) {
 		return
 	}
 
@@ -5793,6 +5907,9 @@ func (h *Handler) FixBrokenLink(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit) {
 		return
 	}
 
@@ -6375,6 +6492,9 @@ func escapeHTMLForExcerpt(s string) string {
 func (h *Handler) ReplaceExecute(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSearchReplace) {
 		return
 	}
 

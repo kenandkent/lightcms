@@ -11,38 +11,38 @@ import (
 
 func TestCoverGapStatusForCodeTable(t *testing.T) {
 	cases := map[string]int{
-		generation.CodeUnauthenticated: 401,
-		generation.CodePermissionDenied: 403,
-		generation.CodeTemplateNotFound: 404,
-		generation.CodeContentNotFound: 404,
-		generation.CodePublicationNotFound: 404,
-		generation.CodeTemplateVersionNotFound: 404,
-		generation.CodeUpgradeJobNotFound: 404,
-		generation.CodeFieldValidationFailed: 422,
-		generation.CodePathInvalid: 422,
-		generation.CodeDataTooLarge: 422,
-		generation.CodeTemplateSchemaInvalid: 422,
+		generation.CodeUnauthenticated:              401,
+		generation.CodePermissionDenied:             403,
+		generation.CodeTemplateNotFound:             404,
+		generation.CodeContentNotFound:              404,
+		generation.CodePublicationNotFound:          404,
+		generation.CodeTemplateVersionNotFound:      404,
+		generation.CodeUpgradeJobNotFound:           404,
+		generation.CodeFieldValidationFailed:        422,
+		generation.CodePathInvalid:                  422,
+		generation.CodeDataTooLarge:                 422,
+		generation.CodeTemplateSchemaInvalid:        422,
 		generation.CodeTemplatePreconditionRequired: 428,
-		generation.CodeIdempotencyKeyRequired: 428,
-		generation.CodeRateLimited: 429,
-		generation.CodeStoreUnavailable: 503,
-		generation.CodePathConflict: 409,
-		generation.CodeTemplateNotActive: 409,
-		generation.CodeTemplateVersionChanged: 409,
-		generation.CodeTemplateVersionConflict: 409,
-		generation.CodeContentVersionConflict: 409,
-		generation.CodePublicationConflict: 409,
-		generation.CodePagePublishInProgress: 409,
-		generation.CodeIdempotencyConflict: 409,
-		generation.CodeRequestInProgress: 409,
-		generation.CodeAgentSandboxRequired: 409,
-		generation.CodeUpgradeJobConflict: 409,
-		generation.CodeInvalidRequest: 400,
-		generation.CodeInternal: 500,
-		generation.CodeContentCreateFailed: 500,
-		generation.CodeContentUpdateFailed: 500,
-		"NOPE": 500,
-		"": 500,
+		generation.CodeIdempotencyKeyRequired:       428,
+		generation.CodeRateLimited:                  429,
+		generation.CodeStoreUnavailable:             503,
+		generation.CodePathConflict:                 409,
+		generation.CodeTemplateNotActive:            409,
+		generation.CodeTemplateVersionChanged:       409,
+		generation.CodeTemplateVersionConflict:      409,
+		generation.CodeContentVersionConflict:       409,
+		generation.CodePublicationConflict:          409,
+		generation.CodePagePublishInProgress:        409,
+		generation.CodeIdempotencyConflict:          409,
+		generation.CodeRequestInProgress:            409,
+		generation.CodeAgentSandboxRequired:         409,
+		generation.CodeUpgradeJobConflict:           409,
+		generation.CodeInvalidRequest:               400,
+		generation.CodeInternal:                     500,
+		generation.CodeContentCreateFailed:          500,
+		generation.CodeContentUpdateFailed:          500,
+		"NOPE":                                      500,
+		"":                                          500,
 	}
 	for code, want := range cases {
 		if got := generation.StatusForCode(code); got != want {
@@ -63,11 +63,11 @@ func TestCoverGapStatusForCodeTable(t *testing.T) {
 }
 
 func TestCoverGapActorAndErrorHelpers(t *testing.T) {
-	full := generation.Actor{Scopes: []string{}}
+	full := generation.Actor{Role: "admin", Scopes: []string{}}
 	if !full.HasScope("anything") || !full.HasScopes("a", "b") {
 		t.Fatalf("empty scopes = full permissions")
 	}
-	lim := generation.Actor{Scopes: []string{"content.view"}}
+	lim := generation.Actor{Role: "admin", Scopes: []string{"content.view"}}
 	if !lim.HasScope("content.view") || lim.HasScope("content.edit") {
 		t.Fatalf("HasScope allowlist")
 	}
@@ -77,15 +77,15 @@ func TestCoverGapActorAndErrorHelpers(t *testing.T) {
 	if !lim.HasScopes("content.view") {
 		t.Fatalf("HasScopes single")
 	}
-	ownerID := generation.Actor{ID: "i"}
+	ownerID := generation.Actor{Role: "admin", ID: "i"}
 	if ownerID.Owner() != "i" {
 		t.Fatalf("Owner ID")
 	}
-	ownerEmail := generation.Actor{Email: "e"}
+	ownerEmail := generation.Actor{Role: "admin", Email: "e"}
 	if ownerEmail.Owner() != "e" {
 		t.Fatalf("Owner email")
 	}
-	ownerAnon := generation.Actor{}
+	ownerAnon := generation.Actor{Role: "admin"}
 	if ownerAnon.Owner() != "anonymous" {
 		t.Fatalf("Owner anonymous")
 	}

@@ -56,7 +56,7 @@ func newHTTPSetup(t *testing.T) (*generation.Service, *httpapi.Handlers) {
 	gen := generation.NewService(db, generation.Options{
 		Templates: tpls, Pubs: saga, PubRepo: repo, Idem: idem, URLs: resolver,
 	})
-	actor := generation.Actor{ID: "u1", Email: "u@e.com", Authenticated: true, Scopes: []string{}}
+	actor := generation.Actor{Role: "admin", ID: "u1", Email: "u@e.com", Authenticated: true, Scopes: []string{}}
 	h := &httpapi.Handlers{
 		Gen: gen,
 		ActorExtractor: func(r *http.Request) (generation.Actor, error) {
@@ -119,11 +119,11 @@ func TestHTTP_GenerateDraftPreview(t *testing.T) {
 	if _, _, err := tpls.Create(ctx, templatecontract.TemplateInput{
 		Slug: "financial-news", Name: "FN", Category: "news", Status: "active",
 		HTMLLayout: httpLayout,
-		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+		Fields:     []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	actor := generation.Actor{ID: "u1", Email: "u@e.com", Authenticated: true, Scopes: []string{}}
+	actor := generation.Actor{Role: "admin", ID: "u1", Email: "u@e.com", Authenticated: true, Scopes: []string{}}
 	h := &httpapi.Handlers{Gen: gen,
 		ActorExtractor: func(r *http.Request) (generation.Actor, error) { return actor, nil },
 		IdempotencyExtractor: func(r *http.Request) (string, bool) {
@@ -191,7 +191,7 @@ func TestHTTP_GenerateDraftPreview(t *testing.T) {
 
 	// unauthenticated → 401
 	h401 := &httpapi.Handlers{Gen: gen,
-		ActorExtractor: func(r *http.Request) (generation.Actor, error) { return generation.Actor{}, nil },
+		ActorExtractor: func(r *http.Request) (generation.Actor, error) { return generation.Actor{Role: "admin"}, nil },
 	}
 	rr = doRequest(h401.HandleGenerate, "POST", "/api/v1/page-generation",
 		map[string]any{"template": "financial-news", "title": "T", "slug": "a", "folder_path": "/n", "mode": "draft", "data": map[string]any{"headline": "h"}},
@@ -226,13 +226,13 @@ func TestHTTP_SchemaETag(t *testing.T) {
 	tvBefore, _, err := tpls.Create(ctx, templatecontract.TemplateInput{
 		Slug: "financial-news", Name: "FN", Category: "news", Status: "active",
 		HTMLLayout: httpLayout,
-		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+		Fields:     []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
 	})
 	_ = tvBefore
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	actor := generation.Actor{ID: "u1", Email: "u@e.com", Authenticated: true, Scopes: []string{}}
+	actor := generation.Actor{Role: "admin", ID: "u1", Email: "u@e.com", Authenticated: true, Scopes: []string{}}
 	h := &httpapi.Handlers{Gen: gen,
 		ActorExtractor: func(r *http.Request) (generation.Actor, error) { return actor, nil },
 	}
@@ -259,7 +259,7 @@ func TestHTTP_SchemaETag(t *testing.T) {
 	_, err = tpls.Update(ctx, tplRec.ID, 1, templatecontract.TemplateInput{
 		Slug: "financial-news", Name: "FN", Category: "news", Status: "active",
 		HTMLLayout: httpLayout + "<!-- v2 -->",
-		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+		Fields:     []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
 	})
 	if err != nil {
 		t.Fatalf("bump: %v", err)
@@ -289,13 +289,13 @@ func TestHTTP_PublishScopesAnd403ZeroMutation(t *testing.T) {
 	if _, _, err := tpls.Create(ctx, templatecontract.TemplateInput{
 		Slug: "financial-news", Name: "FN", Category: "news", Status: "active",
 		HTMLLayout: httpLayout,
-		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+		Fields:     []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	pubOnly := generation.Actor{ID: "k-pub", Email: "p@e.com", Authenticated: true, Scopes: []string{generation.ScopeContentPublish}}
+	pubOnly := generation.Actor{Role: "admin", ID: "k-pub", Email: "p@e.com", Authenticated: true, Scopes: []string{generation.ScopeContentPublish}}
 	h := &httpapi.Handlers{Gen: gen,
-		ActorExtractor: func(r *http.Request) (generation.Actor, error) { return pubOnly, nil },
+		ActorExtractor:       func(r *http.Request) (generation.Actor, error) { return pubOnly, nil },
 		IdempotencyExtractor: func(r *http.Request) (string, bool) { return "k-http-403", true },
 	}
 	c0, _ := db.Collection("content").CountDocuments(ctx, bson.M{})
@@ -336,11 +336,11 @@ func TestHTTP_PublicationsAndRollback(t *testing.T) {
 	if _, _, err := tpls.Create(ctx, templatecontract.TemplateInput{
 		Slug: "financial-news", Name: "FN", Category: "news", Status: "active",
 		HTMLLayout: httpLayout,
-		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+		Fields:     []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	admin := generation.Actor{ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}}
+	admin := generation.Actor{Role: "admin", ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}}
 	// Publish v1 via service (needs idempotency ctx).
 	raw1, _ := json.Marshal(map[string]any{"t": 1})
 	pctx1 := generation.WithIdempotency(ctx, generation.IdempotencyParams{Owner: "a1", Method: "POST", Path: "/api/v1/page-generation", Key: "k-pub-list-1", Body: raw1})
@@ -409,7 +409,7 @@ func TestHTTP_MigrateSlugAndUpgrade(t *testing.T) {
 		tpl, ver, err := tpls.Create(ctx, templatecontract.TemplateInput{
 			Slug: "financial-news", Name: "FN", Category: "news", Status: "active",
 			HTMLLayout: httpLayout,
-			Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+			Fields:     []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
 		})
 		return tpl, ver, err
 	}()
@@ -417,7 +417,7 @@ func TestHTTP_MigrateSlugAndUpgrade(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	_ = tplRec
-	admin := generation.Actor{ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}}
+	admin := generation.Actor{Role: "admin", ID: "a1", Email: "a@e.com", Authenticated: true, IsAdmin: true, Scopes: []string{}}
 	h := &httpapi.Handlers{Gen: gen,
 		ActorExtractor: func(r *http.Request) (generation.Actor, error) { return admin, nil },
 	}
@@ -425,7 +425,7 @@ func TestHTTP_MigrateSlugAndUpgrade(t *testing.T) {
 	if _, _, err := tpls.Create(ctx, templatecontract.TemplateInput{
 		Slug: "taken-slug", Name: "T", Category: "news", Status: "active",
 		HTMLLayout: httpLayout,
-		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+		Fields:     []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
 	}); err != nil {
 		t.Fatalf("seed2: %v", err)
 	}

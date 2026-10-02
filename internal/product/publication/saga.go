@@ -123,11 +123,57 @@ type RenderInput struct {
 	TemplateVersionNum int64
 	LogicalPublishedAt time.Time
 	PublicURL          string
+	// AuthorIsAdmin resolves policy=admin_only at plan time: admins render
+	// raw, everyone else renders strict. Frozen into the snapshot so
+	// takeover replays the same decision. Zero value (false) is fail-closed.
+	AuthorIsAdmin bool
 }
 
 // Renderer turns a frozen snapshot into final HTML bytes. Returning an error
 // fails the attempt before InsertStaged or any file write.
 type Renderer func(ctx context.Context, in RenderInput) ([]byte, error)
+
+// SnapshotRenderFunc is the full-pipeline renderer (R02): PlanSnapshot +
+// RenderDetailed with Markdown, sanitizer policy, snippets, wikilinks and
+// TOC. Unlike Renderer it also returns the render provenance (renderer
+// version, dependency hash + snapshot) so the staged record reflects the
+// ACTUAL render, not construction-time defaults.
+type SnapshotRenderFunc func(ctx context.Context, in RenderInput) (RenderResult, error)
+
+// renderedOutput carries render bytes plus the provenance the staged
+// record must persist (R02: from the actual render, not defaults).
+type renderedOutput struct {
+	html            []byte
+	rendererVersion string
+	depsHash        string
+	depSnapshot     map[string]any
+}
+
+// renderForPlan renders through the snapshot pipeline when wired
+// (production), else the minimal Renderer (tests/fakes).
+func (s *Service) renderForPlan(ctx context.Context, in RenderInput) (*renderedOutput, error) {
+	if s.snapshot != nil {
+		res, rerr := s.snapshot(ctx, in)
+		if rerr != nil {
+			return nil, rerr
+		}
+		return &renderedOutput{
+			html: res.HTML, rendererVersion: res.RendererVersion,
+			depsHash: res.RenderDependenciesHash, depSnapshot: res.DependencySnapshot,
+		}, nil
+	}
+	html, rerr := s.renderer(ctx, in)
+	if rerr != nil {
+		return nil, rerr
+	}
+	// Legacy path: construction-time values, byte-identical to pre-R02
+	// records (service renderer version + template render hash).
+	return &renderedOutput{
+		html: html, rendererVersion: s.rendererVersion,
+		depsHash:    in.Template.RenderHash,
+		depSnapshot: map[string]any{"template_render_hash": in.Template.RenderHash},
+	}, nil
+}
 
 // DefaultRenderer is the deterministic in-process renderer: required-field
 // validation, html/template execution with missingkey=error, and a minimal
@@ -285,10 +331,18 @@ type cutoverPlan struct {
 	recordHash     string // "sha256:<hex>" for the publication record (spec §15.2)
 	verification   VerificationStatus
 	snapshot       map[string]any
-	opID           *primitive.ObjectID
-	attempt        int64
-	useIdem        bool
-	startedAt      time.Time // plan freeze time for duration_ms logs.
+	// Render provenance for the staged record. The legacy renderer path
+	// fills these with today's construction-time values (service renderer
+	// version + template render hash + the diagnostic snapshot above, i.e.
+	// byte-identical to pre-R02 records); the snapshot pipeline fills them
+	// from the actual RenderResult.
+	rendererVersion string
+	renderDepsHash  string
+	depSnapshot     map[string]any
+	opID            *primitive.ObjectID
+	attempt         int64
+	useIdem         bool
+	startedAt       time.Time // plan freeze time for duration_ms logs.
 	// Lane 2B: caller attribution carried from the request into the minted
 	// Publication record (empty = unattributed, as before).
 	actor        string
@@ -393,22 +447,25 @@ func (s *Service) buildPublishPlan(ctx context.Context, req PublishRequest, cont
 		return nil, err
 	}
 
-	html, err := s.renderer(ctx, RenderInput{
+	ro, err := s.renderForPlan(ctx, RenderInput{
 		Content: content, Template: tv, PublicationID: pubID,
 		ContentVersion: cv, TemplateVersionNum: tv.Version,
 		LogicalPublishedAt: logicalAt, PublicURL: publicURL,
+		AuthorIsAdmin: req.AuthorIsAdmin,
 	})
 	if err != nil {
 		s.markTerminal(ctx, opID, attempt, CodeRenderFailed)
 		return nil, err
 	}
+	html := ro.html
 
 	plan := &cutoverPlan{
 		contentID: req.ContentID, fullPath: content.FullPath, contentVersion: cv, tv: tv,
 		oldActive: oldActive, pubID: pubID, logicalAt: logicalAt, publicURL: publicURL,
 		html: html, verification: VerificationVerified,
-		snapshot: map[string]any{"template_render_hash": tv.RenderHash},
-		opID:     opID, attempt: attempt, useIdem: useIdem,
+		snapshot:        map[string]any{"template_render_hash": tv.RenderHash},
+		rendererVersion: ro.rendererVersion, renderDepsHash: ro.depsHash, depSnapshot: ro.depSnapshot,
+		opID: opID, attempt: attempt, useIdem: useIdem,
 		startedAt: s.now(),
 		// Lane 2B: thread caller attribution into the minted record.
 		actor: req.Actor, via: req.Via, agentSession: req.AgentSession,
@@ -466,7 +523,7 @@ func (s *Service) buildRollbackPlan(ctx context.Context, req RollbackRequest, co
 		return nil, err
 	}
 
-	html, verification, snapshot, err := s.rollbackBytes(ctx, content, source, pubID, logicalAt, publicURL)
+	html, verification, snapshot, rendVer, depsHash, depSnap, err := s.rollbackBytes(ctx, content, source, pubID, logicalAt, publicURL, req.AuthorIsAdmin)
 	if err != nil {
 		s.markTerminal(ctx, opID, attempt, CodeRenderFailed)
 		return nil, err
@@ -476,6 +533,7 @@ func (s *Service) buildRollbackPlan(ctx context.Context, req RollbackRequest, co
 		contentID: req.ContentID, fullPath: content.FullPath, contentVersion: source.ContentVersion,
 		oldActive: oldActive, pubID: pubID, logicalAt: logicalAt, publicURL: publicURL,
 		html: html, verification: verification, snapshot: snapshot,
+		rendererVersion: rendVer, renderDepsHash: depsHash, depSnapshot: depSnap,
 		opID: opID, attempt: attempt, useIdem: useIdem,
 		startedAt: s.now(),
 		// Lane 2B: thread caller attribution into the minted record.
@@ -499,7 +557,12 @@ func (s *Service) buildRollbackPlan(ctx context.Context, req RollbackRequest, co
 }
 
 // rollbackBytes loads exact retained bytes, falling back to re-render.
-func (s *Service) rollbackBytes(ctx context.Context, content models.Content, source *Publication, pubID primitive.ObjectID, logicalAt time.Time, publicURL string) ([]byte, VerificationStatus, map[string]any, error) {
+// It also returns the render provenance for the staged record: the exact
+// path reuses the source record's stored provenance (the bytes were rendered
+// then); the re-render path returns the actual render's provenance with the
+// rollback diagnostics merged into the dependency snapshot (full pipeline)
+// or today's diagnostic map (legacy renderer, byte-identical records).
+func (s *Service) rollbackBytes(ctx context.Context, content models.Content, source *Publication, pubID primitive.ObjectID, logicalAt time.Time, publicURL string, authorIsAdmin bool) (html []byte, verification VerificationStatus, snapshot map[string]any, rendererVersion, depsHash string, depSnapshot map[string]any, err error) {
 	immutable := source.StoragePath
 	if immutable == "" {
 		immutable = s.store.ImmutablePath(content.ID, source.ID)
@@ -522,41 +585,58 @@ func (s *Service) rollbackBytes(ctx context.Context, content models.Content, sou
 				break
 			}
 		}
-		return []byte(buf.String()), source.VerificationStatus, map[string]any{
+		snap := map[string]any{
 			"rollback_mode": "exact", "source_publication_id": source.ID.Hex(),
 			"source_verification": string(source.VerificationStatus),
-		}, nil
+		}
+		return []byte(buf.String()), source.VerificationStatus, snap,
+			source.RendererVersion, source.RenderDependenciesHash, snap, nil
 	}
 	if storage.CodeOf(err) != storage.CodeNotFound {
-		return nil, "", nil, sagaErr(CodeRenderFailed, "read retained rollback bytes", err)
+		return nil, "", nil, "", "", nil, sagaErr(CodeRenderFailed, "read retained rollback bytes", err)
 	}
 	// Retention-expired immutable object: weaker re-render path.
 	var ver models.ContentVersion
 	if ferr := s.db.FindOne(ctx, "content_versions",
 		bson.M{"content_id": content.ID, "version": source.ContentVersion}, &ver); ferr != nil {
-		return nil, "", nil, sagaErr(CodeRenderFailed,
+		return nil, "", nil, "", "", nil, sagaErr(CodeRenderFailed,
 			fmt.Sprintf("rollback source bytes expired and version %d not retained", source.ContentVersion), ferr)
 	}
 	tv, terr := s.templates.GetVersion(ctx, source.TemplateVersionID)
 	if terr != nil {
-		return nil, "", nil, sagaErr(templatecontract.CodeVersionNotFound,
+		return nil, "", nil, "", "", nil, sagaErr(templatecontract.CodeVersionNotFound,
 			"rollback template version "+source.TemplateVersionID.Hex()+" not found", terr)
 	}
 	renderContent := content
 	renderContent.Data = ver.Data
 	renderContent.Title = ver.Title
-	html, rerr := s.renderer(ctx, RenderInput{
+	ro, rerr := s.renderForPlan(ctx, RenderInput{
 		Content: renderContent, Template: tv, PublicationID: pubID,
 		ContentVersion: source.ContentVersion, TemplateVersionNum: tv.Version,
 		LogicalPublishedAt: logicalAt, PublicURL: publicURL,
+		AuthorIsAdmin: authorIsAdmin,
 	})
 	if rerr != nil {
-		return nil, "", nil, rerr
+		return nil, "", nil, "", "", nil, rerr
 	}
-	return html, VerificationVerified, map[string]any{
+	snap := map[string]any{
 		"rollback_mode": "re-render", "source_publication_id": source.ID.Hex(),
 		"source_content_version": source.ContentVersion,
-	}, nil
+	}
+	depSnap := snap
+	if s.snapshot != nil && ro.depSnapshot != nil {
+		// Full pipeline: persist the actual render dependencies with the
+		// rollback diagnostics merged in (rollback keys win).
+		merged := make(map[string]any, len(ro.depSnapshot)+len(snap))
+		for k, v := range ro.depSnapshot {
+			merged[k] = v
+		}
+		for k, v := range snap {
+			merged[k] = v
+		}
+		depSnap = merged
+	}
+	return ro.html, VerificationVerified, snap, ro.rendererVersion, ro.depsHash, depSnap, nil
 }
 
 // freezeExecution allocates (or crash-reuses) the attempt's publication ID +
@@ -622,6 +702,22 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 	fail := func(code, message string, err error) (PublicationResult, error) {
 		return PublicationResult{}, sagaErr(code, message, err)
 	}
+	// R07: single effective executor. When this attempt runs under an
+	// idempotency lease, verify we still own it (a takeover by a newer
+	// worker must stop us BEFORE any side effect) and heartbeat it for
+	// the duration of the cutover. Losing the lease cancels ctx: forward
+	// progress stops; compensation paths are ctx-resilient or best-effort.
+	if plan.opID != nil && s.idem != nil {
+		cur, gerr := s.idem.Get(ctx, *plan.opID)
+		if gerr != nil || cur.State != idempotency.StateProcessing ||
+			cur.AttemptState != idempotency.AttemptProcessing || cur.Attempt != plan.attempt {
+			return fail(CodePagePublishInProgress,
+				"idempotency lease is no longer owned by this attempt; retry to take over", gerr)
+		}
+		hctx, stop := s.idem.Heartbeat(ctx, cur.ID, plan.attempt, cur.LeaseGeneration)
+		defer stop()
+		ctx = hctx
+	}
 	if !ActivatableVerification(plan.verification, false) {
 		// Defense in depth: the saga only ever stages verified output, except
 		// exact rollback bytes inherited from a legacy_unverified source —
@@ -645,11 +741,11 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		LogicalPublishedAt: plan.logicalAt,
 		// Lane 2B: caller attribution from the request (empty when the
 		// caller provided none — omitempty keeps old docs byte-identical).
-		Actor:              plan.actor,
-		Via:                plan.via,
-		AgentSession:       plan.agentSession,
-		RendererVersion:    s.rendererVersion, ProductBuildSHA: s.buildSHA,
-		RenderDependenciesHash: plan.tv.RenderHash, DependencySnapshot: plan.snapshot,
+		Actor:           plan.actor,
+		Via:             plan.via,
+		AgentSession:    plan.agentSession,
+		RendererVersion: plan.rendererVersion, ProductBuildSHA: s.buildSHA,
+		RenderDependenciesHash: plan.renderDepsHash, DependencySnapshot: plan.depSnapshot,
 	}
 	rec.ID = plan.pubID
 	if err := s.repo.InsertStaged(ctx, rec); err != nil {
@@ -720,17 +816,48 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		}
 	}
 
-	if err := s.repo.ActivateCAS(ctx, plan.contentID, plan.pubID, oldID); err != nil {
+	var commitErr error
+	if plan.renamed {
+		// R08: the rename redirect commits atomically with the activation —
+		// a crash can never leave the new page live with the old link
+		// redirect-less. finishCommit keeps its idempotent backfill for
+		// pre-R08 rows and same-key retries.
+		commitErr = s.repo.ActivateCASWithRedirect(ctx, plan.contentID, plan.pubID, oldID, plan.oldPath, plan.fullPath)
+	} else {
+		commitErr = s.repo.ActivateCAS(ctx, plan.contentID, plan.pubID, oldID)
+	}
+	if commitErr != nil {
 		// Commit ambiguity: a commit that actually landed reports here as a
 		// success once the new record reads back as active — never compensate
 		// a live page.
-		if active, rerr := s.repo.GetActive(ctx, plan.contentID); rerr == nil && active != nil && active.ID == plan.pubID {
+		active, rerr := s.repo.GetActive(ctx, plan.contentID)
+		if s.faults.CommitReadError != nil {
+			rerr = s.faults.CommitReadError
+			active = nil
+		}
+		if rerr == nil && active != nil && active.ID == plan.pubID {
 			return s.finishCommit(ctx, plan, oldID)
 		}
-		if IsConflict(err) {
-			return s.failCommitted(ctx, plan, staged, oldID, "activation conflict", err)
+		if rerr != nil {
+			// R11: commit result UNKNOWN (the transaction errored AND the
+			// read-back failed too). The commit may have landed — never
+			// compensate a possibly-live page, never fail the staged
+			// record, never mark the attempt terminal: leave everything
+			// for the scanner / same-key retry (which converges via the
+			// idempotent ActivateCAS + frozen snapshot reuse).
+			plan.observeActivateFail(CodeActivationUnknown)
+			s.auditf(ctx, "publication.activate_unknown", map[string]any{
+				"content_id": plan.contentID.Hex(), "publication_id": plan.pubID.Hex(),
+				"full_path": plan.fullPath, "commit_error": commitErr.Error(),
+				"readback_error": rerr.Error(),
+			})
+			return PublicationResult{}, sagaErr(CodeActivationUnknown,
+				"activation commit result unknown; staged publication retained for recovery — retry the same key", commitErr)
 		}
-		return s.failCommitted(ctx, plan, staged, oldID, "activation transaction", err)
+		if IsConflict(commitErr) {
+			return s.failCommitted(ctx, plan, staged, oldID, "activation conflict", commitErr)
+		}
+		return s.failCommitted(ctx, plan, staged, oldID, "activation transaction", commitErr)
 	}
 	return s.finishCommit(ctx, plan, oldID)
 }

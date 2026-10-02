@@ -27,19 +27,19 @@ import (
 )
 
 type genSetup struct {
-	db       *database.DB
-	gen      *generation.Service
-	tpls     *templatecontract.Service
-	repo     *publication.Repository
-	saga     *publication.Service
-	idem     *idempotency.Service
-	store    storage.Store
-	root     string
-	audits   *int
-	tvID     primitive.ObjectID
-	tplID    primitive.ObjectID
-	tvNum    int64
-	slug     string
+	db     *database.DB
+	gen    *generation.Service
+	tpls   *templatecontract.Service
+	repo   *publication.Repository
+	saga   *publication.Service
+	idem   *idempotency.Service
+	store  storage.Store
+	root   string
+	audits *int
+	tvID   primitive.ObjectID
+	tplID  primitive.ObjectID
+	tvNum  int64
+	slug   string
 }
 
 const genLayout = `<html><head><title>{{.title}}</title></head><body><h1>{{.headline}}</h1></body></html>`
@@ -120,11 +120,11 @@ func (s *genSetup) seedTemplate(t *testing.T, slug, status string, fields []mode
 }
 
 func authed(scopes ...string) generation.Actor {
-	return generation.Actor{ID: "user-1", Email: "user@example.com", Authenticated: true, Scopes: scopes}
+	return generation.Actor{Role: "admin", ID: "user-1", Email: "user@example.com", Authenticated: true, Scopes: scopes}
 }
 
 func adminActor() generation.Actor {
-	return generation.Actor{ID: "admin-1", Email: "admin@example.com", Authenticated: true, IsAdmin: true, Scopes: []string{}}
+	return generation.Actor{Role: "admin", ID: "admin-1", Email: "admin@example.com", Authenticated: true, IsAdmin: true, Scopes: []string{}}
 }
 
 func pubCtx(actor generation.Actor, key string, req generation.GenerateRequest, tvNum int64) context.Context {
@@ -465,7 +465,7 @@ func TestGenerate_ErrorsAndScopes(t *testing.T) {
 	}
 
 	// 401 unauthenticated
-	_, err := s.gen.Generate(ctx, generation.Actor{}, generation.GenerateRequest{
+	_, err := s.gen.Generate(ctx, generation.Actor{Role: "admin"}, generation.GenerateRequest{
 		Template: "financial-news", Title: "X", Slug: "x401", FolderPath: "/n", Mode: "draft",
 		Data: map[string]any{"headline": "h"},
 	})
@@ -521,7 +521,7 @@ func TestGenerate_ErrorsAndScopes(t *testing.T) {
 	}
 
 	// 403 publish-only key cannot create (zero mutation, no completed idem)
-	pubOnly := generation.Actor{ID: "k-pub", Email: "p@e.com", Authenticated: true, Scopes: []string{generation.ScopeContentPublish}}
+	pubOnly := generation.Actor{Role: "admin", ID: "k-pub", Email: "p@e.com", Authenticated: true, Scopes: []string{generation.ScopeContentPublish}}
 	pctx := pubCtx(pubOnly, "k-403-1", generation.GenerateRequest{
 		Template: "financial-news", Title: "P", Slug: "p403", FolderPath: "/n",
 		Mode: "publish", ExpectedTemplateVersion: &tv, Data: map[string]any{"headline": "h"},
@@ -541,7 +541,7 @@ func TestGenerate_ErrorsAndScopes(t *testing.T) {
 	}
 
 	// 403 create-only cannot publish
-	createOnly := generation.Actor{ID: "k-cr", Email: "c@e.com", Authenticated: true, Scopes: []string{generation.ScopeContentCreate}}
+	createOnly := generation.Actor{Role: "admin", ID: "k-cr", Email: "c@e.com", Authenticated: true, Scopes: []string{generation.ScopeContentCreate}}
 	pctx2 := pubCtx(createOnly, "k-403-2", generation.GenerateRequest{
 		Template: "financial-news", Title: "P", Slug: "p403b", FolderPath: "/n",
 		Mode: "publish", ExpectedTemplateVersion: &tv, Data: map[string]any{"headline": "h"},
@@ -575,7 +575,7 @@ func TestGenerate_ErrorsAndScopes(t *testing.T) {
 
 	// sandbox_only key cannot publish
 	boxID := primitive.NewObjectID()
-	sandboxOnly := generation.Actor{ID: "k-box", Email: "b@e.com", Authenticated: true,
+	sandboxOnly := generation.Actor{Role: "admin", ID: "k-box", Email: "b@e.com", Authenticated: true,
 		Scopes: []string{generation.ScopeContentCreate, generation.ScopeContentPublish}, SandboxOnly: true, SandboxForkID: &boxID}
 	_, err = s.gen.Generate(pubCtx(sandboxOnly, "k-box-1", generation.GenerateRequest{
 		Template: "financial-news", Title: "BX", Slug: "box-pub", FolderPath: "/n", Mode: "publish",

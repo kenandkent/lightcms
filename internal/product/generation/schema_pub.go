@@ -78,7 +78,7 @@ func (s *Service) RollbackPublication(ctx context.Context, actor Actor, contentI
 	if !actor.Authenticated {
 		return zero, genErr(CodeUnauthenticated, "authentication is required", nil)
 	}
-	if !actor.HasScope(ScopeContentEdit) || !actor.HasScope(ScopeContentPublish) {
+	if !actor.Can(ScopeContentEdit) || !actor.Can(ScopeContentPublish) {
 		return zero, genErr(CodePermissionDenied, "rollback requires content.edit + content.publish", nil)
 	}
 	ifem, hasIdem := IdempotencyFrom(ctx)
@@ -104,7 +104,7 @@ func (s *Service) RollbackPublication(ctx context.Context, actor Actor, contentI
 	if len(body) == 0 {
 		body = []byte(`{"source":"` + sourceID.Hex() + `"}`)
 	}
-	op, err := s.idem.Begin(ctx, owner, method, path, ifem.Key, body)
+	op, err := s.beginOrResume(ctx, owner, method, path, ifem.Key, body)
 	if err != nil {
 		return zero, mapIdemBeginErr(err)
 	}
@@ -134,6 +134,7 @@ func (s *Service) RollbackPublication(ctx context.Context, actor Actor, contentI
 		ExpectedActiveID: expectedActiveID, IdempotencyRecord: &op.ID,
 		// Lane 2B: thread caller attribution into the minted record.
 		Actor: actorKind(actor), Via: actor.Via, AgentSession: actor.AgentSession,
+		AuthorIsAdmin: actor.IsAdmin,
 	})
 	if err != nil {
 		s.completePublishError(ctx, op, err)

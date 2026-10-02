@@ -168,6 +168,19 @@ func (r *Repository) InsertStaged(ctx context.Context, pub *Publication) error {
 	}
 	if _, err := r.db.Collection(CollectionPublications).InsertOne(ctx, pub); err != nil {
 		if isDupKey(err) {
+			// R11 resume: the same attempt re-staging its frozen
+			// publication after an uncertain commit must not fail —
+			// tolerate a byte-identical re-insert, conflict on
+			// divergence (a reused ID with different bytes is a bug).
+			var existing Publication
+			if ferr := r.db.Collection(CollectionPublications).FindOne(ctx,
+				bson.M{"_id": pub.ID}).Decode(&existing); ferr == nil &&
+				existing.Status == StatusStaged &&
+				existing.ContentID == pub.ContentID &&
+				existing.ContentVersion == pub.ContentVersion &&
+				existing.ContentHash == pub.ContentHash {
+				return nil
+			}
 			return pubErr(CodeConflict, "duplicate publication record", err)
 		}
 		return err
@@ -243,6 +256,19 @@ func (r *Repository) ListHistory(ctx context.Context, contentID primitive.Object
 // Lost-response retry after a committed activation is idempotent: if the new
 // record is already the current active, ActivateCAS returns nil.
 func (r *Repository) ActivateCAS(ctx context.Context, contentID, newPublicationID primitive.ObjectID, expectedOldActiveID *primitive.ObjectID) error {
+	return r.activateCAS(ctx, contentID, newPublicationID, expectedOldActiveID, "", "")
+}
+
+// ActivateCASWithRedirect commits the activation transaction with the
+// rename redirect in the SAME transaction (R08, spec §18.3): oldPath →
+// newPath is upserted atomically with the active-pointer flip, so a crash
+// can never leave the new page live with the old link redirect-less.
+// Empty paths skip the redirect write (non-rename activations).
+func (r *Repository) ActivateCASWithRedirect(ctx context.Context, contentID, newPublicationID primitive.ObjectID, expectedOldActiveID *primitive.ObjectID, oldPath, newPath string) error {
+	return r.activateCAS(ctx, contentID, newPublicationID, expectedOldActiveID, oldPath, newPath)
+}
+
+func (r *Repository) activateCAS(ctx context.Context, contentID, newPublicationID primitive.ObjectID, expectedOldActiveID *primitive.ObjectID, redirectFrom, redirectTo string) error {
 	return r.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
 		pubs := r.db.Collection(CollectionPublications)
 		content := r.db.Collection(CollectionContent)
@@ -343,6 +369,22 @@ func (r *Repository) ActivateCAS(ctx context.Context, contentID, newPublicationI
 		next.ID = newPublicationID
 		if err := r.outbox.InsertUnique(sc, EventPublished, newPublicationID, eventPayload(&next)); err != nil {
 			return err
+		}
+		if redirectFrom != "" && redirectTo != "" && redirectFrom != redirectTo {
+			// R08: the rename redirect commits atomically with the
+			// activation — same doc shape as the saga backfill (which
+			// stays as the idempotent retry path).
+			now := time.Now()
+			if _, err := r.db.Collection("redirects").UpdateOne(sc,
+				bson.M{"from_path": redirectFrom},
+				bson.M{"$set": bson.M{
+					"from_path": redirectFrom, "to_path": redirectTo, "status_code": 301,
+					"description": "rename-and-publish redirect", "updated_at": now,
+				}, "$setOnInsert": bson.M{"created_at": now}},
+				options.Update().SetUpsert(true),
+			); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

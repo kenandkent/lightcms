@@ -23,7 +23,7 @@ import (
 // mutationFootprint snapshots every mutable surface for zero-mutation rows.
 type mutationFootprint struct {
 	content, versions, pubs, outbox, idem int64
-	files                                  []string
+	files                                 []string
 }
 
 func snapshotFootprint(t *testing.T, e *testEnv) mutationFootprint {
@@ -121,28 +121,32 @@ func TestE2E_SecurityScopes(t *testing.T) {
 	if code != 403 {
 		t.Fatalf("denied probe = %d, want 403", code)
 	}
+	// R05: the denial creates no lease — the same key stays pristine, so an
+	// authorized retry proceeds immediately instead of wedging on
+	// REQUEST_IN_PROGRESS.
+	if n := e.count("idempotency_records", bson.M{"key": "sec-poison-key"}); n != 0 {
+		t.Fatalf("denied request minted %d idempotency record(s), want none", n)
+	}
 	e.setActor(defaultActor())
 	code, resp := e.postRaw("/api/v1/page-generation", deniedRaw, map[string]string{"Idempotency-Key": "sec-poison-key"})
-	if code != 409 || errorCodeOf(resp) != "REQUEST_IN_PROGRESS" {
-		t.Fatalf("authorized retry during denied lease = %d (%v), want 409 REQUEST_IN_PROGRESS", code, resp)
+	if code != 201 {
+		t.Fatalf("authorized retry after 403 = %d (%v), want 201 (no wedging)", code, resp)
 	}
-	if _, err := e.db.Collection("idempotency_records").UpdateOne(context.Background(),
-		bson.M{"key": "sec-poison-key"},
-		bson.M{"$set": bson.M{"processing_expires_at": thenPast()}}); err != nil {
-		t.Fatalf("backdate lease: %v", err)
+	firstPub, _ := resp["publication_id"].(string)
+	if firstPub == "" {
+		t.Fatalf("authorized retry missing publication_id: %v", resp)
 	}
-	// Even after the lease lapses the key stays 409: no HTTP path performs
-	// TakeOver — generation answers "retry to take over the same attempt"
-	// but offers no takeover operation, and PublishInternal's attempt is
-	// shadowed (see TestE2E_SchedulerStableKey). The key only becomes
-	// usable after TTL expiry. Pinned as part of the crash-takeover gap.
-	for i := 0; i < 2; i++ {
-		code, resp = e.postRaw("/api/v1/page-generation", deniedRaw, map[string]string{"Idempotency-Key": "sec-poison-key"})
-		if code != 409 {
-			t.Fatalf("post-lapse retry %d = %d (%v), want stuck-409 (takeover gap pin)", i, code, resp)
-		}
+	// And again → replay of the same publication (R04: no duplicate).
+	code, resp = e.postRaw("/api/v1/page-generation", deniedRaw, map[string]string{"Idempotency-Key": "sec-poison-key"})
+	if code != 201 {
+		t.Fatalf("second retry = %d (%v), want 201 replay", code, resp)
 	}
-	t.Logf("GAP PINNED: expired-lease HTTP retry loops 409 with no reachable TakeOver; recovery waits for TTL expiry")
+	if again, _ := resp["publication_id"].(string); again != firstPub {
+		t.Fatalf("replay minted a second publication: %q vs %q", again, firstPub)
+	}
+	if n := e.count("content_publications", bson.M{}); n != 1 {
+		t.Fatalf("content_publications = %d, want exactly 1 (no duplicates)", n)
+	}
 
 	// Control: full owner publishes.
 	e.setActor(defaultActor())
