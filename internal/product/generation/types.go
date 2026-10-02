@@ -88,17 +88,18 @@ const (
 // Role grants nothing — extractors must always populate it from the
 // authenticated session/API key.
 type Actor struct {
-	ID            string
-	Email         string
-	Authenticated bool
-	IsAdmin       bool
-	Role          string
-	Scopes        []string
-	SandboxOnly   bool
-	SandboxForkID *primitive.ObjectID
-	AgentSession  string
-	Via           string
-	ActorKind     string // "human" | "agent"
+	ID              string
+	CredentialOwner string // API-key document ID or OAuth client + resolved subject.
+	Email           string
+	Authenticated   bool
+	IsAdmin         bool
+	Role            string
+	Scopes          []string
+	SandboxOnly     bool
+	SandboxForkID   *primitive.ObjectID
+	AgentSession    string
+	Via             string
+	ActorKind       string // "human" | "agent"
 }
 
 // Can reports whether the actor holds permission p: the role must grant it,
@@ -159,6 +160,9 @@ func (a Actor) HasScopes(ss ...string) bool {
 // owner is ID when present, else Email, else "anonymous" (which never reaches
 // publish — unauthenticated is 401 first).
 func (a Actor) Owner() string {
+	if a.CredentialOwner != "" {
+		return a.CredentialOwner
+	}
 	if a.ID != "" {
 		return a.ID
 	}
@@ -192,6 +196,7 @@ const (
 	CodeTemplatePreconditionRequired = "TEMPLATE_VERSION_PRECONDITION_REQUIRED"
 	CodeTemplateVersionConflict      = "TEMPLATE_VERSION_CONFLICT"
 	CodeFieldValidationFailed        = "FIELD_VALIDATION_FAILED"
+	CodeRenderValidationFailed       = "RENDER_VALIDATION_FAILED"
 	CodeDataTooLarge                 = "DATA_TOO_LARGE"
 	CodePathInvalid                  = "PATH_INVALID"
 	CodePathConflict                 = "PATH_CONFLICT"
@@ -268,7 +273,7 @@ func StatusForCode(code string) int {
 		CodeTemplateVersionNotFound, CodeUpgradeJobNotFound:
 		return 404
 	case CodeFieldValidationFailed, CodePathInvalid, CodeDataTooLarge,
-		CodeTemplateSchemaInvalid:
+		CodeTemplateSchemaInvalid, CodeRenderValidationFailed:
 		return 422
 	case CodeTemplatePreconditionRequired, CodeIdempotencyKeyRequired:
 		return 428

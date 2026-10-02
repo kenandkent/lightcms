@@ -230,6 +230,18 @@ func PlanSnapshot(
 
 	data := deepCopyData(content.Data)
 	fields := deepCopyFields(tmplVer.Fields)
+	deps := deepCopySnapshot(opts.DependencySnapshot)
+	if deps == nil {
+		deps = DefaultDependencySnapshot(policy)
+	}
+	for name, value := range map[string]any{"snippets": opts.Snippets, "title_to_path": opts.TitleToPath, "path_to_title": opts.PathToTitle, "lc_query_cache": opts.LCQueryCache} {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return RenderSnapshot{}, renderErr(CodeRenderValidation, "encode dependency "+name, err)
+		}
+		h := sha256.Sum256(raw)
+		deps[name+"_hash"] = "sha256:" + hex.EncodeToString(h[:])
+	}
 	return RenderSnapshot{
 		PublicationID:      publicationID,
 		ContentID:          content.ID,
@@ -248,7 +260,7 @@ func PlanSnapshot(
 		AuthorIsAdmin:      opts.AuthorIsAdmin,
 		LogicalPublishedAt: logicalAt.UTC(),
 		PublicURL:          publicURL,
-		DependencySnapshot: deepCopySnapshot(opts.DependencySnapshot),
+		DependencySnapshot: deps,
 		Snippets:           copyStringMap(opts.Snippets),
 		TitleToPath:        copyStringMap(opts.TitleToPath),
 		PathToTitle:        copyStringMap(opts.PathToTitle),
@@ -377,6 +389,9 @@ func RenderDetailed(ctx context.Context, snap RenderSnapshot) (RenderResult, err
 		if !ok {
 			continue
 		}
+		if fieldTypes[k] != "markdown" && fieldTypes[k] != "richtext" && fieldTypes[k] != "rawhtml" {
+			continue // Plain text is literal, including include/wiki/query syntax.
+		}
 		s = expandSnippetIncludesFrozen(s, snap.Snippets, snippetRenderData(snap, data))
 		// Markdown conversion per frozen field type; richtext sanitized when strict.
 		switch fieldTypes[k] {
@@ -394,7 +409,7 @@ func RenderDetailed(ctx context.Context, snap RenderSnapshot) (RenderResult, err
 	// the frozen logical time formatted deterministically, never time.Now.
 	tmplData := make(map[string]any, len(data)+16)
 	for k, v := range data {
-		if s, ok := v.(string); ok {
+		if s, ok := v.(string); ok && (fieldTypes[k] == "markdown" || fieldTypes[k] == "richtext" || fieldTypes[k] == "rawhtml") {
 			tmplData[k] = template.HTML(s)
 		} else if v != nil {
 			tmplData[k] = v

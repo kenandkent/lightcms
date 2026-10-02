@@ -13,7 +13,15 @@ type contextKey int
 const (
 	// apiUserContextKey stores the authenticated API user in context
 	apiUserContextKey contextKey = iota
+	originalOAuthTokenKey
 )
+
+// OriginalOAuthToken keeps the original credential through the MCP loopback
+// client. It is never accepted from a user-supplied forwarding header.
+func OriginalOAuthToken(ctx context.Context) string {
+	s, _ := ctx.Value(originalOAuthTokenKey).(string)
+	return s
+}
 
 // APIKeyValidateFunc validates an API key and returns the authenticated user (as interface{}).
 // The returned value will be stored in the request context and can be retrieved with APIUserFromContext.
@@ -122,6 +130,7 @@ func (m *APIAuth) Middleware(next http.Handler) http.Handler {
 			}
 			// Replace Authorization header with system API key so downstream
 			// handlers (MCP http_handler, REST API) work correctly
+			r = r.WithContext(context.WithValue(r.Context(), originalOAuthTokenKey, token))
 			r.Header.Set("Authorization", "Bearer "+m.systemAPIKey)
 			next.ServeHTTP(w, r)
 		} else {

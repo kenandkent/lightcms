@@ -115,7 +115,7 @@ func TestInstanceGateHeartbeatRefresh(t *testing.T) {
 
 	// Direct refresh call must also bump the heartbeat (backdate first so
 	// the bump is observable even without waiting for the ticker).
-	backdated := before.LastHeartbeat.Add(-time.Hour)
+	backdated := before.LastHeartbeat.Add(-time.Minute)
 	if _, err := db.Collection(instanceLivenessCollection).UpdateOne(ctx,
 		bson.M{"_id": id}, bson.M{"$set": bson.M{"last_heartbeat": backdated}}); err != nil {
 		stop()

@@ -2,6 +2,7 @@ package generation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -27,6 +28,9 @@ func (s *Service) publishWithOp(ctx context.Context, actor Actor, tv templatecon
 	}
 	if op == nil {
 		return zero, genErr(CodeInternal, "idempotency operation is required", nil)
+	}
+	if err := s.idem.SetResponseMetadata(ctx, *op, map[string]any{"warnings": warns}); err != nil {
+		return zero, rwIdemErr(err)
 	}
 	// op is the early Begin from Generate (replay already handled there).
 
@@ -126,6 +130,7 @@ func (s *Service) publishWithOp(ctx context.Context, actor Actor, tv templatecon
 		"mode": out.Mode, "published": out.Published, "requires_publish": out.RequiresPublish,
 		"public_url": publicURL, "content_version": float64(out.ContentVersion),
 		"template_version": float64(out.TemplateVersion), "publication_id": pubHex,
+		"warnings": warns,
 	}
 	// R07 fencing: complete only while this worker still owns the attempt —
 	// after a lease takeover, Completing would stamp our response onto the
@@ -284,6 +289,10 @@ func mapSagaErr(err error) error {
 		return &Error{Code: CodeStoreUnavailable, Message: msg, RetryAfter: 30, Err: err}
 	case publication.CodeValidationFailed:
 		return genErr(CodeFieldValidationFailed, msg, err)
+	case publication.CodeRenderValidation:
+		return genErr(CodeRenderValidationFailed, msg, err)
+	case idempotency.CodeLeaseLost, idempotency.CodeStaleAttempt:
+		return &Error{Code: CodeRequestInProgress, Message: msg, RetryAfter: 1, Err: err}
 	case publication.CodePathInvalid:
 		return genErr(CodePathInvalid, msg, err)
 	case publication.CodePathConflict:
@@ -395,13 +404,23 @@ func responseFromCache(op idempotency.Operation) (GenerateResponse, error) {
 	if p := str("publication_id"); p != "" {
 		pubID = &p
 	}
+	warnings := []templatecontract.FieldWarning{}
+	if raw, ok := m["warnings"]; ok {
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return GenerateResponse{}, err
+		}
+		if err = json.Unmarshal(b, &warnings); err != nil {
+			return GenerateResponse{}, err
+		}
+	}
 	return GenerateResponse{
 		ID: str("id"), Action: str("action"), Template: str("template"),
 		FullPath: str("full_path"), Mode: str("mode"),
 		Published: boolean("published"), RequiresPublish: boolean("requires_publish"),
 		PublicURL: pubURL, ContentVersion: num("content_version"),
 		TemplateVersion: num("template_version"), PublicationID: pubID,
-		Warnings: []templatecontract.FieldWarning{},
+		Warnings: warnings,
 	}, nil
 }
 

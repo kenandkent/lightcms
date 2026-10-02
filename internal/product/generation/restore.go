@@ -74,17 +74,14 @@ func (s *Service) RestoreAndPublish(ctx context.Context, actor Actor, contentID 
 	if err != nil {
 		return zero, genErr(CodeInternal, "read active publication", err)
 	}
-	if expectedActiveID != nil {
-		if active == nil || active.ID != *expectedActiveID {
-			return zero, genErr(CodePublicationConflict, "stale expected active publication", nil)
-		}
-	}
+	_ = active // Expected-active applies to new execution, not committed replay.
 	owner := ifem.Owner
 	if owner == "" {
 		owner = actor.Owner()
 	}
 	body, _ := json.Marshal(map[string]any{
 		"op": "restore_and_publish", "content_id": contentID.Hex(), "version": version,
+		"expected_active_id": expectedActiveID,
 	})
 	method := ifem.Method
 	if method == "" {
@@ -101,6 +98,15 @@ func (s *Service) RestoreAndPublish(ctx context.Context, actor Actor, contentID 
 	ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 	if op.Replay {
 		return restoreReplay(op)
+	}
+	if recovered, rerr := s.resumeHistory(ctx, op, contentID, "restore_and_publish"); rerr != nil {
+		return zero, rerr
+	} else if recovered != nil {
+		return restoreReplay(*recovered)
+	}
+	if expectedActiveID != nil && (active == nil || active.ID != *expectedActiveID) {
+		s.completePublishError(ctx, op, genErr(CodePublicationConflict, "stale expected active publication", nil))
+		return zero, genErr(CodePublicationConflict, "stale expected active publication", nil)
 	}
 	// New Main draft version from the historical snapshot + Bind, one txn.
 	next := live.CurrentVersion + 1
@@ -119,31 +125,38 @@ func (s *Service) RestoreAndPublish(ctx context.Context, actor Actor, contentID 
 	if canonical == "" {
 		canonical = live.FullPath
 	}
-	err = s.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
-		res, err := s.db.Collection("content").UpdateOne(sc,
-			bson.M{"_id": contentID, "current_version": live.CurrentVersion},
-			bson.M{"$set": bson.M{
-				"template_id": ver.TemplateID, "template_name": ver.TemplateName,
-				"title": ver.Title, "slug": ver.Slug, "folder_path": ver.FolderPath,
-				"data": ver.Data, "current_version": next, "updated_at": s.now().UTC(),
-			}})
+	if op.ContentID != nil && op.ContentVersion > 0 {
+		if *op.ContentID != contentID || live.CurrentVersion != op.ContentVersion {
+			return zero, genErr(CodeContentVersionConflict, "restored content changed concurrently", nil)
+		}
+		next = op.ContentVersion
+	} else {
+		err = s.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
+			res, err := s.db.Collection("content").UpdateOne(sc,
+				bson.M{"_id": contentID, "current_version": live.CurrentVersion},
+				bson.M{"$set": bson.M{
+					"template_id": ver.TemplateID, "template_name": ver.TemplateName,
+					"title": ver.Title, "slug": ver.Slug, "folder_path": ver.FolderPath,
+					"data": ver.Data, "current_version": next, "updated_at": s.now().UTC(),
+				}})
+			if err != nil {
+				return err
+			}
+			if res.MatchedCount == 0 {
+				return genErr(CodeContentVersionConflict, "content changed concurrently", nil)
+			}
+			if _, err := s.db.Collection("content_versions").InsertOne(sc, newVer); err != nil {
+				return mapDupKey(err, CodeContentVersionConflict, "content version conflict")
+			}
+			if berr := s.idem.BindContentAndVersion(ctx, sc, op.ID, contentID, next, canonical); berr != nil {
+				return rwIdemErr(berr)
+			}
+			return nil
+		})
 		if err != nil {
-			return err
+			s.completePublishError(ctx, op, err)
+			return zero, err
 		}
-		if res.MatchedCount == 0 {
-			return genErr(CodeContentVersionConflict, "content changed concurrently", nil)
-		}
-		if _, err := s.db.Collection("content_versions").InsertOne(sc, newVer); err != nil {
-			return mapDupKey(err, CodeContentVersionConflict, "content version conflict")
-		}
-		if berr := s.idem.BindContentAndVersion(ctx, sc, op.ID, contentID, next, canonical); berr != nil {
-			return rwIdemErr(berr)
-		}
-		return nil
-	})
-	if err != nil {
-		s.completePublishError(ctx, op, err)
-		return zero, err
 	}
 	// Publish the restored draft. Template version: the live row's template
 	// current version is resolved by the saga when TemplateVersionID is zero.
@@ -212,6 +225,7 @@ func (s *Service) RevertLive(ctx context.Context, actor Actor, contentID, source
 	body, _ := json.Marshal(map[string]any{
 		"op": "revert_live", "content_id": contentID.Hex(),
 		"source_publication_id": sourcePublicationID.Hex(),
+		"expected_active_id":    expectedActiveID,
 	})
 	method := ifem.Method
 	if method == "" {
@@ -228,6 +242,11 @@ func (s *Service) RevertLive(ctx context.Context, actor Actor, contentID, source
 	ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 	if op.Replay {
 		return revertReplay(op)
+	}
+	if recovered, rerr := s.resumeHistory(ctx, op, contentID, "revert_live"); rerr != nil {
+		return zero, rerr
+	} else if recovered != nil {
+		return revertReplay(*recovered)
 	}
 	res, err := s.pubs.Rollback(ctx, publication.RollbackRequest{
 		ContentID: contentID, SourcePublicationID: sourcePublicationID,
@@ -255,6 +274,35 @@ func (s *Service) RevertLive(ctx context.Context, actor Actor, contentID, source
 		"publication_id": out.PublicationID,
 	})
 	return out, nil
+}
+
+// A committed Publication is execution evidence even after later supersession
+// or unpublish. Recover the original response, never apply the live command again.
+func (s *Service) resumeHistory(ctx context.Context, op idempotency.Operation, contentID primitive.ObjectID, mode string) (*idempotency.Operation, error) {
+	if op.PublicationID == nil {
+		return nil, nil
+	}
+	pub, err := s.pubRepo.GetByID(ctx, *op.PublicationID)
+	if publication.CodeOf(err) == publication.CodeNotFound || err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if pub.ActivatedAt == nil {
+		return nil, nil
+	}
+	if pub.ContentID != contentID {
+		return nil, genErr(CodePublicationConflict, "operation publication belongs to different content", nil)
+	}
+	cache := map[string]any{"content_id": pub.ContentID.Hex(), "content_version": float64(pub.ContentVersion), "publication_id": pub.ID.Hex(), "full_path": pub.FullPath, "public_url": pub.PublicURL, "mode": mode}
+	_, err = s.idem.Complete(ctx, op.ID, op.Attempt, 200, cache, false)
+	if err != nil {
+		return nil, mapIdemBeginErr(err)
+	}
+	op.Response = cache
+	op.Replay = true
+	return &op, nil
 }
 
 func restoreReplay(op idempotency.Operation) (RestoreAndPublishResult, error) {

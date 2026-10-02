@@ -128,12 +128,24 @@ func HasPermission(role, perm string) bool {
 
 // SessionUser represents the authenticated user extracted from a session or API context
 type SessionUser struct {
-	ID          string   `json:"id"`
-	Email       string   `json:"email"`
-	Role        string   `json:"role"`
-	ViaAPIKey   bool     `json:"via_api_key,omitempty"`  // true when authenticated via API key (not session)
-	Scopes      []string `json:"scopes,omitempty"`       // API-key permission allowlist; empty = full role permissions
-	SandboxOnly bool     `json:"sandbox_only,omitempty"` // API key restricted to fork-sandboxed content writes
+	ID              string   `json:"id"`
+	CredentialOwner string   `json:"-"`
+	Email           string   `json:"email"`
+	Role            string   `json:"role"`
+	ViaAPIKey       bool     `json:"via_api_key,omitempty"`  // true when authenticated via API key (not session)
+	Scopes          []string `json:"scopes,omitempty"`       // API-key permission allowlist; empty = full role permissions
+	SandboxOnly     bool     `json:"sandbox_only,omitempty"` // API key restricted to fork-sandboxed content writes
+}
+
+// OperationOwner preserves credential identity independently of user/sandbox identity.
+func (u *SessionUser) OperationOwner() string {
+	if u.CredentialOwner != "" {
+		return u.CredentialOwner
+	}
+	if u.ID != "" {
+		return u.ID
+	}
+	return u.Email
 }
 
 // sandboxAllowedPerms is the permission set available to sandbox-only API

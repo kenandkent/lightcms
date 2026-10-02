@@ -141,6 +141,7 @@ type Operation struct {
 	Path             string              `bson:"path" json:"path"`
 	Key              string              `bson:"key" json:"key"`
 	RequestHash      string              `bson:"request_hash" json:"request_hash"`
+	CommandKind      string              `bson:"command_kind,omitempty" json:"command_kind,omitempty"`
 	State            State               `bson:"state" json:"state"`
 	Attempt          int64               `bson:"attempt" json:"attempt"`
 	AttemptState     AttemptState        `bson:"attempt_state" json:"attempt_state"`
@@ -152,6 +153,8 @@ type Operation struct {
 	PublicationID    *primitive.ObjectID `bson:"publication_id,omitempty" json:"publication_id,omitempty"`
 	LogicalAt        *time.Time          `bson:"logical_published_at,omitempty" json:"logical_published_at,omitempty"`
 	TemplateVersion  *primitive.ObjectID `bson:"template_version_id,omitempty" json:"template_version_id,omitempty"`
+	RenderSnapshot   []byte              `bson:"render_snapshot,omitempty" json:"-"`
+	ResponseMetadata map[string]any      `bson:"response_metadata,omitempty" json:"-"`
 	StatusCode       int                 `bson:"status_code,omitempty" json:"status_code,omitempty"`
 	Response         map[string]any      `bson:"response,omitempty" json:"response,omitempty"`
 	ValidationReplay bool                `bson:"validation_replay,omitempty" json:"validation_replay,omitempty"`

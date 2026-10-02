@@ -23,9 +23,20 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+// Legacy single/batch endpoints share the same crash-takeover protocol as
+// generation. Always carry the returned generation into the saga and completion.
+func (a *APIHandler) beginLegacyPublication(ctx context.Context, owner, method, path, key string) (idempotency.Operation, error) {
+	op, err := a.idempotencyService.Begin(ctx, owner, method, path, key, nil)
+	if idempotency.CodeOf(err) == idempotency.CodeLeaseExpired {
+		return a.idempotencyService.TakeOverByKey(ctx, owner, method, path, key)
+	}
+	return op, err
+}
 
 // API Content endpoints
 
@@ -699,12 +710,9 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 		if a.idempotencyService != nil {
 			owner := ""
 			if u := a.getAPIUser(r); u != nil {
-				owner = u.ID
-				if owner == "" {
-					owner = u.Email
-				}
+				owner = u.OperationOwner()
 			}
-			op, berr := a.idempotencyService.Begin(r.Context(), owner, r.Method, r.URL.Path, key, nil)
+			op, berr := a.beginLegacyPublication(r.Context(), owner, r.Method, r.URL.Path, key)
 			if berr != nil {
 				f := a.publicationReqFields(r, "publish", t0)
 				f.ContentID = id.Hex()
@@ -726,6 +734,7 @@ func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 			}
 			opID = &op.ID
 			opAttempt = op.Attempt
+			r = r.WithContext(idempotency.WithLeaseGeneration(r.Context(), op.LeaseGeneration))
 		}
 		pubActor, pubVia, pubSession := publishAttribution(r)
 		pubAdmin := false
@@ -1509,13 +1518,10 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 			if a.idempotencyService != nil {
 				owner := ""
 				if u := a.getAPIUser(r); u != nil {
-					owner = u.ID
-					if owner == "" {
-						owner = u.Email
-					}
+					owner = u.OperationOwner()
 				}
 				itemPath := strings.TrimSuffix(strings.TrimSpace(r.URL.Path), "/") + "/items/" + id.Hex()
-				op, berr := a.idempotencyService.Begin(r.Context(), owner, r.Method, itemPath, key, nil)
+				op, berr := a.beginLegacyPublication(r.Context(), owner, r.Method, itemPath, key)
 				if berr != nil {
 					failed = append(failed, withBulkFailCode(map[string]string{"id": id.Hex(), "error": sanitizeAPIError(berr)}, publication.CodeOf(berr)))
 					continue
@@ -1531,6 +1537,7 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 				}
 				opID = &op.ID
 				opAttempt = op.Attempt
+				r = r.WithContext(idempotency.WithLeaseGeneration(r.Context(), op.LeaseGeneration))
 			}
 			pubActor, pubVia, pubSession := publishAttribution(r)
 			pubAdmin := false
@@ -2020,7 +2027,7 @@ func publicationHTTPStatus(err error) int {
 	switch code {
 	case publication.CodeNotFound, "CONTENT_NOT_FOUND":
 		return http.StatusNotFound
-	case "FIELD_VALIDATION_FAILED", "PATH_INVALID", "CONTENT_PUBLISH_FAILED":
+	case "FIELD_VALIDATION_FAILED", "PATH_INVALID", "CONTENT_PUBLISH_FAILED", publication.CodeRenderValidation:
 		return 422
 	case "TEMPLATE_NOT_ACTIVE", "TEMPLATE_VERSION_CHANGED", "PATH_CONFLICT",
 		"PUBLICATION_CONFLICT", "PAGE_PUBLISH_IN_PROGRESS", "CONTENT_VERSION_CONFLICT":

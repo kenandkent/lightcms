@@ -112,10 +112,11 @@ func (s *Service) PreviewUpgrade(ctx context.Context, actor Actor, slug string) 
 	if err != nil {
 		return zero, genErr(CodeTemplateVersionNotFound, "current template version not found", err)
 	}
-	// Pages referencing this template (live scope only, limit 500 for MVP).
+	// Every live page participates. A silent cap would make a completed job
+	// falsely certify a partial upgrade.
 	cur2, err := s.db.Collection("content").Find(ctx,
 		bson.M{"template_id": tpl.ID, "path_scope": "live", "path_active": true},
-		options.Find().SetLimit(500).SetProjection(bson.M{"_id": 1, "full_path": 1, "current_version": 1, "data": 1}))
+		options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetProjection(bson.M{"_id": 1, "full_path": 1, "current_version": 1, "data": 1}))
 	if err != nil {
 		return zero, genErr(CodeInternal, "list template pages", err)
 	}
@@ -378,7 +379,9 @@ func (s *Service) publishUpgradeItem(ctx context.Context, actor Actor, job Upgra
 		if code == "" {
 			code = string(publication.CodeActivateFailed)
 		}
-		_, _ = s.idem.MarkTerminal(ctx, op.ID, op.Attempt, code)
+		// Only the saga knows whether activation is provably absent.
+		// Releasing a retryable lease must not terminalize an unknown commit.
+		_, _ = s.idem.Complete(ctx, op.ID, op.Attempt, 503, map[string]any{"error_code": code}, false)
 		return publication.PublicationResult{}, mapSagaErr(perr)
 	}
 	_, _ = s.idem.Complete(ctx, op.ID, op.Attempt, 200,

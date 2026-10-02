@@ -2,6 +2,7 @@ package generation
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
@@ -103,13 +104,22 @@ func (s *Service) RollbackPublication(ctx context.Context, actor Actor, contentI
 	}
 	body := ifem.Body
 	if len(body) == 0 {
-		body = []byte(`{"source":"` + sourceID.Hex() + `"}`)
+		body, _ = json.Marshal(map[string]any{"source": sourceID.Hex(), "expected_active_id": expectedActiveID})
 	}
 	op, err := s.beginOrResume(ctx, owner, method, path, ifem.Key, body)
 	if err != nil {
 		return zero, mapIdemBeginErr(err)
 	}
 	ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
+	if !op.Replay {
+		recovered, rerr := s.resumeHistory(ctx, op, contentID, "rollback")
+		if rerr != nil {
+			return zero, rerr
+		}
+		if recovered != nil {
+			op = *recovered
+		}
+	}
 	if op.Replay {
 		m := op.Response
 		str := func(k string) string {

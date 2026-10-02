@@ -275,7 +275,7 @@ func TestE2E_MigrateSlug(t *testing.T) {
 		t.Fatalf("active changed by slug migration: %s", active.ID.Hex())
 	}
 	code, schema := e.getJSON("/api/v1/templates/financial-news-v2/schema", nil)
-	if code != 200 || intOf(schema, "template_version") != 1 {
+	if code != 200 || intOf(schema, "template_version") != 2 || strOf(schema, "template") != "financial-news-v2" {
 		t.Fatalf("schema at new slug = %d (%v)", code, schema)
 	}
 	code, _ = e.getJSON("/api/v1/templates/financial-news/schema", nil)

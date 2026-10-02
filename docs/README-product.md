@@ -63,7 +63,7 @@ PUBLICATION_SCAN_INTERVAL_MINUTES=10 / PUBLICATION_STAGE_TIMEOUT_MINUTES=15
 
 1. 选模板建草稿：`POST /api/v1/page-generation`（`mode=draft`，模板 schema 见 `GET /api/v1/templates/{slug}/schema`，`ETag: "template-version-3"`）。
 2. 预览：`mode=preview`（不落发布记录）。
-3. 发布：`mode=publish`，**必须带 `expected_template_version` + `Idempotency-Key`**；模板版本漂移返回 `409 TEMPLATE_VERSION_CHANGED` 且零副作用（换新版本号重试，不要换 key）。
+3. 发布：`mode=publish`，**必须带 `expected_template_version` + `Idempotency-Key`**；模板版本漂移返回 `409 TEMPLATE_VERSION_CHANGED`。更新版本号或修改请求数据属于新命令，必须使用新 key；网络故障或响应丢失时使用原 key 和完全相同的请求恢复。
 4. 查发布：`GET /api/v1/content/{id}/publications`；回滚：`POST .../publications/{publication_id}/rollback`（新 Publication，不改旧记录）。
 5. 可执行示例（含 201/200/409/422/428）见 [API.md](API.md)；模板字段写法见 [TEMPLATE-GUIDE.md](TEMPLATE-GUIDE.md)；Agent（sandbox key、MCP、outbox 去重）见 [AGENT-INTEGRATION.md](AGENT-INTEGRATION.md)。
 

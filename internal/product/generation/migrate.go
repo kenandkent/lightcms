@@ -10,7 +10,6 @@ package generation
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 
@@ -60,18 +59,15 @@ func (s *Service) MigrateSlug(ctx context.Context, actor Actor, templateID primi
 	} else if templatecontract.CodeOf(err) != templatecontract.CodeNotFound {
 		return zero, genErr(CodeInternal, "check slug uniqueness", err)
 	}
-	now := s.now()
-	if now.IsZero() {
-		now = time.Now()
-	}
-	res, err := s.db.Collection("templates").UpdateOne(ctx,
-		bson.M{"_id": templateID, "slug": tpl.Slug},
-		bson.M{"$set": bson.M{"slug": newSlug, "updated_at": now}})
+	_, err = s.templates.MigrateSlug(ctx, templateID, tpl.CurrentVersion, newSlug)
 	if err != nil {
+		if templatecontract.CodeOf(err) == templatecontract.CodeSlugConflict {
+			return zero, genErr(CodePathConflict, "template slug already exists", err)
+		}
+		if templatecontract.CodeOf(err) == templatecontract.CodeVersionConflict {
+			return zero, genErr(CodeTemplateVersionConflict, "template changed concurrently; reload and retry", err)
+		}
 		return zero, mapDupKey(err, CodePathConflict, fmt.Sprintf("template slug %q already exists", newSlug))
-	}
-	if res.MatchedCount == 0 {
-		return zero, genErr(CodeTemplateVersionConflict, "template changed concurrently; reload and retry", nil)
 	}
 	// Affected pages: live content rows pointing at this template (guidance
 	// only — their bytes, paths and Publications are untouched).

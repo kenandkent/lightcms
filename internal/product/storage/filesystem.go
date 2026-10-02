@@ -134,6 +134,26 @@ func checkCtx(ctx context.Context) error {
 	return ctx.Err()
 }
 
+type writeGuardKey struct{}
+
+// WithWriteGuard checks executor ownership at the final filesystem write
+// boundary, after potentially slow copies/fsyncs and immediately before rename.
+func WithWriteGuard(ctx context.Context, guard func() error) context.Context {
+	return context.WithValue(ctx, writeGuardKey{}, guard)
+}
+func checkWriteGuard(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
+	if guard, ok := ctx.Value(writeGuardKey{}).(func() error); ok {
+		return guard()
+	}
+	return nil
+}
+
 func shaHex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
@@ -264,6 +284,9 @@ func (s *FilesystemStore) Stage(ctx context.Context, req StageRequest) (StagedOb
 		_ = os.Remove(tmp)
 		return StagedObject{}, storeErr(CodeHashMismatch, "staged bytes failed size/hash verification; nothing staged", tmp, nil)
 	}
+	if err := checkWriteGuard(ctx); err != nil {
+		return StagedObject{}, err
+	}
 	if err := os.Rename(tmp, immutable); err != nil {
 		_ = os.Remove(tmp)
 		return StagedObject{}, storeErr(CodeIO, "rename staged file to immutable object", immutable, err)
@@ -310,7 +333,7 @@ func previousPath(canonical string, oldPublicationID primitive.ObjectID) string 
 // canonical, unlike the previous move-first sequence. Any failure before
 // the final rename leaves the canonical untouched (only .next/previous
 // leftovers, both scanner-convergent).
-func (s *FilesystemStore) cutover(obj StagedObject, canonical string, oldID *primitive.ObjectID) error {
+func (s *FilesystemStore) cutover(ctx context.Context, obj StagedObject, canonical string, oldID *primitive.ObjectID) error {
 	canonExisted := true
 	if _, err := os.Stat(canonical); err != nil {
 		if !isNotExist(err) {
@@ -352,10 +375,18 @@ func (s *FilesystemStore) cutover(obj StagedObject, canonical string, oldID *pri
 		// POSIX rename(2) replacement is atomic; Windows deployments are
 		// unsupported (MapView/ReplaceFile would be needed there).
 		prev := previousPath(canonical, *oldID)
-		if err := copyFile(prev, canonical); err != nil {
-			_ = os.Remove(next)
-			_ = os.Remove(prev) // drop the partial backup; scanner never sees it
-			return storeErr(CodeIO, "back up canonical to previous", prev, err)
+		_, statErr := os.Stat(prev)
+		if statErr != nil && !isNotExist(statErr) {
+			return storeErr(CodeIO, "stat previous backup", prev, statErr)
+		}
+		// A crash retry can already be serving obj while Mongo still points
+		// to oldID. Never overwrite oldID's retained compensation bytes with obj.
+		if isNotExist(statErr) {
+			if err := copyFile(prev, canonical); err != nil {
+				_ = os.Remove(next)
+				_ = os.Remove(prev) // drop the partial backup; scanner never sees it
+				return storeErr(CodeIO, "back up canonical to previous", prev, err)
+			}
 		}
 		if err := syncDir(filepath.Dir(canonical)); err != nil {
 			_ = os.Remove(next)
@@ -364,6 +395,9 @@ func (s *FilesystemStore) cutover(obj StagedObject, canonical string, oldID *pri
 		}
 	}
 
+	if err := checkWriteGuard(ctx); err != nil {
+		return err
+	}
 	if err := os.Rename(next, canonical); err != nil {
 		_ = os.Remove(next)
 		return storeErr(CodeIO, "rename next file to canonical", canonical, err)
@@ -415,7 +449,7 @@ func (s *FilesystemStore) Activate(ctx context.Context, obj StagedObject, public
 	if err := os.MkdirAll(filepath.Dir(canonical), 0o755); err != nil {
 		return storeErr(CodeIO, "create canonical directory", canonical, err)
 	}
-	return s.cutover(obj, canonical, nil)
+	return s.cutover(ctx, obj, canonical, nil)
 }
 
 // ActivateWithPrevious cuts over obj while preserving the existing canonical
@@ -435,7 +469,7 @@ func (s *FilesystemStore) ActivateWithPrevious(ctx context.Context, obj StagedOb
 	if err := os.MkdirAll(filepath.Dir(canonical), 0o755); err != nil {
 		return storeErr(CodeIO, "create canonical directory", canonical, err)
 	}
-	return s.cutover(obj, canonical, oldPublicationID)
+	return s.cutover(ctx, obj, canonical, oldPublicationID)
 }
 
 // CompensateActivate undoes a cutover after the Mongo activation transaction

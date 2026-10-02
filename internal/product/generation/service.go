@@ -128,6 +128,66 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 	if !actor.Authenticated {
 		return zero, genErr(CodeUnauthenticated, "authentication is required", nil)
 	}
+	var prior *idempotency.Operation
+	if mode == ModePublish {
+		if req.ExpectedTemplateVersion == nil {
+			return zero, genErr(CodeTemplatePreconditionRequired, "mode=publish requires expected_template_version", nil)
+		}
+		p, ok := IdempotencyFrom(ctx)
+		if !ok {
+			return zero, genErr(CodeIdempotencyKeyRequired, "mode=publish requires Idempotency-Key", nil)
+		}
+		if s.idem == nil {
+			return zero, genErr(CodeInternal, "idempotency service is not wired", nil)
+		}
+		owner, method, path, key := publishIdemIdentity(actor, p)
+		body := p.Body
+		if len(body) == 0 {
+			body, _ = json.Marshal(canonicalGenerateBody(req, templatecontract.TemplateVersion{}))
+		}
+		var err error
+		prior, err = s.idem.Lookup(ctx, owner, method, path, key, body)
+		if err != nil {
+			return zero, mapIdemBeginErr(err)
+		}
+		if prior != nil {
+			kind := prior.CommandKind
+			if kind == "" {
+				kind, _ = prior.Response["action"].(string)
+				if kind == "" && prior.ContentID != nil && prior.ContentVersion == 1 {
+					kind = "created"
+				}
+			}
+			if kind != "" {
+				if err := checkScopes(actor, mode, kind != "created"); err != nil {
+					return zero, err
+				}
+				if prior.Replay {
+					_, resp, err := s.replayOpResponse(*prior)
+					if err != nil {
+						return zero, err
+					}
+					return *resp, nil
+				}
+				if prior.PublicationID != nil && s.pubRepo != nil {
+					pub, perr := s.pubRepo.GetByID(ctx, *prior.PublicationID)
+					if perr == nil && pub.ActivatedAt != nil {
+						tv, terr := s.templates.GetVersion(ctx, pub.TemplateVersionID)
+						if terr != nil {
+							return zero, terr
+						}
+						_, resp, rerr := s.beginOrResumePublish(ctx, actor, req, tv, p)
+						if rerr != nil {
+							return zero, rerr
+						}
+						if resp != nil {
+							return *resp, nil
+						}
+					}
+				}
+			}
+		}
+	}
 	if s.limiter != nil {
 		if ok, after := s.limiter.Allow(ctx, actor); !ok {
 			return zero, &Error{Code: CodeRateLimited, Message: "rate limit exceeded", RetryAfter: after}
@@ -144,7 +204,13 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 	if tplSlug == "" {
 		return zero, genErr(CodeFieldValidationFailed, "template is required", nil)
 	}
-	tv, err := s.templates.GetCurrent(ctx, tplSlug)
+	var tv templatecontract.TemplateVersion
+	var err error
+	if prior != nil && prior.AttemptState == idempotency.AttemptProcessing && prior.TemplateVersion != nil {
+		tv, err = s.templates.GetVersion(ctx, *prior.TemplateVersion)
+	} else {
+		tv, err = s.templates.GetCurrent(ctx, tplSlug)
+	}
 	if err != nil {
 		if templatecontract.CodeOf(err) == templatecontract.CodeNotFound {
 			return zero, genErr(CodeTemplateNotFound, fmt.Sprintf("template %q not found", tplSlug), err)
@@ -213,7 +279,11 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 	// sandbox_only, sandbox fork. A 403 here creates no lease, so an
 	// authorized retry of the same key proceeds immediately instead of
 	// wedging on REQUEST_IN_PROGRESS. (Scope matrix §22.2.)
-	if err := checkScopes(actor, mode, targetExists); err != nil {
+	authTargetExists := targetExists
+	if prior != nil && (prior.CommandKind == "created" || (prior.CommandKind == "" && prior.ContentID != nil && prior.ContentVersion == 1)) {
+		authTargetExists = false
+	}
+	if err := checkScopes(actor, mode, authTargetExists); err != nil {
 		return zero, err
 	}
 	if actor.SandboxOnly && mode != ModeSandbox {
@@ -267,6 +337,24 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 		}
 		earlyOp = &op
 		ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
+		if op.CommandKind == "" {
+			kind := "updated"
+			if !authTargetExists {
+				kind = "created"
+			}
+			if err := s.idem.SetCommandKind(ctx, op, kind); err != nil {
+				return zero, mapIdemBeginErr(err)
+			}
+			earlyOp.CommandKind = kind
+		}
+		if op.TemplateVersion != nil {
+			frozen, ferr := s.templates.GetVersion(ctx, *op.TemplateVersion)
+			if ferr != nil {
+				releaseOp(ferr)
+				return zero, ferr
+			}
+			tv = frozen
+		}
 		if *req.ExpectedTemplateVersion != tv.Version {
 			verr := genErr(CodeTemplateVersionChanged,
 				fmt.Sprintf("template %s is at version %d, expected %d", tv.Slug, tv.Version, *req.ExpectedTemplateVersion), nil)
@@ -308,7 +396,7 @@ func (s *Service) Generate(ctx context.Context, actor Actor, req GenerateRequest
 	// precedence as before): a replay never trips on the page its first
 	// attempt created, and a fresh conflict releases the lease (R05) so the
 	// same key retries cleanly once the caller fixes upsert/body.
-	if mode == ModePublish && targetExists && !req.Upsert {
+	if mode == ModePublish && targetExists && !req.Upsert && (earlyOp == nil || earlyOp.ContentID == nil || *earlyOp.ContentID != live.ID) {
 		uerr := genErr(CodePathConflict, fmt.Sprintf("page %s already exists (upsert=false)", fullPath), nil)
 		releaseOp(uerr)
 		return zero, uerr
@@ -636,7 +724,7 @@ func (s *Service) beginOrResumePublish(ctx context.Context, actor Actor, req Gen
 		// If that publication already went active, cache the response and
 		// return it — never mint a second Publication for one operation.
 		if pub, gerr := s.pubRepo.GetByID(ctx, *op.PublicationID); gerr == nil && pub != nil &&
-			pub.Status == publication.StatusActive {
+			pub.ActivatedAt != nil {
 			if resp, rerr := s.completeResumedActive(ctx, op, *pub, tv); rerr == nil {
 				return op, resp, nil
 			}
@@ -689,7 +777,7 @@ func (s *Service) replayOpResponse(op idempotency.Operation) (idempotency.Operat
 			}
 		}
 		return idempotency.Operation{}, nil, &Error{
-			Code: CodeFieldValidationFailed,
+			Code:    CodeFieldValidationFailed,
 			Message: "content data does not match the template",
 			Details: details,
 		}
@@ -708,6 +796,7 @@ func (s *Service) replayOpResponse(op idempotency.Operation) (idempotency.Operat
 // binding it must agree with the record, otherwise the snapshot belongs to
 // a different execution and resuming would certify the wrong bytes.
 func (s *Service) completeResumedActive(ctx context.Context, op idempotency.Operation, pub publication.Publication, tv templatecontract.TemplateVersion) (*GenerateResponse, error) {
+	ctx = idempotency.WithLeaseGeneration(ctx, op.LeaseGeneration)
 	action, status := "updated", 200
 	if pub.ContentVersion <= 1 {
 		action, status = "created", 201
@@ -720,9 +809,12 @@ func (s *Service) completeResumedActive(ctx context.Context, op idempotency.Oper
 		"id": pub.ContentID.Hex(), "action": action, "template": tv.Slug,
 		"full_path": pub.FullPath, "mode": ModePublish, "published": true,
 		"requires_publish": false, "public_url": pub.PublicURL,
-		"content_version": float64(pub.ContentVersion),
+		"content_version":  float64(pub.ContentVersion),
 		"template_version": float64(pub.TemplateVersion),
-		"publication_id": pub.ID.Hex(),
+		"publication_id":   pub.ID.Hex(),
+	}
+	if warnings, ok := op.ResponseMetadata["warnings"]; ok {
+		cache["warnings"] = warnings
 	}
 	if _, cerr := s.idem.Complete(ctx, op.ID, op.Attempt, status, cache, false); cerr != nil {
 		return nil, cerr

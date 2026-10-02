@@ -1230,15 +1230,8 @@ func TestE2E_IdempotencyTerminalRetry(t *testing.T) {
 	}
 }
 
-// TestE2E_IdempotencyCreateTerminalGap pins a protocol gap: a terminal
-// pre-activation failure on a CREATE deadlocks same-key retry — the
-// byte-identical retry hits 409 PATH_CONFLICT at the upsert gate (the page
-// was created by attempt 1), while an upsert=true retry hits 409
-// IDEMPOTENCY_CONFLICT at Begin (body changed). The only escape is a NEW
-// key + upsert, which breaks idempotent linkage. Specified fix (not
-// implemented here): exempt same-operation retries from the upsert gate
-// (the op metadata proves the target is the prior attempt's artifact) or
-// document the new-key escape. Table row: FAIL.
+// A terminal CREATE failure retains its Content binding. Retrying the
+// original key must publish it, without an upsert escape or duplicate version.
 func TestE2E_IdempotencyCreateTerminalGap(t *testing.T) {
 	e := newEnv(t, envOpts{maxWriteBytes: 1})
 	e.seedTemplate(t, "financial-news")
@@ -1250,22 +1243,24 @@ func TestE2E_IdempotencyCreateTerminalGap(t *testing.T) {
 	}
 	e.refault(envOpts{})
 	c2, r2 := e.postRaw("/api/v1/page-generation", raw, hdr)
-	if c2 != 409 || errorCodeOf(r2) != "PATH_CONFLICT" {
-		t.Fatalf("identical retry = %d (%v), want 409 PATH_CONFLICT", c2, r2)
+	if c2 != 201 {
+		t.Fatalf("identical retry = %d (%v), want 201 recovered create", c2, r2)
+	}
+	if n := e.count("content_versions", bson.M{}); n != 1 {
+		t.Fatalf("retry wrote %d content versions", n)
 	}
 	rawU, _ := jsonMarshal(idemBody("term-create", "h1", true))
 	c3, r3 := e.postRaw("/api/v1/page-generation", rawU, hdr)
 	if c3 != 409 || errorCodeOf(r3) != "IDEMPOTENCY_CONFLICT" {
 		t.Fatalf("upsert retry = %d (%v), want 409 IDEMPOTENCY_CONFLICT", c3, r3)
 	}
-	c4, r4 := e.postRaw("/api/v1/page-generation", rawU, map[string]string{"Idempotency-Key": "term-create-2"})
-	if c4 != 200 {
-		t.Fatalf("new-key escape = %d (%v), want 200", c4, r4)
+	c4, r4 := e.postRaw("/api/v1/page-generation", raw, hdr)
+	if c4 != 201 || strOf(r4, "publication_id") != strOf(r2, "publication_id") {
+		t.Fatalf("replay = %d (%v), want identical recovered Publication", c4, r4)
 	}
 	if n := e.count(publication.CollectionOutbox, bson.M{"event_type": publication.EventPublished}); n != 1 {
 		t.Fatalf("publish outbox rows = %d, want 1", n)
 	}
-	t.Logf("GAP PINNED: same-key retry after terminal CREATE failure is unreachable (PATH_CONFLICT vs IDEMPOTENCY_CONFLICT); escape needs a new key")
 }
 
 // TestE2E_IdempotencyLeaseMatrix pins the crash-lease contract at the

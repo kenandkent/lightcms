@@ -516,12 +516,13 @@ func main() {
 			if err == nil && user != nil {
 				go analyticsService.RecordActivity(context.Background(), user.ID.Hex())
 				return &auth.SessionUser{
-					ID:          user.ID.Hex(),
-					Email:       user.Email,
-					Role:        user.Role,
-					ViaAPIKey:   true,
-					Scopes:      apiKey.Scopes,
-					SandboxOnly: apiKey.SandboxOnly,
+					ID:              user.ID.Hex(),
+					CredentialOwner: "apikey:" + apiKey.ID.Hex(),
+					Email:           user.Email,
+					Role:            user.Role,
+					ViaAPIKey:       true,
+					Scopes:          apiKey.Scopes,
+					SandboxOnly:     apiKey.SandboxOnly,
 				}, nil
 			}
 		}
@@ -535,10 +536,11 @@ func main() {
 					log.Printf("[security] Auto-migrated legacy API key to admin user %s", u.Email)
 					go analyticsService.RecordActivity(context.Background(), u.ID.Hex())
 					return &auth.SessionUser{
-						ID:        u.ID.Hex(),
-						Email:     u.Email,
-						Role:      u.Role,
-						ViaAPIKey: true,
+						ID:              u.ID.Hex(),
+						CredentialOwner: "apikey:" + apiKey.ID.Hex(),
+						Email:           u.Email,
+						Role:            u.Role,
+						ViaAPIKey:       true,
 					}, nil
 				}
 			}
@@ -568,13 +570,21 @@ func main() {
 	resourceMetadataURL := cfg.BaseURL + "/.well-known/oauth-protected-resource"
 	apiAuthMiddleware.SetOAuth(
 		func(ctx context.Context, rawToken string) (interface{}, error) {
-			_, err := oauthService.ValidateAccessToken(ctx, rawToken)
+			token, err := oauthService.ValidateAccessToken(ctx, rawToken)
 			if err != nil {
 				return nil, err
 			}
-			// OAuth tokens go through the system API key path — no specific user context
-			// (the system key will be resolved on the subsequent internal request)
-			return nil, nil
+			// Legacy OAuth tokens have no stored subject; their resolved subject
+			// is the configured system user. Client identity must still survive
+			// REST and MCP calls rather than collapsing into the shared system key.
+			if systemKeyAdminID == nil {
+				return nil, fmt.Errorf("OAuth system user is unavailable")
+			}
+			user, err := userService.GetByID(ctx, *systemKeyAdminID)
+			if err != nil || user == nil {
+				return nil, fmt.Errorf("OAuth system user is unavailable")
+			}
+			return &auth.SessionUser{ID: user.ID.Hex(), Email: user.Email, Role: user.Role, ViaAPIKey: true, CredentialOwner: "oauth:" + token.ClientID + ":" + user.ID.Hex()}, nil
 		},
 		systemAPIKey,
 		resourceMetadataURL,

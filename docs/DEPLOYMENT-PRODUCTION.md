@@ -45,6 +45,10 @@
 
 两个后台 worker 与主服务**同进程**运行，随 server context 取消而停止（`cmd/server/main.go:469-470`：`go rt.Outbox.Run(bgCtx)` / `go rt.Scanner.Run(bgCtx)`）。没有独立的 worker 进程、队列服务或 cron 容器。
 
+同一站点数据库当前只允许运行一个应用进程。Mongo 唯一 writer lease slot 在启动时原子认领；心跳失效、owner/incarnation 不匹配或独立 watchdog 到期，应用直接停止。部署更新必须先停旧进程再启新进程，不要开启两个副本的重叠滚动更新。该限制不是多实例分布式锁的替代实现，Scale-out 仍是后续工作。
+
+发布时完整渲染输入快照（含 Snippet/Wikilink/query 依赖）限制为 JSON 编码后 8 MiB。超过限制的请求在文件发布前失败；管理员需缩小输入/依赖范围，不能靠重试绕过。同一幂等 attempt 的恢复使用原快照，不受依赖后续修改影响。
+
 当前 Fly.io 现状（按仓库现状如实记录，见 `CLAUDE.md` Deploy 章节、`fly.toml`、`Dockerfile`、`start.sh`）：
 
 - 应用名 `metavert-cms`，实际运行的是一台 legacy 非 Launch machine（`d890122a371528`）。`fly deploy` 看不到它，会另建 stuck orphan machine，因此**部署必须使用 `./deploy.sh`**（构建镜像 → 提取 image ref → 删除 stuck 新机 → `fly machines update` 直接更新运行机）。machine ID 硬编码在 `deploy.sh` 中。

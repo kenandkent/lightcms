@@ -17,22 +17,17 @@ package services
 // time and frozen into the snapshot — exactly what makes them deterministic
 // for retries.
 //
-// Takeover drift note: a resumed attempt re-runs this adapter, re-reading
-// snippets, the wikilink index, and lc:query results live. If site
-// dependencies changed between the crashed attempt and the resume, the
-// retried bytes may differ from the first attempt's (the frozen publication
-// ID, logical time, and template pin stay stable, so convergence —
-// exactly one active publication per operation — is unaffected). Byte
-// identity across takeovers holds whenever site dependencies are stable,
-// which is the common case; freezing the full dependency closure into the
-// idempotency record was rejected as disproportionate (unbounded snapshot
-// growth for index-heavy sites).
+// The complete snapshot is durably frozen before rendering for keyed
+// attempts. Takeover reads it without querying live dependencies. The JSON
+// snapshot is limited to 8 MiB; oversize planning fails before file activation.
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"strings"
 
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -59,6 +54,17 @@ func rankScriptPolicy(p string) int {
 // SagaSnapshotRender implements publication.SnapshotRenderFunc.
 func (s *ContentService) SagaSnapshotRender(ctx context.Context, in publication.RenderInput) (publication.RenderResult, error) {
 	var zero publication.RenderResult
+	op, err := idempotency.RenderSnapshotForPublication(ctx, s.db, in.PublicationID)
+	if err != nil {
+		return zero, err
+	}
+	if op != nil && len(op.RenderSnapshot) > 0 {
+		var snap publication.RenderSnapshot
+		if err = json.Unmarshal(op.RenderSnapshot, &snap); err != nil {
+			return zero, err
+		}
+		return publication.RenderDetailed(ctx, snap)
+	}
 
 	// 1. Script policy — site config first (same source and default as the
 	// legacy path), with the template's own policy able to narrow toward
@@ -134,6 +140,22 @@ func (s *ContentService) SagaSnapshotRender(ctx context.Context, in publication.
 		})
 	if err != nil {
 		return zero, err
+	}
+	if op != nil {
+		payload, err := json.Marshal(snap)
+		if err != nil {
+			return zero, err
+		}
+		payload, err = idempotency.FreezeRenderSnapshot(ctx, s.db, *op, payload)
+		if err != nil {
+			if idempotency.CodeOf(err) == idempotency.CodeInvalidRequest {
+				return zero, &publication.Error{Code: publication.CodeRenderValidation, Message: err.Error(), Err: err}
+			}
+			return zero, err
+		}
+		if err = json.Unmarshal(payload, &snap); err != nil {
+			return zero, err
+		}
 	}
 	return publication.RenderDetailed(ctx, snap)
 }

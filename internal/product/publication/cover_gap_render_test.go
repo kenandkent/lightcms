@@ -19,9 +19,9 @@ func gapRenderSnap() publication.RenderSnapshot {
 		PublicationID: primitive.NewObjectID(), ContentID: primitive.NewObjectID(),
 		ContentVersion: 1, TemplateVersionID: primitive.NewObjectID(), TemplateVersion: 1,
 		Title: "Gap", Slug: "gap", FullPath: "/news/gap",
-		HTMLLayout:      "<article>{{.body}}</article>",
-		Fields:          []models.TemplateField{{Name: "body", Label: "B", Type: "textarea"}},
-		ScriptPolicy:    "all",
+		HTMLLayout:         "<article>{{.body}}</article>",
+		Fields:             []models.TemplateField{{Name: "body", Label: "B", Type: "textarea"}},
+		ScriptPolicy:       "all",
 		LogicalPublishedAt: time.Now(), PublicURL: "https://example.com/news/gap",
 		Data: map[string]any{"body": "hello"},
 	}
@@ -68,14 +68,14 @@ func TestCoverGapRenderMatrix(t *testing.T) {
 		`<p>[[Gap Page]] and [[Missing Page]] and [[/news/gap]] and [[/nope]] and [[Gap Page|Read more]] and [[include:missing]]</p>` +
 		`<footer>{{.flag}}/{{.nick}}/{{.present}}/{{.count}}/{{.title}}/{{.slug}}/{{.full_path}}/{{.published_at}}/{{.public_url}}/{{.content_id}}/{{.template_slug}}/{{.template_version}}/{{.publication_id}}/{{.content_version}}</footer></article>`
 	snap.Snippets = map[string]string{
-		"cta": "Click {{.title}} [[include:nested]]",
+		"cta":    "Click {{.title}} [[include:nested]]",
 		"nested": "deep",
 	}
 	snap.TitleToPath = map[string]string{"gap page": "/news/gap"}
 	snap.PathToTitle = map[string]string{"/news/gap": "Gap Page"}
 	snap.LCQueryCache = map[string]string{
 		"<!--lc:query recent-->": "<ul><li>cached</li></ul>",
-		"*":                     "<p>wild</p>",
+		"*":                      "<p>wild</p>",
 	}
 	res, err := publication.RenderDetailed(context.Background(), snap)
 	if err != nil {
@@ -141,13 +141,13 @@ func TestCoverGapRenderMatrix(t *testing.T) {
 		t.Fatalf("exec error layout: want error")
 	}
 
-	// Strict + snippet-injected residual vector, clean layout → unsafe error.
+	// Plain text must not expand includes, even when a same-named snippet exists.
 	vecSnap := gapRenderSnap()
 	vecSnap.ScriptPolicy = "none"
 	vecSnap.Data = map[string]any{"body": "prefix [[include:evil]] suffix"}
 	vecSnap.Snippets = map[string]string{"evil": "<script>evil()</script>"}
-	if _, _, err := publication.Render(context.Background(), vecSnap); err == nil {
-		t.Fatalf("snippet vector residual: want error")
+	if rendered, _, err := publication.Render(context.Background(), vecSnap); err != nil || strings.Contains(string(rendered), "evil()") {
+		t.Fatalf("plain text unexpectedly expanded a snippet: %s %v", rendered, err)
 	}
 	// Strict + layout-carried vector → renders (layout vetted upstream).
 	laySnap := gapRenderSnap()
@@ -159,6 +159,7 @@ func TestCoverGapRenderMatrix(t *testing.T) {
 
 	// Snippet cycle + snippet with bad template syntax in body.
 	cycSnap := gapRenderSnap()
+	cycSnap.Fields[0].Type = "rawhtml"
 	cycSnap.Data = map[string]any{"body": "[[include:a]] [[include:bad]]"}
 	cycSnap.Snippets = map[string]string{
 		"a":   "A [[include:b]]",

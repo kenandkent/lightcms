@@ -226,6 +226,14 @@ func (s *Service) Publish(ctx context.Context, req PublishRequest) (PublicationR
 	if req.ContentID.IsZero() {
 		return PublicationResult{}, sagaErr(CodeValidationFailed, "content_id is required", nil)
 	}
+	ctx, stop, err := s.ownExecution(ctx, req.IdempotencyRecord)
+	if err != nil {
+		return PublicationResult{}, err
+	}
+	defer stop()
+	if result, ok, err := s.committedExecution(ctx, req.IdempotencyRecord, req.ContentID); err != nil || ok {
+		return result, err
+	}
 	content, err := s.loadContent(ctx, req.ContentID)
 	if err != nil {
 		return PublicationResult{}, err
@@ -368,6 +376,14 @@ func (s *Service) Rollback(ctx context.Context, req RollbackRequest) (Publicatio
 	if req.ContentID.IsZero() || req.SourcePublicationID.IsZero() {
 		return PublicationResult{}, sagaErr(CodeValidationFailed, "content_id and source_publication_id are required", nil)
 	}
+	ctx, stop, err := s.ownExecution(ctx, req.IdempotencyRecord)
+	if err != nil {
+		return PublicationResult{}, err
+	}
+	defer stop()
+	if result, ok, err := s.committedExecution(ctx, req.IdempotencyRecord, req.ContentID); err != nil || ok {
+		return result, err
+	}
 	content, err := s.loadContent(ctx, req.ContentID)
 	if err != nil {
 		return PublicationResult{}, err
@@ -442,5 +458,57 @@ func (s *Service) idemAttempt(ctx context.Context, opID *primitive.ObjectID) (op
 		return idempotency.Operation{}, 0, false, sagaErr(string(idempotency.CodeStaleAttempt),
 			"attempt is terminal; Begin a retry for a new attempt", nil)
 	}
+	gen := loaded.LeaseGeneration
+	if owned, ok := idempotency.LeaseGenerationFrom(ctx); ok {
+		gen = owned
+	}
+	if err := s.idem.AssertOwned(ctx, loaded.ID, loaded.Attempt, gen); err != nil {
+		return op, 0, false, err
+	}
 	return loaded, loaded.Attempt, true, nil
+}
+
+func (s *Service) ownExecution(ctx context.Context, opID *primitive.ObjectID) (context.Context, context.CancelFunc, error) {
+	if opID == nil || s.idem == nil {
+		return ctx, func() {}, nil
+	}
+	op, _, _, err := s.idemAttempt(ctx, opID)
+	if err != nil {
+		return ctx, func() {}, err
+	}
+	if _, err = s.idem.RenewLease(ctx, op.ID, op.Attempt, op.LeaseGeneration); err != nil {
+		return ctx, func() {}, err
+	}
+	ctx = idempotency.WithExecutionLease(ctx, op.ID, op.Attempt, op.LeaseGeneration)
+	hctx, stop := s.idem.Heartbeat(ctx, op.ID, op.Attempt, op.LeaseGeneration)
+	bounded, cancel := context.WithTimeout(hctx, s.idem.Lease()/2)
+	bounded = storage.WithWriteGuard(bounded, func() error { return s.idem.AssertOwned(bounded, op.ID, op.Attempt, op.LeaseGeneration) })
+	return bounded, func() { cancel(); stop() }, nil
+}
+
+func (s *Service) committedExecution(ctx context.Context, opID *primitive.ObjectID, contentID primitive.ObjectID) (PublicationResult, bool, error) {
+	if opID == nil || s.idem == nil {
+		return PublicationResult{}, false, nil
+	}
+	op, err := s.idem.Get(ctx, *opID)
+	if err != nil {
+		return PublicationResult{}, false, err
+	}
+	if op.PublicationID == nil {
+		return PublicationResult{}, false, nil
+	}
+	p, err := s.repo.GetByID(ctx, *op.PublicationID)
+	if CodeOf(err) == CodeNotFound {
+		return PublicationResult{}, false, nil
+	}
+	if err != nil {
+		return PublicationResult{}, false, err
+	}
+	if p.ActivatedAt == nil {
+		return PublicationResult{}, false, nil
+	}
+	if p.ContentID != contentID {
+		return PublicationResult{}, false, sagaErr(CodeConflict, "bound publication belongs to different content", nil)
+	}
+	return PublicationResult{PublicationID: p.ID, ContentID: p.ContentID, ContentVersion: p.ContentVersion, TemplateVersionID: p.TemplateVersionID, FullPath: p.FullPath, PublicURL: p.PublicURL, ContentHash: p.ContentHash, LogicalPublishedAt: p.LogicalPublishedAt}, true, nil
 }

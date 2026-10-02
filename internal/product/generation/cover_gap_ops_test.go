@@ -138,7 +138,7 @@ func TestCoverGapRollbackPublicationMatrix(t *testing.T) {
 		t.Fatalf("rollback unknown source: want error")
 	}
 	// In-progress: pre-Begin the canonical rollback body with a live lease.
-	sameBody := []byte(`{"source":"` + pid.Hex() + `"}`)
+	sameBody := []byte(`{"source":"` + pid.Hex() + `","expected_active_id":null}`)
 	if _, err := idem.Begin(ctx, actor.Owner(), "POST", "/p2", "k-rb-busy", sameBody); err != nil {
 		t.Fatalf("pre-Begin: %v", err)
 	}

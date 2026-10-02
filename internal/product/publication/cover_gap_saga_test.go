@@ -105,6 +105,9 @@ func TestCoverGapPublishWithIdempotencyRecord(t *testing.T) {
 		t.Fatalf("zero publication")
 	}
 	// Same record after completion → already-completed error (replay upstream).
+	if _, err := idem.Complete(ctx, op.ID, op.Attempt, 200, map[string]any{"publication_id": res.PublicationID.Hex()}, false); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := svc.Publish(ctx, publication.PublishRequest{
 		ContentID: cid, ContentVersion: 1, TemplateVersionID: tvID, IdempotencyRecord: &op.ID,
 	}); err == nil {

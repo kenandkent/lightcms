@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go, existing Gorilla Mux/http handlers, MongoDB Go driver v1, Go `html/template`, existing LightCMS Admin HTML, filesystem, existing REST/MCP/API key/OAuth/RBAC.
 
-**Spec:** `docs/LightCMS_V3_模板化页面生成与静态发布系统_最终设计方案.md` at SHA-256 `60222a89251cd6e15fc1d9e10d8ad7ca11f45bf6bf44fdb9f7a3c16100704f86`.
+**Spec:** `docs/LightCMS_V3_模板化页面生成与静态发布系统_最终设计方案.md` at SHA-256 `15db7eab7e7818906f56d156401b101c416a1b2caf48c0687d299da2e0659e48`.
 
 ## Global Constraints
 

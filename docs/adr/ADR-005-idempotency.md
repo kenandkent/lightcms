@@ -48,6 +48,13 @@ HTTP contract; this ADR fixes the shared semantics both build on.
   `FreezeExecution`, `RenewLease`, `TakeOver`, `Complete`). Crash before
   Render recovers the durable Publication ID + logical time — never allocates
   a second one for the same attempt.
+  Mutable render dependencies are frozen as a complete JSON render snapshot
+  (content/template inputs, policy, snippets, wikilink indices, query expansions)
+  by CAS before rendering. Maximum serialized snapshot: 8 MiB; oversize is
+  `RENDER_VALIDATION_FAILED`, never an implicit live-dependency fallback.
+  Dependency hashes include actual dependency contents. Terminal retry clears
+  this snapshot; uncertain takeover preserves it. Command kind and response
+  metadata (including warnings) persist before business effects.
 - **D5 — Terminal retry allocates anew.** A terminal pre-activation failure
   marks the attempt terminal; a retry with the same key increments `attempt`
   and allocates a NEW Publication ID + logical time. Lost-response retry after
@@ -62,6 +69,17 @@ HTTP contract; this ADR fixes the shared semantics both build on.
 - **D8 — TTL.** Idempotency records TTL-default `IDEMPOTENCY_TTL_HOURS=24`
   (spec §36); expiry after completion degrades to "unknown key" (safe to
   re-execute as a new operation), never to phantom replay.
+- **D9 — Ownership fences.** The original lease generation is held throughout
+  planning/render/cutover, with heartbeat and an execution deadline of half
+  the configured lease. Final filesystem renames recheck ownership; activation
+  writes the owned operation inside the same Mongo transaction as Publication
+  and Outbox. Never adopt a newer worker's generation from a fresh read.
+- **D10 — Credential namespace.** API keys use `apikey:<database ID>`; OAuth
+  uses `oauth:<client_id>:<resolved subject user_id>`. Legacy OAuth tokens do
+  not store a subject, so it is the existing configured system user; client
+  isolation still survives MCP loopback requests. Rotating into a new API-key
+  record starts a new namespace: retry an outstanding operation with its
+  original credential, not a newly issued key. User/sandbox IDs remain separate.
 
 ## 3. Rejected alternatives
 

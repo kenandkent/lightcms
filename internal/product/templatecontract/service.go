@@ -224,6 +224,7 @@ func (s *Service) insertVersionTxn(ctx context.Context, id primitive.ObjectID, e
 			bson.M{
 				"$inc": bson.M{"current_version": 1},
 				"$set": bson.M{
+					"slug":        in.Slug,
 					"name":        in.Name,
 					"category":    in.Category,
 					"status":      in.Status,
@@ -233,6 +234,9 @@ func (s *Service) insertVersionTxn(ctx context.Context, id primitive.ObjectID, e
 				},
 			})
 		if err != nil {
+			if IsDuplicateKey(err) {
+				return &Error{Code: CodeSlugConflict, Message: "template slug already exists"}
+			}
 			return internalErr("increment template version", err)
 		}
 		if ures.MatchedCount == 0 {
@@ -260,6 +264,23 @@ func (s *Service) insertVersionTxn(ctx context.Context, id primitive.ObjectID, e
 		}
 		return nil
 	})
+}
+
+// MigrateSlug creates a new current contract; historical versions and page
+// URLs remain unchanged. The mutable identity and immutable version commit together.
+func (s *Service) MigrateSlug(ctx context.Context, id primitive.ObjectID, expected int64, newSlug string) (TemplateVersion, error) {
+	if err := ValidateSlug(newSlug); err != nil {
+		return TemplateVersion{}, err
+	}
+	cur, err := s.repo.FindVersion(ctx, id, expected)
+	if err != nil {
+		return TemplateVersion{}, err
+	}
+	in := TemplateInput{Slug: newSlug, Name: cur.Name, Category: cur.Category, Status: cur.Status, Fields: cur.Fields, HTMLLayout: cur.HTMLLayout, ScriptPolicy: cur.ScriptPolicy}
+	if err = s.insertVersionTxn(ctx, id, expected, expected+1, in, ContractHash(in), RenderHash(in)); err != nil {
+		return TemplateVersion{}, err
+	}
+	return s.repo.FindVersion(ctx, id, expected+1)
 }
 
 // GetCurrent returns the current immutable version for a slug.

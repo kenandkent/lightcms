@@ -320,12 +320,8 @@ func TestE2E_SecurityInputHardening(t *testing.T) {
 	}
 }
 
-// TestE2E_SecurityStoredXSS pins stored-XSS behavior on the V3 publish path.
-// FINDING (table row FAIL): the saga DefaultRenderer binds every string as
-// template.HTML, so a script headline is persisted VERBATIM into the served
-// canonical bytes. Mitigation row (PASS): script_policy=none refuses to
-// render at all. Specified fix: run V3 renders through the Task 7
-// sanitizer/script-policy path (render.go) instead of raw template.HTML.
+// Plain-text headlines remain literal, regardless of permissive script policy.
+// The explicit restrictive policy still rejects script output from richtext.
 func TestE2E_SecurityStoredXSS(t *testing.T) {
 	e := newEnv(t, envOpts{})
 	e.seedTemplate(t, "financial-news")
@@ -343,17 +339,16 @@ func TestE2E_SecurityStoredXSS(t *testing.T) {
 	if c != 200 {
 		t.Fatalf("xss page not served: %d", c)
 	}
-	if !strings.Contains(string(body), `<script>alert(document.domain)</script>`) {
-		t.Fatalf("expected raw script passthrough evidence, got:\n%s", body)
+	if strings.Contains(string(body), `<script>alert(document.domain)</script>`) || !strings.Contains(string(body), `&lt;script&gt;alert(document.domain)&lt;/script&gt;`) {
+		t.Fatalf("text headline did not remain literal:\n%s", body)
 	}
-	t.Logf("FINDING PINNED: stored <script> passes V3 publish into served bytes verbatim (saga DefaultRenderer template.HTML binding)")
 
 	// script_policy=none refuses to render: no live page, no active.
 	ctx := context.Background()
 	_, _, err := e.tpls.Create(ctx, templatecontract.TemplateInput{
 		Slug: "no-script", Name: "NoScript", Category: "news", Status: "active",
 		ScriptPolicy: "none", HTMLLayout: sharedLayout,
-		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "text", Required: true}},
+		Fields: []models.TemplateField{{Name: "headline", Label: "H", Type: "richtext", Required: true}},
 	})
 	if err != nil {
 		t.Fatalf("no-script template: %v", err)

@@ -156,7 +156,8 @@ func buildPublicationRuntime(ctx context.Context, db *database.DB, cfg *config.C
 			}
 			return generation.Actor{
 				ID: u.ID, Email: u.Email, Authenticated: true,
-				IsAdmin: u.Role == models.RoleAdmin, Role: u.Role, Scopes: u.Scopes,
+				CredentialOwner: u.OperationOwner(),
+				IsAdmin:         u.Role == models.RoleAdmin, Role: u.Role, Scopes: u.Scopes,
 				SandboxOnly: u.SandboxOnly, AgentSession: session,
 				Via: "api", ActorKind: kind,
 			}, nil

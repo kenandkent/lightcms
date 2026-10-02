@@ -33,8 +33,9 @@ Lane B (Task 6) owns the store; the integration owner owns the scanner/GC
   canonical file (no cross-filesystem renames, no hard-link reliance).
 - **D2 — Stage/verify/activate order.** `Stage`: write `.tmp` → fsync file →
   verify SHA-256 → rename to immutable path → fsync directory. `Activate`:
-  copy immutable bytes to `.next-{publicationID}` → verify copy → rename old
-  canonical to `.previous-{oldID}` → rename next to canonical → fsync
+  copy immutable bytes to `.next-{publicationID}` → verify copy → copy old
+  canonical bytes to `.previous-{oldID}` (old canonical keeps
+  serving) → atomically rename next to canonical → fsync
   directory. Every step returns explicit close/fsync errors; injected short
   writes leave no verified object.
 - **D3 — Restore/abort/delete.** `Restore` reverses a failed activation from
@@ -59,6 +60,12 @@ Lane B (Task 6) owns the store; the integration owner owns the scanner/GC
   publications/day × 90-day retention); `STATIC_STORAGE_PROVIDER` accepts only
   `filesystem` until the R2/S3 ADR lands; unsupported providers fail startup
   with actionable diagnostics (Task 17 negative test).
+- **D7 — Single application writer.** Filesystem MVP permits one process per
+  site database. An atomically claimed Mongo writer slot and owner/incarnation
+  guarded heartbeat enforce admission. Loss or expiry triggers process
+  fail-stop, including an independent watchdog when heartbeat I/O blocks.
+  Multi-replica scale-out is not enabled by this gate; it requires the future
+  shared-lock/storage ADR and integration verification.
 
 ## 3. Rejected alternatives
 

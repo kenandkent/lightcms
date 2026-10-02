@@ -395,6 +395,7 @@ MVP 中迁移操作必须：
 - 校验新 slug 唯一；
 - 记录 Audit；
 - 不改变历史 Template Version；
+- 在同一 Mongo transaction 中创建携带新 slug/ContractHash 的 Template Version，并前移 current_version；只改变今后的机器契约，不重新发布既有页面；
 - 返回受影响的外部集成提示；
 - 不自动创建 URL redirect，因为 Template slug 不是 Public Page path。
 
@@ -2152,6 +2153,8 @@ completed_at
 
 Execution Snapshot 必须在 Render 前通过 CAS 持久化，字段至少包括 `operation_id/attempt/publication_id/logical_published_at/content_id/content_version/template_version_id/canonical_full_path/attempt_state`。持久化失败不得开始 Render。
 
+有可变渲染依赖的发布还必须在 Render 前持久化完整 `render_snapshot`：包括内容和模板输入、ScriptPolicy、author 判定、Snippet bodies、Wikilink index 与 lc:query expansions。该快照的 JSON 编码上限为 **8 MiB**，超限以 `RENDER_VALIDATION_FAILED` 拒绝，不能退化为恢复时读取 live dependencies；该限制与 `data` 5 MiB 限制同时成立。`render_dependencies_hash` 必须覆盖实际依赖内容的 hashes。Crash takeover 复用已存快照，terminal attempt++ 时清除旧快照。已提交但未缓存响应的恢复也必须保留原 warnings，因此业务副作用之前持久化 `response_metadata`；`command_kind` 保存原命令的 created/updated 权限语义。
+
 Content 创建/更新和 IdempotencyRecord 的 `content_id/content_version/canonical_full_path` 绑定必须位于同一 Mongo transaction。若进程在该 transaction 之前崩溃，重试可安全重新执行；若在 commit 之后崩溃，接管 worker 从 durable snapshot 读取 Content ID 与版本，禁止按 path 再创建第二个 Content。对已存在 Content 的 `mode=publish`，数据替换、新 Content Version 与 snapshot 绑定也必须同一 transaction 提交。
 
 在创建 Content 后发生进程崩溃时，接管 worker 使用 snapshot 查询现有状态并继续或 replay，不得无条件重新创建资源。failed Publication 永远不可重新 stage；terminal failure 的新 attempt 使用新 Publication。IdempotencyRecord 保存各 attempt 的 publication ID 关联，最终 completed response 指向成功 attempt。
@@ -2427,6 +2430,7 @@ TEMPLATE_VERSION_CHANGED
 TEMPLATE_VERSION_PRECONDITION_REQUIRED
 TEMPLATE_VERSION_CONFLICT
 FIELD_VALIDATION_FAILED
+RENDER_VALIDATION_FAILED
 FIELD_REQUIRED
 PATH_INVALID
 PATH_CONFLICT
@@ -3225,6 +3229,8 @@ Single LightCMS Application
 ```
 
 以上能力位于同一个 Go 可执行文件和同一个运行进程。Admin UI 由该进程直接提供，不交付第二个前端应用。Filesystem 必须支持 atomic activation。
+
+当前 Filesystem MVP 每个站点数据库只允许 **一个 LightCMS 应用进程**。启动时通过 Mongo 的唯一 writer lease slot 原子取得所有权；心跳同时校验 owner/incarnation 与续租有效期。丢失所有权、续租失败或到期前未确认续租，进程必须 fail-stop；不能只打印告警后继续服务。独立 watchdog 不得被 Mongo 心跳请求阻塞。滚动更新先停止旧实例再启动新实例，不支持同库双实例并行。下节 Scale-out 为后续部署能力，当前版本不能启用；实施完整共享锁、任务租约与 pointer 验证前，启动门禁必须拒绝第二个实例。
 
 ## 40.2 Scale-out
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/jonradoff/lightcms/v7/internal/apiclient"
+	"github.com/jonradoff/lightcms/v7/internal/middleware"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -26,6 +27,9 @@ func NewHTTPHandler(serverPort string) http.Handler {
 }
 
 func extractBearerToken(r *http.Request) string {
+	if token := middleware.OriginalOAuthToken(r.Context()); token != "" {
+		return token
+	}
 	auth := r.Header.Get("Authorization")
 	parts := strings.SplitN(auth, " ", 2)
 	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {

@@ -129,15 +129,13 @@ func (s *ContentService) PublishInternal(ctx context.Context, contentID primitiv
 		AuthorIsAdmin: AuthorIsAdminFromContext(ctx),
 	})
 	if perr != nil {
-		// Pre-activation failure: mark terminal so the next same-key Begin
-		// allocates a new attempt (a retry after a terminal staging failure
-		// uses a NEW Publication ID). Post-commit paths return success, so
-		// this never marks a live page's operation terminal.
+		// The saga alone can prove a terminal pre-activation failure. An
+		// unknown commit/cutover must retain its attempt and frozen Publication.
 		code := publication.CodeOf(perr)
 		if code == "" {
 			code = "PUBLISH_FAILED"
 		}
-		_, _ = internalIdem.MarkTerminal(ctx, op.ID, op.Attempt, code)
+		_, _ = internalIdem.Complete(ctx, op.ID, op.Attempt, 503, map[string]any{"error_code": code}, false)
 		return perr
 	}
 	_, _ = internalIdem.Complete(ctx, op.ID, op.Attempt, 200,

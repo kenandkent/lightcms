@@ -748,7 +748,7 @@ func TestGenerate_MigrateSlug(t *testing.T) {
 	}
 	// Historical versions untouched.
 	var vers []bson.M
-	cur, _ := s.db.Collection("template_versions").Find(ctx, bson.M{"template_id": tplID})
+	cur, _ := s.db.Collection("template_versions").Find(ctx, bson.M{"template_id": tplID, "version": bson.M{"$lte": tv}})
 	_ = cur.All(ctx, &vers)
 	for _, v := range vers {
 		if v["slug"] != "financial-news" {

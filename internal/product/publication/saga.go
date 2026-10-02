@@ -204,8 +204,12 @@ func DefaultRenderer(_ context.Context, in RenderInput) ([]byte, error) {
 	}
 
 	data := make(map[string]any, len(in.Content.Data)+9)
+	fieldTypes := map[string]string{}
+	for _, f := range in.Template.Fields {
+		fieldTypes[f.Name] = f.Type
+	}
 	for k, v := range in.Content.Data {
-		if str, ok := v.(string); ok {
+		if str, ok := v.(string); ok && (fieldTypes[k] == "richtext" || fieldTypes[k] == "markdown" || fieldTypes[k] == "rawhtml") {
 			data[k] = template.HTML(str)
 		} else {
 			data[k] = v
@@ -714,6 +718,16 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 	fail := func(code, message string, err error) (PublicationResult, error) {
 		return PublicationResult{}, sagaErr(code, message, err)
 	}
+	owned := func() error {
+		if plan.opID == nil || s.idem == nil {
+			return ctx.Err()
+		}
+		gen, ok := idempotency.LeaseGenerationFrom(ctx)
+		if !ok {
+			return sagaErr(CodePagePublishInProgress, "execution lease is missing", nil)
+		}
+		return s.idem.AssertOwned(ctx, *plan.opID, plan.attempt, gen)
+	}
 	// R07: single effective executor. When this attempt runs under an
 	// idempotency lease, verify we still own it (a takeover by a newer
 	// worker must stop us BEFORE any side effect) and heartbeat it for
@@ -725,14 +739,12 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 	// scanner converges whatever a cancelled worker leaves behind.
 	if plan.opID != nil && s.idem != nil {
 		cur, gerr := s.idem.Get(ctx, *plan.opID)
+		owned, hasOwned := idempotency.LeaseGenerationFrom(ctx)
 		if gerr != nil || cur.State != idempotency.StateProcessing ||
-			cur.AttemptState != idempotency.AttemptProcessing || cur.Attempt != plan.attempt {
+			cur.AttemptState != idempotency.AttemptProcessing || cur.Attempt != plan.attempt || !hasOwned || cur.LeaseGeneration != owned || !cur.LeaseExpiresAt.After(time.Now()) {
 			return fail(CodePagePublishInProgress,
 				"idempotency lease is no longer owned by this attempt; retry to take over", gerr)
 		}
-		hctx, stop := s.idem.Heartbeat(ctx, cur.ID, plan.attempt, cur.LeaseGeneration)
-		defer stop()
-		ctx = hctx
 	}
 	if !ActivatableVerification(plan.verification, false) {
 		// Defense in depth: the saga only ever stages verified output, except
@@ -770,10 +782,16 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		return fail(CodeOf(err), "persist staged publication", err)
 	}
 
+	if err := owned(); err != nil {
+		return fail(CodePagePublishInProgress, "lease lost before stage", err)
+	}
 	staged, err := s.store.Stage(ctx, storage.StageRequest{
 		ContentID: plan.contentID, PublicationID: plan.pubID,
 		CanonicalPath: plan.fullPath, HTML: plan.html, ExpectedSHA256: plan.rawHash,
 	})
+	if oerr := owned(); oerr != nil {
+		return fail(CodePagePublishInProgress, "lease lost during stage; recovery owns staged remnants", oerr)
+	}
 	if err != nil {
 		_ = s.repo.MarkFailed(ctx, plan.pubID, "stage: "+err.Error())
 		s.markTerminal(ctx, plan.opID, plan.attempt, CodeStageFailed)
@@ -781,13 +799,22 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		return fail(CodeStageFailed, "stage immutable publication object", err)
 	}
 	if err := s.store.Verify(ctx, staged); err != nil {
+		if oerr := owned(); oerr != nil {
+			return fail(CodePagePublishInProgress, "lease lost during failed verification", oerr)
+		}
 		_ = s.store.Abort(ctx, staged)
 		_ = s.repo.MarkFailed(ctx, plan.pubID, "verify: "+err.Error())
 		s.markTerminal(ctx, plan.opID, plan.attempt, CodeVerifyFailed)
 		plan.observeStageFail(CodeVerifyFailed)
 		return fail(CodeVerifyFailed, "verify staged publication object", err)
 	}
+	if err := owned(); err != nil {
+		return fail(CodePagePublishInProgress, "lease lost during verification", err)
+	}
 	if err := s.markVerifiedPresent(ctx, plan.pubID); err != nil {
+		if oerr := owned(); oerr != nil {
+			return fail(CodePagePublishInProgress, "lease lost before verification metadata", oerr)
+		}
 		_ = s.store.Abort(ctx, staged)
 		_ = s.repo.MarkFailed(ctx, plan.pubID, "verify-commit: "+err.Error())
 		s.markTerminal(ctx, plan.opID, plan.attempt, CodeVerifyFailed)
@@ -808,12 +835,18 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 				"rename target "+plan.fullPath+" already has a canonical file", nil)
 		}
 	}
+	if err := owned(); err != nil {
+		return fail(CodePagePublishInProgress, "lease lost before cutover", err)
+	}
 	if oldID == nil {
 		err = s.store.Activate(ctx, staged, plan.fullPath)
 	} else {
 		err = s.store.ActivateWithPrevious(ctx, staged, plan.fullPath, oldID)
 	}
 	if err != nil {
+		if oerr := owned(); oerr != nil {
+			return fail(CodePagePublishInProgress, "lease lost during cutover; recovery owns remaining files", oerr)
+		}
 		if storage.CodeOf(err) == storage.CodeNeedsPreviousID {
 			return s.failCutover(ctx, plan, staged, CodeActivateFailed,
 				"canonical appeared concurrently; retry with a fresh expected active ID", err)
@@ -828,8 +861,14 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 				// for the Task 10 scanner, the DB still shows the old active.
 				return fail(CodeCrashStop, herr.Error(), herr)
 			}
+			if oerr := owned(); oerr != nil {
+				return fail(CodeActivationUnknown, "lease lost after cutover hook", oerr)
+			}
 			return s.failCommitted(ctx, plan, staged, oldID, "pre-commit hook", herr)
 		}
+	}
+	if err := owned(); err != nil {
+		return fail(CodeActivationUnknown, "lease lost after cutover; scanner recovery required", err)
 	}
 
 	var commitErr error
@@ -843,6 +882,9 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		commitErr = s.repo.ActivateCAS(ctx, plan.contentID, plan.pubID, oldID)
 	}
 	if commitErr != nil {
+		if oerr := owned(); oerr != nil {
+			return fail(CodeActivationUnknown, "lease lost while committing; scanner must resolve outcome", oerr)
+		}
 		// Commit ambiguity: a commit that actually landed reports here as a
 		// success once the new record reads back as active — never compensate
 		// a live page.

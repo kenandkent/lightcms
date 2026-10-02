@@ -111,6 +111,35 @@ func Test16D_StableKeyRetryReplays(t *testing.T) {
 		t.Fatalf("stable-key retry must not duplicate outbox rows (count=%d)", outboxCount)
 	}
 
+	// An uncertain cutover is NOT proof of terminal pre-activation failure.
+	// Background wrappers must preserve the same attempt for scanner/takeover.
+	SetPublicationPublisher(publication.NewService(db, repo, store, publication.Options{Idem: idem, URLs: resolver, Faults: publication.Faults{BeforeCommit: func(context.Context) error { return publication.ErrStopAfterRename }}}))
+	crashKey := "scheduler/crash/" + contentID.Hex()
+	if err := cs.PublishInternal(ctx, contentID, "scheduler", "/internal/scheduler/publish", crashKey); err == nil {
+		t.Fatal("crash fixture did not run")
+	}
+	var crashed idempotency.Operation
+	if err := db.FindOne(ctx, idempotency.CollectionName, bson.M{"key": crashKey}, &crashed); err != nil {
+		t.Fatal(err)
+	}
+	if crashed.AttemptState != idempotency.AttemptProcessing {
+		t.Fatalf("uncertain cutover incorrectly declared terminal: %s", crashed.AttemptState)
+	}
+	SetPublicationPublisher(saga)
+	if _, err := db.Collection(idempotency.CollectionName).UpdateOne(ctx, bson.M{"_id": crashed.ID}, bson.M{"$set": bson.M{"processing_expires_at": time.Now().Add(-time.Minute)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.PublishInternal(ctx, contentID, "scheduler", "/internal/scheduler/publish", crashKey); err != nil {
+		t.Fatal(err)
+	}
+	active, err := repo.GetActive(ctx, contentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if crashed.PublicationID == nil || active.ID != *crashed.PublicationID {
+		t.Fatal("background recovery minted another Publication")
+	}
+
 	// Terminal path: missing content fails pre-activation; the retry must
 	// execute a NEW attempt (surface the saga error again), never replay
 	// success and never mint a row.

@@ -62,6 +62,44 @@ func NewService(db *database.DB, opts Options) (*Service, error) {
 func (s *Service) TTL() time.Duration   { return s.ttl }
 func (s *Service) Lease() time.Duration { return s.lease }
 
+func (s *Service) SetResponseMetadata(ctx context.Context, op Operation, metadata map[string]any) error {
+	n, err := s.repo.UpdateCAS(ctx, fenceFilter(ctx, bson.M{"_id": op.ID, "attempt": op.Attempt, "state": StateProcessing, "attempt_state": AttemptProcessing}), bson.M{"$set": bson.M{"response_metadata": metadata}})
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return idemErr(CodeLeaseLost, "response metadata ownership lost")
+	}
+	return nil
+}
+
+// Lookup is read-only: replay must precede mutable template/store/rate gates,
+// but callers still authorize the original command before returning its result.
+func (s *Service) Lookup(ctx context.Context, owner, method, path, key string, body []byte) (*Operation, error) {
+	op, err := s.repo.FindByKey(ctx, strings.TrimSpace(owner), strings.ToUpper(strings.TrimSpace(method)), strings.TrimSpace(path), key)
+	if err != nil || op == nil {
+		return op, err
+	}
+	if op.RequestHash != CanonicalHash(body) {
+		return nil, idemErr(CodeConflict, "same Idempotency-Key with a different request body")
+	}
+	op.Replay = op.State == StateCompleted
+	return op, nil
+}
+
+// SetCommandKind freezes authorization semantics before the first business write.
+func (s *Service) SetCommandKind(ctx context.Context, op Operation, kind string) error {
+	n, err := s.repo.UpdateCAS(ctx, fenceFilter(ctx, bson.M{"_id": op.ID, "state": StateProcessing, "attempt": op.Attempt, "attempt_state": AttemptProcessing,
+		"$or": bson.A{bson.M{"command_kind": bson.M{"$exists": false}}, bson.M{"command_kind": kind}}}), bson.M{"$set": bson.M{"command_kind": kind}})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return idemErr(CodeLeaseLost, "command ownership changed")
+	}
+	return nil
+}
+
 // Begin starts or resumes the operation for (owner, method, path, key,
 // canonicalBody):
 //   - no record → inserts attempt 1 with a fresh lease; caller owns it.
@@ -180,6 +218,7 @@ func (s *Service) advanceAttempt(ctx context.Context, existing *Operation, now t
 				"publication_id":        nil,
 				"logical_published_at":  nil,
 				"template_version_id":   nil,
+				"render_snapshot":       nil,
 				"last_error_code":       "",
 				"updated_at":            now,
 				"expires_at":            now.Add(s.ttl),
@@ -256,12 +295,99 @@ func leaseGenerationFrom(ctx context.Context) (int64, bool) {
 	return v, ok
 }
 
+func LeaseGenerationFrom(ctx context.Context) (int64, bool) { return leaseGenerationFrom(ctx) }
+
+// RenderSnapshotForPublication returns an already frozen payload without
+// touching mutable render dependencies. Empty means planning is still required.
+func RenderSnapshotForPublication(ctx context.Context, db *database.DB, pubID primitive.ObjectID) (*Operation, error) {
+	var op Operation
+	err := db.Collection(CollectionName).FindOne(ctx, bson.M{"publication_id": pubID}).Decode(&op)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	gen, ok := leaseGenerationFrom(ctx)
+	if !ok || gen != op.LeaseGeneration || op.State != StateProcessing || op.AttemptState != AttemptProcessing || !op.LeaseExpiresAt.After(time.Now()) {
+		return nil, idemErr(CodeLeaseLost, "render snapshot lease not owned")
+	}
+	return &op, nil
+}
+
+// FreezeRenderSnapshot durably stores the complete bounded input before Render.
+// Concurrent resume reads the winning snapshot, never overwrites it.
+func FreezeRenderSnapshot(ctx context.Context, db *database.DB, op Operation, payload []byte) ([]byte, error) {
+	if len(payload) > 8<<20 {
+		return nil, idemErr(CodeInvalidRequest, "frozen render snapshot exceeds 8 MiB")
+	}
+	r, err := db.Collection(CollectionName).UpdateOne(ctx, fenceFilter(ctx, bson.M{"_id": op.ID, "attempt": op.Attempt, "state": StateProcessing, "attempt_state": AttemptProcessing, "render_snapshot": nil, "processing_expires_at": bson.M{"$gt": time.Now().UTC()}}), bson.M{"$set": bson.M{"render_snapshot": payload}})
+	if err != nil {
+		return nil, err
+	}
+	if r.MatchedCount == 1 {
+		return payload, nil
+	}
+	cur, err := RenderSnapshotForPublication(ctx, db, *op.PublicationID)
+	if err != nil {
+		return nil, err
+	}
+	if cur == nil || len(cur.RenderSnapshot) == 0 {
+		return nil, idemErr(CodeLeaseLost, "snapshot freeze lost ownership")
+	}
+	return cur.RenderSnapshot, nil
+}
+
+// AssertOwned never adopts a freshly read generation. Ownership is the
+// caller's original (attempt,generation), and an expired lease is not owned.
+func (s *Service) AssertOwned(ctx context.Context, id primitive.ObjectID, attempt, generation int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	op, err := s.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if op.State != StateProcessing || op.AttemptState != AttemptProcessing || op.Attempt != attempt || op.LeaseGeneration != generation || !op.LeaseExpiresAt.After(time.Now()) {
+		return idemErr(CodeLeaseLost, "worker no longer owns the live lease")
+	}
+	return nil
+}
+
+type executionLease struct {
+	ID                  primitive.ObjectID
+	Attempt, Generation int64
+}
+type executionLeaseKey struct{}
+
+func WithExecutionLease(ctx context.Context, id primitive.ObjectID, attempt, generation int64) context.Context {
+	return context.WithValue(WithLeaseGeneration(ctx, generation), executionLeaseKey{}, executionLease{id, attempt, generation})
+}
+
+// GuardExecution writes the owned operation inside the activation transaction.
+// A takeover racing the commit creates a Mongo write conflict, not a stale activation.
+func GuardExecution(ctx context.Context, db *database.DB) error {
+	lease, ok := ctx.Value(executionLeaseKey{}).(executionLease)
+	if !ok {
+		return nil
+	}
+	r, err := db.Collection(CollectionName).UpdateOne(ctx, bson.M{"_id": lease.ID, "attempt": lease.Attempt, "lease_generation": lease.Generation, "state": StateProcessing, "attempt_state": AttemptProcessing, "processing_expires_at": bson.M{"$gt": time.Now().UTC()}}, bson.M{"$inc": bson.M{"fence_sequence": 1}})
+	if err != nil {
+		return err
+	}
+	if r.MatchedCount != 1 {
+		return idemErr(CodeLeaseLost, "activation lease lost")
+	}
+	return nil
+}
+
 // fenceFilter augments a CAS filter with the stashed lease generation.
 // Callers translate a zero match through the existing mismatch diagnosers,
 // which report the attempt as superseded.
 func fenceFilter(ctx context.Context, filter bson.M) bson.M {
 	if gen, ok := leaseGenerationFrom(ctx); ok {
 		filter["lease_generation"] = gen
+		filter["processing_expires_at"] = bson.M{"$gt": time.Now().UTC()}
 	}
 	return filter
 }
@@ -418,7 +544,7 @@ func (s *Service) FreezeExecution(ctx context.Context, opID primitive.ObjectID, 
 
 // Heartbeat starts lease renewal for (opID, attempt, generation) until
 // stop is called (R07: spec §21.5 heartbeat). Renewals run every
-// lease/3 (clamped to 1s–60s). The FIRST failed renewal cancels the
+// lease/3 (clamped to 1ms–60s). The FIRST failed renewal cancels the
 // returned context: a generation mismatch (or any loss) means a newer
 // worker owns the attempt — the caller must stop all side effects
 // immediately. Callers scope the child context to the long side-effect
@@ -427,8 +553,8 @@ func (s *Service) FreezeExecution(ctx context.Context, opID primitive.ObjectID, 
 func (s *Service) Heartbeat(ctx context.Context, opID primitive.ObjectID, attempt, generation int64) (context.Context, context.CancelFunc) {
 	hctx, cancel := context.WithCancel(ctx)
 	interval := s.lease / 3
-	if interval < time.Second {
-		interval = time.Second
+	if interval < time.Millisecond {
+		interval = time.Millisecond
 	}
 	if interval > time.Minute {
 		interval = time.Minute
@@ -466,7 +592,7 @@ func (s *Service) Heartbeat(ctx context.Context, opID primitive.ObjectID, attemp
 func (s *Service) RenewLease(ctx context.Context, opID primitive.ObjectID, attempt, generation int64) (Operation, error) {
 	now := time.Now().UTC()
 	matched, err := s.repo.UpdateCAS(ctx,
-		bson.M{"_id": opID, "attempt": attempt, "lease_generation": generation, "state": StateProcessing, "attempt_state": AttemptProcessing},
+		bson.M{"_id": opID, "attempt": attempt, "lease_generation": generation, "state": StateProcessing, "attempt_state": AttemptProcessing, "processing_expires_at": bson.M{"$gt": now}},
 		bson.M{"$set": bson.M{"processing_expires_at": now.Add(s.lease), "updated_at": now}})
 	if err != nil {
 		return Operation{}, err

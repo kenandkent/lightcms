@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/jonradoff/lightcms/v7/internal/database"
+	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -116,7 +117,8 @@ func withAttribution(p *Publication, attr Attribution) *Publication {
 	return &cp
 }
 
-func eventPayload(p *Publication) map[string]any {	payload := map[string]any{
+func eventPayload(p *Publication) map[string]any {
+	payload := map[string]any{
 		"content_id":           p.ContentID.Hex(),
 		"publication_id":       p.ID.Hex(),
 		"content_version":      p.ContentVersion,
@@ -295,6 +297,9 @@ func (r *Repository) ActivateCASWithRedirect(ctx context.Context, contentID, new
 
 func (r *Repository) activateCAS(ctx context.Context, contentID, newPublicationID primitive.ObjectID, expectedOldActiveID *primitive.ObjectID, redirectFrom, redirectTo string) error {
 	return r.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
+		if err := idempotency.GuardExecution(sc, r.db); err != nil {
+			return err
+		}
 		pubs := r.db.Collection(CollectionPublications)
 		content := r.db.Collection(CollectionContent)
 

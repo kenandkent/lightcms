@@ -30,6 +30,7 @@ import (
 
 // instanceLivenessCollection holds one document per running server instance.
 const instanceLivenessCollection = "instance_liveness"
+const writerLeaseSlot = "__exclusive_site_writer__"
 
 // instanceHeartbeatInterval is how often the gate refreshes our own
 // heartbeat. instanceLivenessWindow is how far back a rival heartbeat counts
@@ -88,11 +89,17 @@ func refreshInstanceHeartbeat(ctx context.Context, db *database.DB, coll, instan
 	}
 	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, err := db.Collection(coll).UpdateOne(rctx,
-		bson.M{"_id": instanceID},
+	res, err := db.Collection(coll).UpdateOne(rctx,
+		bson.M{"_id": instanceID, "last_heartbeat": bson.M{"$gt": time.Now().UTC().Add(-instanceLivenessWindow)}},
 		bson.M{"$set": bson.M{"last_heartbeat": time.Now().UTC()}},
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount != 1 {
+		return fmt.Errorf("single-instance ownership lost: missing or expired heartbeat")
+	}
+	return nil
 }
 
 // enforceSingleInstance registers instanceID in the liveness collection and
@@ -103,12 +110,12 @@ func refreshInstanceHeartbeat(ctx context.Context, db *database.DB, coll, instan
 // meet their own pre-stop heartbeat (guarded by started_at; crashes still
 // rely on TTL expiry plus stale-local reaping).
 func enforceSingleInstance(ctx context.Context, db *database.DB, instanceID string, version string) (func(), error) {
-	return enforceSingleInstanceOnCollection(ctx, db, instanceLivenessCollection, instanceID, version)
+	return enforceSingleInstanceOnCollection(ctx, db, instanceLivenessCollection, instanceID, version, func(err error) { log.Fatalf("single-instance writer lease lost; stopping process: %v", err) })
 }
 
 // enforceSingleInstanceOnCollection is the collection-parameterized core so
 // tests can isolate without touching the production collection name.
-func enforceSingleInstanceOnCollection(ctx context.Context, db *database.DB, coll, instanceID, version string) (func(), error) {
+func enforceSingleInstanceOnCollection(ctx context.Context, db *database.DB, coll, instanceID, version string, onLost ...func(error)) (func(), error) {
 	if strings.TrimSpace(instanceID) == "" {
 		return nil, fmt.Errorf("single-instance gate: instance ID is required")
 	}
@@ -135,7 +142,7 @@ func enforceSingleInstanceOnCollection(ctx context.Context, db *database.DB, col
 	var rivalIDs []string
 	cursor, cerr := db.Collection(coll).Find(ctx,
 		bson.M{
-			"_id":            bson.M{"$ne": instanceID},
+			"_id":            bson.M{"$nin": bson.A{instanceID, writerLeaseSlot}},
 			"last_heartbeat": bson.M{"$gte": now.Add(-instanceLivenessWindow)},
 		},
 		options.Find().SetProjection(bson.M{"_id": 1}))
@@ -180,6 +187,22 @@ func enforceSingleInstanceOnCollection(ctx context.Context, db *database.DB, col
 		_, _ = db.Collection(coll).DeleteOne(ctx, bson.M{"_id": instanceID})
 		return nil, fmt.Errorf("instance %q is already running: multi-instance deployment is unsupported: run a single instance", liveRivals[0])
 	}
+	// A single atomic slot is the final arbiter, including simultaneous boot.
+	// TTL/probe rows alone cannot establish an exclusive writer lease.
+	var slot struct {
+		Owner         string    `bson:"owner"`
+		LastHeartbeat time.Time `bson:"last_heartbeat"`
+	}
+	if err := db.Collection(coll).FindOne(ctx, bson.M{"_id": writerLeaseSlot}).Decode(&slot); err == nil {
+		if host, pid, ok := parseInstanceID(slot.Owner); ok && host == localHostname() && !pidAlive(pid) {
+			_, _ = db.Collection(coll).DeleteOne(ctx, bson.M{"_id": writerLeaseSlot, "owner": slot.Owner, "last_heartbeat": slot.LastHeartbeat})
+		}
+	}
+	_, err := db.Collection(coll).UpdateOne(ctx, bson.M{"_id": writerLeaseSlot, "$or": bson.A{bson.M{"owner": instanceID}, bson.M{"last_heartbeat": bson.M{"$lte": now.Add(-instanceLivenessWindow)}}}}, bson.M{"$set": bson.M{"owner": instanceID, "started_at": now, "last_heartbeat": now}}, options.Update().SetUpsert(true))
+	if err != nil {
+		_, _ = db.Collection(coll).DeleteOne(ctx, bson.M{"_id": instanceID})
+		return nil, fmt.Errorf("multi-instance deployment unsupported: exclusive writer lease held by %q: %w", slot.Owner, err)
+	}
 
 	interval := instanceHeartbeatInterval
 	if interval <= 0 {
@@ -199,7 +222,47 @@ func enforceSingleInstanceOnCollection(ctx context.Context, db *database.DB, col
 		_, _ = db.Collection(coll).DeleteOne(dctx, bson.M{
 			"_id": instanceID, "started_at": bson.M{"$lte": now},
 		})
+		_, _ = db.Collection(coll).DeleteOne(dctx, bson.M{"_id": writerLeaseSlot, "owner": instanceID, "started_at": now})
 	}
+	var lostOnce sync.Once
+	lost := func(err error) {
+		lostOnce.Do(func() {
+			for _, fn := range onLost {
+				if fn != nil {
+					fn(err)
+				}
+			}
+			stop()
+		})
+	}
+	renewed := make(chan time.Time, 1)
+	// Independent watchdog: a blocked Mongo heartbeat must not postpone
+	// fail-stop past lease expiry. Stop slightly before the slot becomes claimable.
+	guardWindow := instanceLivenessWindow - time.Second
+	if guardWindow <= 0 {
+		guardWindow = instanceLivenessWindow * 9 / 10
+	}
+	go func() {
+		deadline := time.NewTimer(time.Until(now.Add(guardWindow)))
+		defer deadline.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-deadline.C:
+				lost(fmt.Errorf("writer lease renewal deadline exceeded"))
+				return
+			case at := <-renewed:
+				if !deadline.Stop() {
+					select {
+					case <-deadline.C:
+					default:
+					}
+				}
+				deadline.Reset(time.Until(at.Add(guardWindow)))
+			}
+		}
+	}()
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -211,7 +274,25 @@ func enforceSingleInstanceOnCollection(ctx context.Context, db *database.DB, col
 				// Heartbeats use a fresh background context: the boot
 				// context may be a short connect-scoped timeout.
 				if err := refreshInstanceHeartbeat(context.Background(), db, coll, instanceID); err != nil {
-					log.Printf("WARNING: instance heartbeat refresh failed: %v", err)
+					lost(err)
+					return
+				}
+				rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				renewedAt := time.Now().UTC()
+				res, err := db.Collection(coll).UpdateOne(rctx, bson.M{"_id": writerLeaseSlot, "owner": instanceID, "started_at": now, "last_heartbeat": bson.M{"$gt": renewedAt.Add(-instanceLivenessWindow)}}, bson.M{"$set": bson.M{"last_heartbeat": renewedAt}})
+				cancel()
+				if err != nil {
+					lost(err)
+					return
+				}
+				if res.MatchedCount != 1 {
+					lost(fmt.Errorf("exclusive writer slot ownership lost"))
+					return
+				}
+				select {
+				case renewed <- renewedAt:
+				case <-stopCh:
+					return
 				}
 			}
 		}
