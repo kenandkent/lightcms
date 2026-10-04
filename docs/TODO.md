@@ -7,6 +7,7 @@
 - 负责人：Ken 确定域名；部署负责人完成配置与验证。
 - 优先级：生产部署必备，未完成不得通过 Go-live Gate。
 - 范围：本项目所有生成公开页面的 HTML 模板，包括文件中的模板、默认／主题模板、数据库中已启用的 Template HTMLLayout，以及已发布页面。管理后台内部视图不属于公开分享页面范围。
+- 模板清单补充：新增 8 套报告／公告模板的文件与静态分享素材见 [REPORT-TEMPLATES.md](../examples/templates/REPORT-TEMPLATES.md)。全部纳入此生产门槛；示例 JSON 中的 `publisher.example` 地址必须替换，不能直接上线。
 
 ### 执行步骤
 

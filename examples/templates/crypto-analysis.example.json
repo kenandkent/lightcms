@@ -1,0 +1,17 @@
+{
+  "template": "crypto-analysis",
+  "title": "Digital asset market review",
+  "slug": "crypto-analysis-demo",
+  "folder_path": "/reports",
+  "mode": "draft",
+  "data": {
+    "headline": "Digital asset market review",
+    "summary": "Illustrative template content. Replace with verified reporting.",
+    "body": "<h2>Evidence and context</h2><p>This is an illustrative report, not an investment recommendation.</p>",
+    "author": "Research desk",
+    "category": "Digital assets",
+    "share_image_url": "https://publisher.example/static/images/chain-lens-share.png",
+    "share_image_alt": "Digital asset market analysis",
+    "favicon_url": "https://publisher.example/static/images/chain-lens-icon.svg"
+  }
+}

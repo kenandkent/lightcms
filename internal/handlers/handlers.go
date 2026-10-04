@@ -38,6 +38,7 @@ import (
 	"github.com/gorilla/mux"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/text/unicode/norm"
 )
@@ -236,8 +237,20 @@ func formatBytes(n int64) string {
 
 // SeedDefaults creates default templates and hello world page if they don't exist
 func (h *Handler) SeedDefaults(ctx context.Context) error {
+	// A curated library is an explicit persisted site policy. Removing stock
+	// templates must not silently recreate them on the next process restart.
+	var policy struct {
+		CustomOnly bool `bson:"custom_only"`
+	}
+	if err := h.db.FindOne(ctx, "settings", bson.M{"type": "template_library_policy"}, &policy); err != nil && err != mongo.ErrNoDocuments {
+		return fmt.Errorf("load template library policy: %w", err)
+	}
+	defaultTemplates := models.DefaultTemplates
+	if policy.CustomOnly {
+		defaultTemplates = nil
+	}
 	// Seed default templates
-	for _, tmpl := range models.DefaultTemplates {
+	for _, tmpl := range defaultTemplates {
 		count, err := h.db.Count(ctx, "templates", bson.M{"slug": tmpl.Slug})
 		if err != nil {
 			return err
@@ -256,7 +269,7 @@ func (h *Handler) SeedDefaults(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if count == 0 {
+	if count == 0 && !policy.CustomOnly {
 		// Get the explanatory page template
 		var tmpl models.Template
 		err := h.db.FindOne(ctx, "templates", bson.M{"slug": "explanatory-page"}, &tmpl)
@@ -354,7 +367,9 @@ func (h *Handler) SeedDefaults(ctx context.Context) error {
 	}
 
 	// Ensure default pages exist
-	h.ensureDefaultPages(ctx)
+	if !policy.CustomOnly {
+		h.ensureDefaultPages(ctx)
+	}
 
 	// Set default header/footer in theme if not set
 	theme, _ := h.db.GetThemeSettings(ctx)

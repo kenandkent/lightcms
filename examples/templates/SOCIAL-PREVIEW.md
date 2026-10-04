@@ -4,6 +4,8 @@ Production requirement: complete [PROD-001](../../docs/TODO.md) after selecting 
 
 The template includes server-rendered Open Graph metadata, X/Twitter summary cards, a favicon, and an Apple touch icon. Preview text comes from the article fields rather than browser-language JavaScript.
 
+The eight additional report/announcement layouts use the same production gate. Their shared field contract, import payloads and style-specific images are documented in [REPORT-TEMPLATES.md](REPORT-TEMPLATES.md). Their optional Chinese article fields affect browser content only; social metadata remains server-rendered English.
+
 ## Template configuration
 
 Keep the existing headline, summary, author and category fields. Add these fields to the LightCMS Template before sending them in generation requests:
