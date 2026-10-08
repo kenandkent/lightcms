@@ -193,13 +193,26 @@ func TestE2E_StartupRejections(t *testing.T) {
 	requireLiveMongo(t)
 	cname := "lightcms-standalone-probe"
 	exec.Command("docker", "rm", "-f", cname).Run()
+	// Ephemeral host port (docker picks a free one): a hardcoded port
+	// breaks whenever the runner already has something on it (exit 125).
 	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", cname,
-		"-p", "127.0.0.1:27018:27017", "mongo:7.0.14", "--port", "27017").CombinedOutput()
+		"-p", "127.0.0.1::27017", "mongo:7.0.14", "--port", "27017").CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run standalone mongod (no skip): %v %s", err, out)
 	}
 	defer exec.Command("docker", "rm", "-f", cname).Run()
-	uri := "mongodb://127.0.0.1:27018/standalone-probe?directConnection=true"
+	portOut, err := exec.Command("docker", "port", cname, "27017").CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker port standalone mongod (no skip): %v %s", err, portOut)
+	}
+	hostPort := strings.TrimSpace(string(portOut)) // "127.0.0.1:XXXXX"
+	if i := strings.LastIndex(hostPort, ":"); i >= 0 {
+		hostPort = hostPort[i+1:]
+	}
+	if hostPort == "" {
+		t.Fatalf("docker port returned no mapping: %q", string(portOut))
+	}
+	uri := "mongodb://127.0.0.1:" + hostPort + "/standalone-probe?directConnection=true"
 	var db *database.DB
 	deadline := time.Now().Add(90 * time.Second)
 	for {
