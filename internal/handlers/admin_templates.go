@@ -1662,7 +1662,7 @@ var adminTemplates = map[string]string{
                     {{end}}
                 </select>
                 {{end}}
-                {{with index $.FieldErrors .Name}}{{range .}}<p class="field-error" data-field="{{.Field}}">{{.Code}}: {{.Message}}</p>{{end}}{{end}}
+                {{$fname := .Name}}{{with $.FieldErrors}}{{with index . $fname}}{{range .}}<p class="field-error" data-field="{{.Field}}">{{.Code}}: {{.Message}}</p>{{end}}{{end}}{{end}}
             </div>
             {{end}}
 

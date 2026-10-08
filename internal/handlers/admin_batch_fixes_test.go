@@ -76,6 +76,45 @@ func TestServePageDeletedNeverServes(t *testing.T) {
 	}
 }
 
+// FieldErrors-missing regression: content_form with template fields must
+// render to completion on the NEW page (IsNew, no Content; FieldErrors is
+// guaranteed non-nil by the handler). Previously `index $.FieldErrors` on
+// a missing key aborted execution mid-form (silent truncated 200, no save
+// button) for every template with ≥1 field.
+func TestNewFormRendersFullyWithFields(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+	tmplID := seedTemplate(t, h.db, "Fields Template", "fields-template")
+	// Give the template every input type the form loop branches on.
+	if _, err := h.db.Collection("templates").UpdateOne(context.Background(),
+		bson.M{"_id": tmplID},
+		bson.M{"$set": bson.M{"fields": []bson.M{
+			{"name": "t1", "label": "T1", "type": "text", "required": true},
+			{"name": "t2", "label": "T2", "type": "textarea"},
+			{"name": "t3", "label": "T3", "type": "markdown"},
+			{"name": "t4", "label": "T4", "type": "richtext"},
+			{"name": "t5", "label": "T5", "type": "select", "options": "a,b"},
+			{"name": "t6", "label": "T6", "type": "url"},
+			{"name": "t7", "label": "T7", "type": "date"},
+			{"name": "t8", "label": "T8", "type": "boolean"},
+		}}}); err != nil {
+		t.Fatalf("seed fields: %v", err)
+	}
+	req := rbacSessionReq(t, "admin", http.MethodGet, "/cm/content/new/"+tmplID.Hex(), nil,
+		map[string]string{"templateID": tmplID.Hex()})
+	rr := httptest.NewRecorder()
+	h.NewContentWithTemplate(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("new page: got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{"field_t1", "field_t5", "field_t8", `type="submit"`, "field_t3"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("new form truncated, missing %q", want)
+		}
+	}
+}
+
 // M8: the role gate expression must render bare (html/template already
 // quotes in script context) — the printf "%q" double-wrap broke the
 // admin-only comment button the same way CSRF broke before it.
@@ -543,7 +582,7 @@ func TestUpsertRestatementAllowed(t *testing.T) {
 	callUpsert := func(slug string, published bool) *httptest.ResponseRecorder {
 		raw, _ := json.Marshal(map[string]any{
 			"template_id": tpl["_id"].(primitive.ObjectID).Hex(),
-			"title": "Upsert", "slug": slug, "folder_path": "/news",
+			"title":       "Upsert", "slug": slug, "folder_path": "/news",
 			"published": published, "upsert": true,
 		})
 		req := httptest.NewRequest("POST", "/api/v1/content", strings.NewReader(string(raw)))

@@ -32,6 +32,7 @@ import (
 	"github.com/jonradoff/lightcms/v7/internal/product/idempotency"
 	"github.com/jonradoff/lightcms/v7/internal/product/pathkey"
 	"github.com/jonradoff/lightcms/v7/internal/product/publication"
+	"github.com/jonradoff/lightcms/v7/internal/product/templatecontract"
 	"github.com/jonradoff/lightcms/v7/internal/services"
 
 	"github.com/gorilla/csrf"
@@ -960,6 +961,9 @@ func (h *Handler) NewContentWithTemplate(w http.ResponseWriter, r *http.Request)
 		"IsNew":    true,
 		"Template": tmpl,
 		"Folders":  folders,
+		// Non-nil FieldErrors: the template indexes it per field and a
+		// missing key aborts execution with a truncated page.
+		"FieldErrors": map[string][]templatecontract.FieldError{},
 	})
 }
 
@@ -1170,10 +1174,11 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 	id, err := h.db.InsertOne(ctx, "content", content)
 	if err != nil {
 		h.renderAdmin(w, r, "content_form", map[string]interface{}{
-			"IsNew":    true,
-			"Template": tmpl,
-			"Content":  content,
-			"Error":    err.Error(),
+			"IsNew":       true,
+			"Template":    tmpl,
+			"Content":     content,
+			"Error":       err.Error(),
+			"FieldErrors": map[string][]templatecontract.FieldError{},
 		})
 		return
 	}
@@ -1382,6 +1387,9 @@ func (h *Handler) EditContent(w http.ResponseWriter, r *http.Request) {
 		"PageViews7d":         pageViews7d,
 		"PageReferrersJSON":   pageReferrersJSON,
 		"ActivePublicationID": activePublicationID,
+		// Non-nil FieldErrors: the template indexes it per field and a
+		// missing key aborts execution with a truncated page.
+		"FieldErrors": map[string][]templatecontract.FieldError{},
 		// Per-render idempotency key for the standalone 发布上线 button:
 		// a double-submit of the same page replays instead of minting a
 		// second Publication (M6). Empty only if crypto/rand fails, in
