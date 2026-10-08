@@ -38,10 +38,13 @@ permissions:
   contents: read
   packages: write
 
-# Deploys queue behind each other; never cancel a deploy in flight.
+# A newer push cancels the in-flight run and only the latest proceeds:
+# stale code must never deploy after fresh code. (A deploy step killed
+# mid-switch is safe — `compose up` is idempotent and the winner's health
+# gate re-verifies before the job can go green.)
 concurrency:
-  group: prod-deploy
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   IMAGE_NAME: ghcr.io/kenandkent/lightcms
@@ -168,12 +171,14 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           GH_IMAGE: ${{ env.IMAGE_NAME }}
+          GH_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: 167.114.210.84
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 15m
-          envs: IMAGE_TAG,PROD_BASE_URL,PROD_SESSION_SECRET,ANTHROPIC_API_KEY,RESEND_API_KEY,EMAIL_FROM,GH_IMAGE
+          envs: IMAGE_TAG,PROD_BASE_URL,PROD_SESSION_SECRET,ANTHROPIC_API_KEY,RESEND_API_KEY,EMAIL_FROM,GH_IMAGE,GH_USER,GH_TOKEN
           script: |
             set -euo pipefail
             mkdir -p /opt/lightcms/backups
@@ -201,8 +206,14 @@ jobs:
               echo "no running mongo yet — first boot, skipping backup"
             fi
             # --- switch ---
+            # GHCR login uses the job's short-lived GITHUB_TOKEN (no extra
+            # secret needed); always logout afterwards so no credential
+            # lingers on the box. Required when the image is private;
+            # harmless when it is public.
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin
             echo "$GH_IMAGE:$IMAGE_TAG" > .image_tag
             IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.prod.yml pull app
+            docker logout ghcr.io >/dev/null 2>&1 || true
             IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.prod.yml up -d --remove-orphans
             # --- health gate (fail the job if the app never becomes healthy) ---
             for i in $(seq 1 30); do
