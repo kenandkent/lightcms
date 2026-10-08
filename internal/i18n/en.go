@@ -190,6 +190,10 @@ var enDict = map[string]string{
 	// API keys list.
 	"api_keys.api_keys":                             "API Keys",
 	"api_keys.api_keys_provide_programmatic_access": "API keys provide programmatic access to the LightCMS REST API for CLI tools, the MCP server, or custom integrations.",
+	"api_keys.copy":                                 "Copy",
+	"api_keys.copy_failed":                          "Copy failed, please retry",
+	"api_keys.copy_legacy_hint":                     "This key was created before copy support and cannot be viewed; delete and recreate it to enable copying",
+	"api_keys.copied":                               "Copied",
 	"api_keys.key_prefix":                           "Key prefix",
 	"api_keys.last_used":                            "Last used",
 	"api_keys.never":                                "Never",

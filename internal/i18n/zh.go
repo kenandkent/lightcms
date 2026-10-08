@@ -190,6 +190,10 @@ var zhDict = map[string]string{
 	// API keys list.
 	"api_keys.api_keys":                             "API 密钥",
 	"api_keys.api_keys_provide_programmatic_access": "API 密钥用于以编程方式访问 LightCMS REST API，可配合 CLI 工具、MCP 服务或自研集成使用。",
+	"api_keys.copy":                                 "复制",
+	"api_keys.copy_failed":                          "复制失败，请重试",
+	"api_keys.copy_legacy_hint":                     "该密钥创建于复制功能上线之前，无法查看原文；删除后重建即可复制",
+	"api_keys.copied":                               "已复制",
 	"api_keys.key_prefix":                           "键前缀",
 	"api_keys.last_used":                            "上次使用",
 	"api_keys.never":                                "从不",

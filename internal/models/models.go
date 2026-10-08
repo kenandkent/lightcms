@@ -205,11 +205,18 @@ type APIKey struct {
 	Description string              `bson:"description" json:"description"`
 	Prefix      string              `bson:"prefix" json:"prefix"`                                 // First 11 chars (e.g., "lc_a1b2c3d4") for identification
 	KeyHash     string              `bson:"key_hash" json:"-"`                                    // SHA-256 hash of full key
-	UserID      *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"`           // Owning user
-	Scopes      []string            `bson:"scopes,omitempty" json:"scopes,omitempty"`             // Permission allowlist; empty = full owner permissions
-	SandboxOnly bool                `bson:"sandbox_only,omitempty" json:"sandbox_only,omitempty"` // Content writes must target a fork; live mutations rejected
-	LastUsedAt  *time.Time          `bson:"last_used_at,omitempty" json:"last_used_at,omitempty"`
-	CreatedAt   time.Time           `bson:"created_at" json:"created_at"`
+	// KeyCiphertext holds the AES-GCM encrypted raw key (base64 nonce +
+	// ciphertext) so owners can re-copy it from the admin UI. Empty for
+	// keys created before copy support or when no encryption key is
+	// configured — those keys can never be revealed, only recreated.
+	// json:"-" keeps it out of every API response; only the dedicated
+	// reveal path decrypts it, permission-checked and audit-logged.
+	KeyCiphertext string              `bson:"key_ciphertext,omitempty" json:"-"`
+	UserID        *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"`           // Owning user
+	Scopes        []string            `bson:"scopes,omitempty" json:"scopes,omitempty"`             // Permission allowlist; empty = full owner permissions
+	SandboxOnly   bool                `bson:"sandbox_only,omitempty" json:"sandbox_only,omitempty"` // Content writes must target a fork; live mutations rejected
+	LastUsedAt    *time.Time          `bson:"last_used_at,omitempty" json:"last_used_at,omitempty"`
+	CreatedAt     time.Time           `bson:"created_at" json:"created_at"`
 }
 
 // Snippet is a named, reusable HTML fragment used as an item renderer in lc:query directives.

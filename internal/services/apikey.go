@@ -2,9 +2,13 @@ package services
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -19,11 +23,86 @@ import (
 // APIKeyService handles API key management
 type APIKeyService struct {
 	db *database.DB
+	// encKey seals raw keys for the admin copy/reveal flow (AES-256-GCM).
+	// Nil = copy unsupported (legacy behavior: show-once only).
+	encKey []byte
 }
 
 // NewAPIKeyService creates a new API key service
 func NewAPIKeyService(db *database.DB) *APIKeyService {
 	return &APIKeyService{db: db}
+}
+
+// DeriveKeyEncryptionKey derives the 32-byte key-sealing key from the
+// server session secret. Domain-separated so it cannot double as a session
+// or CSRF key. Rotating the session secret permanently orphans sealed keys
+// created under the old secret (reveal then fails closed — recreate them).
+func DeriveKeyEncryptionKey(sessionSecret string) []byte {
+	sum := sha256.Sum256([]byte("lightcms-apikey-reveal-v1:" + sessionSecret))
+	return sum[:]
+}
+
+// SetEncryptionKey enables sealed storage + reveal for subsequently created
+// keys. Pass nil to disable (show-once behavior, as before).
+func (s *APIKeyService) SetEncryptionKey(key []byte) {
+	if len(key) == 0 {
+		s.encKey = nil
+		return
+	}
+	cp := make([]byte, len(key))
+	copy(cp, key)
+	s.encKey = cp
+}
+
+// sealKey encrypts the raw key with AES-256-GCM (random nonce per key).
+// Returns "" when no encryption key is configured.
+func (s *APIKeyService) sealKey(rawKey string) (string, error) {
+	if len(s.encKey) == 0 {
+		return "", nil
+	}
+	block, err := aes.NewCipher(s.encKey)
+	if err != nil {
+		return "", fmt.Errorf("key cipher init: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("key GCM init: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("key nonce: %w", err)
+	}
+	sealed := gcm.Seal(nonce, nonce, []byte(rawKey), nil)
+	return base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+// openKey decrypts a sealed key. Fails closed on any error (wrong secret
+// after rotation, tampered row, unconfigured key).
+func (s *APIKeyService) openKey(sealed string) (string, error) {
+	if len(s.encKey) == 0 {
+		return "", fmt.Errorf("key reveal is not configured on this server")
+	}
+	raw, err := base64.StdEncoding.DecodeString(sealed)
+	if err != nil {
+		return "", fmt.Errorf("key envelope corrupt: %w", err)
+	}
+	block, err := aes.NewCipher(s.encKey)
+	if err != nil {
+		return "", fmt.Errorf("key cipher init: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("key GCM init: %w", err)
+	}
+	if len(raw) < gcm.NonceSize() {
+		return "", fmt.Errorf("key envelope corrupt: too short")
+	}
+	nonce, ct := raw[:gcm.NonceSize()], raw[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return "", fmt.Errorf("key decrypt failed (wrong server secret or tampered row): %w", err)
+	}
+	return string(plain), nil
 }
 
 // CreateAPIKeyForUser generates a new API key owned by a user, stores its hash, and returns the raw key (shown once)
@@ -63,6 +142,15 @@ func (s *APIKeyService) CreateScopedAPIKey(ctx context.Context, name, descriptio
 		Scopes:      scopes,
 		SandboxOnly: sandboxOnly,
 		CreatedAt:   now,
+	}
+	// Seal a recoverable copy when configured; failures fail the create
+	// loudly rather than silently producing an uncopyable key.
+	if len(s.encKey) > 0 {
+		sealed, serr := s.sealKey(rawKey)
+		if serr != nil {
+			return "", nil, serr
+		}
+		apiKey.KeyCiphertext = sealed
 	}
 
 	id, err := s.db.InsertOne(ctx, "api_keys", apiKey)
@@ -120,6 +208,46 @@ func (s *APIKeyService) DeleteAPIKey(ctx context.Context, id primitive.ObjectID)
 // Returns an error if the key does not exist or belongs to a different user.
 func (s *APIKeyService) DeleteAPIKeyForUser(ctx context.Context, id primitive.ObjectID, ownerID primitive.ObjectID) error {
 	return s.db.DeleteOne(ctx, "api_keys", bson.M{"_id": id, "user_id": ownerID})
+}
+
+// Reveal errors: callers map these to HTTP statuses (404/403/410).
+var (
+	// ErrAPIKeyNotFound is returned when no key matches the ID.
+	ErrAPIKeyNotFound = errors.New("api key not found")
+	// ErrAPIKeyForbidden is returned when the requester owns neither the
+	// key nor an admin role.
+	ErrAPIKeyForbidden = errors.New("not allowed to reveal this api key")
+	// ErrAPIKeyNotRevealable is returned for legacy keys created before
+	// copy support (no sealed copy stored) — they must be recreated.
+	ErrAPIKeyNotRevealable = errors.New("key created before copy support; delete and recreate it to enable copying")
+)
+
+// GetAPIKey loads one key record by ID (never includes the raw key).
+func (s *APIKeyService) GetAPIKey(ctx context.Context, id primitive.ObjectID) (*models.APIKey, error) {
+	var key models.APIKey
+	if err := s.db.FindOne(ctx, "api_keys", bson.M{"_id": id}, &key); err != nil {
+		return nil, ErrAPIKeyNotFound
+	}
+	return &key, nil
+}
+
+// RevealAPIKey decrypts and returns the raw key for the admin copy flow.
+// Only the owning user or an admin may reveal; every other caller gets
+// ErrAPIKeyForbidden. Legacy keys without a sealed copy get
+// ErrAPIKeyNotRevealable. Callers must audit-log successful reveals.
+func (s *APIKeyService) RevealAPIKey(ctx context.Context, id primitive.ObjectID, requestingUserID string, isAdmin bool) (string, error) {
+	key, err := s.GetAPIKey(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	owned := key.UserID != nil && requestingUserID != "" && key.UserID.Hex() == requestingUserID
+	if !owned && !isAdmin {
+		return "", ErrAPIKeyForbidden
+	}
+	if key.KeyCiphertext == "" {
+		return "", ErrAPIKeyNotRevealable
+	}
+	return s.openKey(key.KeyCiphertext)
 }
 
 // ValidateAPIKey checks a raw API key, returns the key record if valid, and updates last_used_at

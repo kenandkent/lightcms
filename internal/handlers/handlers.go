@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"html"
 	"html/template"
@@ -3508,6 +3509,63 @@ func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		"RawKey": rawKey,
 		"APIKey": apiKey,
 	})
+}
+
+// SetAPIKeyEncryptionKey enables sealed storage + reveal on the handler's
+// own API key service (wired once at boot from the session secret).
+func (h *Handler) SetAPIKeyEncryptionKey(key []byte) {
+	if h.apiKeyService != nil {
+		h.apiKeyService.SetEncryptionKey(key)
+	}
+}
+
+// RevealAPIKey returns the raw key value for the admin copy button.
+// Session + CSRF protected (POST-only route). Only the owning user or an
+// admin may reveal; every successful reveal is audit-logged.
+func (h *Handler) RevealAPIKey(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	vars := mux.Vars(r)
+	id, err := primitive.ObjectIDFromHex(vars["id"])
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	isAdmin := user.Role == models.RoleAdmin
+	rawKey, rerr := h.apiKeyService.RevealAPIKey(r.Context(), id, user.ID, isAdmin)
+	if rerr != nil {
+		switch {
+		case stderrors.Is(rerr, services.ErrAPIKeyNotFound):
+			http.Error(w, "API key not found", http.StatusNotFound)
+		case stderrors.Is(rerr, services.ErrAPIKeyForbidden):
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		case stderrors.Is(rerr, services.ErrAPIKeyNotRevealable):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			fmt.Fprint(w, `{"error":"key created before copy support; delete and recreate it to enable copying"}`)
+		default:
+			log.Printf("API key reveal failed for %s: %v", id.Hex(), rerr)
+			http.Error(w, "Reveal failed", http.StatusInternalServerError)
+		}
+		return
+	}
+	if h.auditService != nil {
+		userOID, _ := primitive.ObjectIDFromHex(user.ID)
+		h.auditService.LogAsync(models.AuditLog{
+			UserID:     userOID,
+			UserEmail:  user.Email,
+			Action:     "apikey.reveal",
+			Resource:   "apikey",
+			ResourceID: id.Hex(),
+			IPAddress:  r.RemoteAddr,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprintf(w, `{"key":%q}`, rawKey)
 }
 
 // DeleteAPIKey deletes an API key

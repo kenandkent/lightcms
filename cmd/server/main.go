@@ -330,6 +330,7 @@ func main() {
 	admin.HandleFunc("/api-keys/new", h.NewAPIKeyPage).Methods("GET")
 	admin.HandleFunc("/api-keys/new", h.CreateAPIKey).Methods("POST")
 	admin.HandleFunc("/api-keys/{id}/delete", h.DeleteAPIKey).Methods("POST")
+	admin.HandleFunc("/api-keys/{id}/reveal", h.RevealAPIKey).Methods("POST")
 
 	// Approvals dashboard
 	admin.HandleFunc("/approvals", h.ApprovalsPage).Methods("GET")
@@ -430,6 +431,12 @@ func main() {
 
 	// REST API v1 routes (API key authenticated, JSON only)
 	apiKeyService := services.NewAPIKeyService(db)
+	// Seal API keys for the admin copy/reveal flow (AES-GCM over a
+	// session-secret-derived key). Without this, keys stay show-once-only
+	// and the copy button reports them as legacy.
+	keySeal := services.DeriveKeyEncryptionKey(cfg.SessionSecret)
+	apiKeyService.SetEncryptionKey(keySeal)
+	h.SetAPIKeyEncryptionKey(keySeal)
 	linkCheckerService := services.NewLinkCheckerService(db)
 	maintenanceService := services.NewMaintenanceService(db, linkCheckerService)
 	go maintenanceService.Start(bgCtx)

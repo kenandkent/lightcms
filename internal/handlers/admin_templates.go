@@ -1937,10 +1937,51 @@ var adminTemplates = map[string]string{
                                 </td>
                             </tr>
                             {{end}}
-                        </tbody>
-                    </table>
-                </div>
-                {{else}}
+                </tbody>
+            </table>
+        </div>
+        <script>
+        // Admin API-key copy: reveal-once via the CSRF-protected POST
+        // endpoint, then clipboard. The raw key never appears in page HTML.
+        function copyApiKey(id, btn) {
+            var original = btn.textContent;
+            var done = function (ok) {
+                btn.textContent = ok ? btn.dataset.copied : btn.dataset.failed;
+                setTimeout(function () { btn.textContent = original; }, 1500);
+            };
+            var tokenEl = document.querySelector('input[name="gorilla.csrf.Token"]');
+            var token = tokenEl ? tokenEl.value : '';
+            function finish(text) {
+                var write = function (t) {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        return navigator.clipboard.writeText(t);
+                    }
+                    return new Promise(function (resolve, reject) {
+                        var ta = document.createElement('textarea');
+                        ta.value = t;
+                        document.body.appendChild(ta);
+                        ta.select();
+                        try {
+                            document.execCommand('copy') ? resolve() : reject(new Error('execCommand'));
+                        } catch (e) { reject(e); }
+                        ta.remove();
+                    });
+                };
+                write(text).then(function () { done(true); }, function () { done(false); });
+            }
+            fetch('/cm/api-keys/' + encodeURIComponent(id) + '/reveal', {
+                method: 'POST',
+                headers: {'X-CSRF-Token': token}
+            }).then(function (res) {
+                if (!res.ok) throw new Error('reveal ' + res.status);
+                return res.json();
+            }).then(function (data) {
+                if (!data.key) throw new Error('empty key');
+                finish(data.key);
+            }).catch(function () { done(false); });
+        }
+        </script>
+        {{else}}
                 <p style="color: var(--muted); font-size: 0.9rem;">{{i18n "content_form.no_version_history_yet" "暂无版本历史。" $.Lang}}</p>
                 {{end}}
 
@@ -5505,6 +5546,11 @@ var adminTemplates = map[string]string{
                         <td>{{.CreatedAt.Format "Jan 2, 2006"}}</td>
                         <td>{{if .LastUsedAt}}{{.LastUsedAt.Format "Jan 2, 2006 3:04 PM"}}{{else}}<em>{{i18n "api_keys.never" "从不" $.Lang}}</em>{{end}}</td>
                         <td>
+                            {{if .KeyCiphertext}}
+                            <button type="button" class="btn btn-sm" onclick="copyApiKey('{{.ID.Hex}}', this)" data-copied="{{i18n "api_keys.copied" "已复制" $.Lang}}" data-failed="{{i18n "api_keys.copy_failed" "复制失败，请重试" $.Lang}}">{{i18n "api_keys.copy" "复制" $.Lang}}</button>
+                            {{else}}
+                            <button type="button" class="btn btn-sm" disabled title="{{i18n "api_keys.copy_legacy_hint" "该密钥创建于复制功能上线之前，无法查看原文；删除后重建即可复制" $.Lang}}">{{i18n "api_keys.copy" "复制" $.Lang}}</button>
+                            {{end}}
                             <form method="POST" action="/cm/api-keys/{{.ID.Hex}}/delete" style="display:inline;">
                                 {{$.CSRFField}}
                                 <button type="submit" class="btn btn-danger btn-sm delete-btn" data-message="Are you sure you want to delete the API key '{{.Name}}'? Any integrations using this key will stop working.">{{i18n "form.delete" "删除" $.Lang}}</button>
