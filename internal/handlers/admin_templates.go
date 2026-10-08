@@ -1606,7 +1606,7 @@ var adminTemplates = map[string]string{
             </div>
 
             {{range .Template.Fields}}
-            <div class="form-group">
+            <div class="form-group{{if not .Required}} adv-field adv-collapsed{{end}}">
                 <label for="field_{{.Name}}">{{.Label}}{{if .Required}} *{{end}}</label>
                 {{if .Description}}<p class="help-text">{{.Description}}</p>{{end}}
                 {{if .Example}}<p class="help-text">{{i18n "content_form.example" "示例：" $.Lang}} <code>{{.Example}}</code></p>{{end}}
@@ -1666,7 +1666,33 @@ var adminTemplates = map[string]string{
             </div>
             {{end}}
 
-            <div class="form-section">
+            <style>.adv-collapsed{display:none;}</style>
+            <noscript><style>.adv-collapsed{display:block !important;}</style></noscript>
+            <div class="form-group">
+                <button type="button" class="btn btn-outline" id="adv-toggle" onclick="toggleAdvancedFields()"><span id="adv-toggle-label">{{i18n "content_form.advanced_options" "高级选项" $.Lang}}</span> <span id="adv-toggle-arrow">▸</span></button>
+            </div>
+            <script>
+            var advFieldsOpen = false;
+            function toggleAdvancedFields() {
+                advFieldsOpen = !advFieldsOpen;
+                document.querySelectorAll('.adv-field').forEach(function (el) {
+                    el.classList.toggle('adv-collapsed', !advFieldsOpen);
+                });
+                document.getElementById('adv-toggle-arrow').textContent = advFieldsOpen ? '▾' : '▸';
+            }
+            (function () {
+                function initAdvToggle() {
+                    if (!document.querySelectorAll('.adv-field').length) {
+                        var btn = document.getElementById('adv-toggle');
+                        if (btn) btn.style.display = 'none';
+                    }
+                }
+                if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAdvToggle);
+                else initAdvToggle();
+            }());
+            </script>
+
+            <div class="form-section adv-field adv-collapsed">
                 <h3>{{i18n "content_form.seo_settings" "SEO 设置" $.Lang}}</h3>
                 <div class="form-group">
                     <label for="content_tags">{{i18n "content_form.tags" "标签" $.Lang}}</label>
@@ -1690,7 +1716,7 @@ var adminTemplates = map[string]string{
                 </div>
             </div>
 
-            <div class="form-section">
+            <div class="form-section adv-field adv-collapsed">
                 <h3>{{i18n "content_form.page_settings" "页面设置" $.Lang}}</h3>
                 <div class="form-group checkbox-group">
                     <label class="checkbox-label">

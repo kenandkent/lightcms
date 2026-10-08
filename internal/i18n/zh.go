@@ -441,6 +441,7 @@ var zhDict = map[string]string{
 	// Content editor form.
 	"content_form.add_an_optional_comment_to_describe":  "添加备注，说明本次版本的改动（可选）。",
 	"content_form.add_to_fork_workspace":                "🌿 加入分支工作区",
+	"content_form.advanced_options":                     "高级选项",
 	"content_form.analytics":                            "📊 数据分析",
 	"content_form.auto_generated_from_title":            "根据标题自动生成",
 	"content_form.brief_description_for_search_engines": "给搜索引擎的简短描述（150-160 字）",

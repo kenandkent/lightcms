@@ -132,5 +132,46 @@
       updateProgress();
     }());
   </script>
+<script>
+/* In-app browser notice (iOS): webviews inside messaging/social apps cannot
+   be forced into Safari, so visitors arriving from those apps get a one-tap
+   guide overlay instead. iOS-only; standalone browsers are left alone. */
+(function () {
+ 'use strict';
+ var ua = navigator.userAgent || '';
+ var isIOS = /iPhone|iPad|iPod/i.test(ua) && !window.MSStream;
+ if (!isIOS) return;
+ if (/CriOS|FxiOS|EdgiOS|OPiOS/i.test(ua)) return;
+ /* Out of scope for the overseas edition: domestic apps. NOTE: this must
+    precede the Messenger check — "MicroMessenger" contains "Messenger". */
+ if (/MicroMessenger|WeChat|Weibo|\sQQ\//i.test(ua)) return;
+ var app = '';
+ if (/Telegram/i.test(ua)) app = 'Telegram';
+ else if (/Instagram/i.test(ua)) app = 'Instagram';
+ else if (/Messenger/i.test(ua)) app = 'Messenger';
+ else if (/FBAN|FBIOS/i.test(ua)) app = 'Facebook';
+ else if (/Twitter/i.test(ua)) app = 'X (Twitter)';
+ else if (/LinkedInApp/i.test(ua)) app = 'LinkedIn';
+ else if (/(^| )Line\//i.test(ua)) app = 'LINE';
+ else if (/Snapchat/i.test(ua)) app = 'Snapchat';
+ else if (/Reddit/i.test(ua)) app = 'Reddit';
+ else if (/Pinterest/i.test(ua)) app = 'Pinterest';
+ else if (/TikTok|musical_ly/i.test(ua)) app = 'TikTok';
+ else if (/WhatsApp/i.test(ua)) app = 'WhatsApp';
+ if (!app) return;
+ var tip = document.createElement('div');
+ tip.setAttribute('role', 'dialog');
+ tip.setAttribute('aria-label', 'Open in Safari');
+ tip.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(8,10,16,.88);color:#fff;padding:84px 28px 28px;text-align:center;font:400 17px/2 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
+ tip.innerHTML = '<div style="font-size:15px;letter-spacing:.14em;opacity:.75">VIEWING INSIDE ' + app.toUpperCase() + '</div>' +
+  '<p style="margin:22px 0 26px">For the best experience,<br>tap <b>&#8942;</b> (or Share) and choose<br><b>&ldquo;Open in Safari&rdquo;</b>.</p>' +
+  '<button type="button" style="font:600 16px/1 -apple-system,BlinkMacSystemFont,sans-serif;padding:13px 46px;border-radius:10px;border:0;background:#fff;color:#111;cursor:pointer">Got it</button>';
+ function dismiss() { if (tip.parentNode) tip.parentNode.removeChild(tip); }
+ tip.querySelector('button').addEventListener('click', dismiss);
+ function mount() { if (document.body && !tip.parentNode) document.body.appendChild(tip); }
+ if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);
+ else mount();
+}());
+</script>
 </body>
 </html>

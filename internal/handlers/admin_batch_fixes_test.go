@@ -115,6 +115,49 @@ func TestNewFormRendersFullyWithFields(t *testing.T) {
 	}
 }
 
+// Advanced-options collapse: only required template fields render open;
+// optional fields plus the SEO and page-settings sections start collapsed
+// behind the 高级选项 toggle (required inputs must never hide — native
+// form validation cannot focus a display:none control).
+func TestContentFormAdvancedCollapse(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+	tmplID := seedTemplate(t, h.db, "Collapse Template", "collapse-template")
+	if _, err := h.db.Collection("templates").UpdateOne(context.Background(),
+		bson.M{"_id": tmplID},
+		bson.M{"$set": bson.M{"fields": []bson.M{
+			{"name": "t1", "label": "T1", "type": "text", "required": true},
+			{"name": "t2", "label": "T2", "type": "textarea"},
+			{"name": "t3", "label": "T3", "type": "markdown"},
+		}}}); err != nil {
+		t.Fatalf("seed fields: %v", err)
+	}
+	req := rbacSessionReq(t, "admin", http.MethodGet, "/cm/content/new/"+tmplID.Hex(), nil,
+		map[string]string{"templateID": tmplID.Hex()})
+	rr := httptest.NewRecorder()
+	h.NewContentWithTemplate(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("new page: got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	// 2 optional fields + SEO section + page-settings section collapsed.
+	if n := strings.Count(body, "adv-field adv-collapsed"); n != 4 {
+		t.Fatalf("collapsed blocks = %d, want 4 (2 optional fields + SEO + page settings)", n)
+	}
+	// Required field div carries no collapse class.
+	if i := strings.Index(body, `for="field_t1"`); i < 0 {
+		t.Fatal("required field t1 missing")
+	} else if div := body[strings.LastIndex(body[:i], "<div"):i]; strings.Contains(div, "adv-collapsed") {
+		t.Fatalf("required field must never collapse: %q", div)
+	}
+	// Toggle + submit always visible.
+	for _, want := range []string{`id="adv-toggle"`, "高级选项", "toggleAdvancedFields", `type="submit"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q", want)
+		}
+	}
+}
+
 // M8: the role gate expression must render bare (html/template already
 // quotes in script context) — the printf "%q" double-wrap broke the
 // admin-only comment button the same way CSRF broke before it.

@@ -441,6 +441,7 @@ var enDict = map[string]string{
 	// Content editor form.
 	"content_form.add_an_optional_comment_to_describe":  "Add a note describing this version's changes (optional).",
 	"content_form.add_to_fork_workspace":                "🌿 Add to Fork Workspace",
+	"content_form.advanced_options":                     "Advanced options",
 	"content_form.analytics":                            "📊 Analytics",
 	"content_form.auto_generated_from_title":            "Auto-generated from title",
 	"content_form.brief_description_for_search_engines": "Short description for search engines (150–160 characters)",
