@@ -1,8 +1,8 @@
 # Build → test → deploy to 167.114.210.84.
 #
 # Triggers:
-#   - push to main ............ full pipeline (build, vet, unit tests,
-#                               image build+push, deploy, smoke test)
+#   - push to main ............ quick gate (build+vet) then tests+image in
+#                               PARALLEL, then deploy when both are green
 #   - workflow_dispatch ....... manual redeploy / rollback to any image tag
 #     (set image_tag, e.g. a previous git SHA; build+test are skipped)
 #
@@ -54,10 +54,12 @@ env:
   GO_VERSION: "1.25"
 
 jobs:
-  build-test:
+  # Fast gate (~1-2 min): compile errors fail here instead of burning the
+  # 5-8 min image build or the 4-5 min test suite.
+  quick:
     if: inputs.image_tag == ''
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -71,6 +73,22 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+  # Long poles run in PARALLEL behind the gate; deploy needs both green.
+  # A failure in either blocks deploy (the sibling runs to completion but
+  # deploys nothing — GitHub has no cross-job kill).
+  tests:
+    if: inputs.image_tag == ''
+    needs: quick
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
 
       # Unit tests need a replica-set Mongo (transactions). Single-node
       # rs0 mirrors docker-compose.test.yml.
@@ -127,7 +145,7 @@ jobs:
 
   image:
     if: inputs.image_tag == ''
-    needs: build-test
+    needs: quick
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -176,8 +194,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
-    needs: [build-test, image]
-    if: always() && (needs.build-test.result == 'success' && needs.image.result == 'success' || inputs.image_tag != '')
+    needs: [tests, image]
+    if: always() && (needs.tests.result == 'success' && needs.image.result == 'success' || inputs.image_tag != '')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
