@@ -145,6 +145,7 @@ jobs:
         run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           file: ./Dockerfile
@@ -153,6 +154,22 @@ jobs:
           build-args: GIT_SHA=${{ steps.meta.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # build-push-action failures surface only inside its own step log;
+      # this companion pins the cause next to it and in this job's Error box.
+      - name: Diagnose image build failure
+        if: failure()
+        run: |
+          echo "::error::image build failed for tag ${{ steps.meta.outputs.tag }} — full error is in the 'build-push-action' step log above; runner diagnostics follow"
+          echo "---- builder ----"
+          docker buildx ls 2>&1 | head -10 || true
+          echo "---- disk ----"
+          df -h / /tmp 2>/dev/null || true
+          {
+            echo "## image job: FAILED"
+            echo "tag: ${{ steps.meta.outputs.tag }}"
+            echo "See the build-push-action step log for the buildx error."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     needs: [build-test, image]
@@ -269,3 +286,26 @@ jobs:
             curl -fsS http://127.0.0.1:8082/ -o /dev/null
             curl -s -o /dev/null -w "cm=%{http_code}\n" http://127.0.0.1:8082/cm
             echo "deployed $GH_IMAGE:$IMAGE_TAG"
+
+      # Deploy-step failures hide server-side causes; pull them here so the
+      # Error box and the log name the culprit (stale containers keep
+      # serving — a failed deploy never takes the site down by itself).
+      - name: Dump server diagnostics on failure
+        if: failure()
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lightcms_diag
+          chmod 600 ~/.ssh/lightcms_diag
+          echo "::error::deploy failed for image tag ${{ env.IMAGE_TAG }} — server state follows"
+          ssh -i ~/.ssh/lightcms_diag -o StrictHostKeyChecking=accept-new \
+            root@167.114.210.84 \
+            'cd /opt/lightcms 2>/dev/null && docker compose -f docker-compose.prod.yml ps; echo "---- app logs (tail) ----"; docker compose -f docker-compose.prod.yml logs --tail=80 app 2>&1; echo "---- disk ----"; df -h / | tail -1' || \
+            echo "::error::diagnostics SSH itself failed — check SSH_PRIVATE_KEY / server reachability"
+          rm -f ~/.ssh/lightcms_diag
+          {
+            echo "## deploy job: FAILED"
+            echo "image tag: ${{ env.IMAGE_TAG }}"
+            echo "Server compose state + app log tail are in this step's log."
+          } >> "$GITHUB_STEP_SUMMARY"
