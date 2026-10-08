@@ -37,6 +37,9 @@ on:
 permissions:
   contents: read
   packages: write
+  # Required by docker/build-push-action cache-to/from type=gha: without it
+  # the cache backend 403s and fails the whole image build.
+  actions: write
 
 # A newer push cancels the in-flight run and only the latest proceeds:
 # stale code must never deploy after fresh code. (A deploy step killed
