@@ -1940,47 +1940,6 @@ var adminTemplates = map[string]string{
                 </tbody>
             </table>
         </div>
-        <script>
-        // Admin API-key copy: reveal-once via the CSRF-protected POST
-        // endpoint, then clipboard. The raw key never appears in page HTML.
-        function copyApiKey(id, btn) {
-            var original = btn.textContent;
-            var done = function (ok) {
-                btn.textContent = ok ? btn.dataset.copied : btn.dataset.failed;
-                setTimeout(function () { btn.textContent = original; }, 1500);
-            };
-            var tokenEl = document.querySelector('input[name="gorilla.csrf.Token"]');
-            var token = tokenEl ? tokenEl.value : '';
-            function finish(text) {
-                var write = function (t) {
-                    if (navigator.clipboard && navigator.clipboard.writeText) {
-                        return navigator.clipboard.writeText(t);
-                    }
-                    return new Promise(function (resolve, reject) {
-                        var ta = document.createElement('textarea');
-                        ta.value = t;
-                        document.body.appendChild(ta);
-                        ta.select();
-                        try {
-                            document.execCommand('copy') ? resolve() : reject(new Error('execCommand'));
-                        } catch (e) { reject(e); }
-                        ta.remove();
-                    });
-                };
-                write(text).then(function () { done(true); }, function () { done(false); });
-            }
-            fetch('/cm/api-keys/' + encodeURIComponent(id) + '/reveal', {
-                method: 'POST',
-                headers: {'X-CSRF-Token': token}
-            }).then(function (res) {
-                if (!res.ok) throw new Error('reveal ' + res.status);
-                return res.json();
-            }).then(function (data) {
-                if (!data.key) throw new Error('empty key');
-                finish(data.key);
-            }).catch(function () { done(false); });
-        }
-        </script>
         {{else}}
                 <p style="color: var(--muted); font-size: 0.9rem;">{{i18n "content_form.no_version_history_yet" "暂无版本历史。" $.Lang}}</p>
                 {{end}}
@@ -5561,6 +5520,47 @@ var adminTemplates = map[string]string{
                 </tbody>
             </table>
         </div>
+        <script>
+        // Admin API-key copy: reveal-once via the CSRF-protected POST
+        // endpoint, then clipboard. The raw key never appears in page HTML.
+        function copyApiKey(id, btn) {
+            var original = btn.textContent;
+            var done = function (ok) {
+                btn.textContent = ok ? btn.dataset.copied : btn.dataset.failed;
+                setTimeout(function () { btn.textContent = original; }, 1500);
+            };
+            var tokenEl = document.querySelector('input[name="gorilla.csrf.Token"]');
+            var token = tokenEl ? tokenEl.value : '';
+            function finish(text) {
+                var write = function (t) {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        return navigator.clipboard.writeText(t);
+                    }
+                    return new Promise(function (resolve, reject) {
+                        var ta = document.createElement('textarea');
+                        ta.value = t;
+                        document.body.appendChild(ta);
+                        ta.select();
+                        try {
+                            document.execCommand('copy') ? resolve() : reject(new Error('execCommand'));
+                        } catch (e) { reject(e); }
+                        ta.remove();
+                    });
+                };
+                write(text).then(function () { done(true); }, function () { done(false); });
+            }
+            fetch('/cm/api-keys/' + encodeURIComponent(id) + '/reveal', {
+                method: 'POST',
+                headers: {'X-CSRF-Token': token}
+            }).then(function (res) {
+                if (!res.ok) throw new Error('reveal ' + res.status);
+                return res.json();
+            }).then(function (data) {
+                if (!data.key) throw new Error('empty key');
+                finish(data.key);
+            }).catch(function () { done(false); });
+        }
+        </script>
         {{else}}
         <div class="empty-state">
             <p>{{i18n "api_keys.no_api_keys_yet_create_one_to_enable" "暂无 API 密钥，创建一个以启用编程访问。" $.Lang}}</p>

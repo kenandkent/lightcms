@@ -123,6 +123,9 @@ func TestAPIKeysPageCopyButtons(t *testing.T) {
 	if !strings.Contains(body, "copyApiKey(") {
 		t.Fatal("keys page must wire the copy button handler")
 	}
+	if !strings.Contains(body, "function copyApiKey(id, btn)") {
+		t.Fatal("keys page must define copyApiKey (not just call it)")
+	}
 	// Exactly one enabled copy button (wired) + one disabled (legacy).
 	if n := strings.Count(body, "disabled title="); n != 1 {
 		t.Fatalf("disabled legacy copy buttons = %d, want 1", n)
