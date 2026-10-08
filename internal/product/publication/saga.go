@@ -322,6 +322,14 @@ func requirePublishableTemplate(tv templatecontract.TemplateVersion) error {
 type cutoverPlan struct {
 	contentID      primitive.ObjectID
 	fullPath       string
+	// canonicalPath is the pathkey-canonical (lowercased, NFC-normalized)
+	// form of fullPath and the ONLY path ever handed to the file store.
+	// FullPath keeps the author's casing for DB records, URLs and audits;
+	// the store contract requires already-canonical paths, and on a
+	// case-sensitive filesystem the two directories differ (on macOS they
+	// alias, which masked this until CI). Set from the canonical the
+	// caller already computed for the DB key.
+	canonicalPath  string
 	contentVersion int64
 	tv             templatecontract.TemplateVersion
 	oldActive      *Publication
@@ -452,7 +460,7 @@ func (s *Service) buildPublishPlan(ctx context.Context, req PublishRequest, cont
 		return nil, err
 	}
 
-	publicURL, err := s.resolvePublicURL(content.FullPath)
+	publicURL, err := s.resolvePublicURL(canonical)
 	if err != nil {
 		return nil, err
 	}
@@ -470,7 +478,7 @@ func (s *Service) buildPublishPlan(ctx context.Context, req PublishRequest, cont
 	html := ro.html
 
 	plan := &cutoverPlan{
-		contentID: req.ContentID, fullPath: content.FullPath, contentVersion: cv, tv: tv,
+		contentID: req.ContentID, fullPath: content.FullPath, canonicalPath: canonical, contentVersion: cv, tv: tv,
 		oldActive: oldActive, pubID: pubID, logicalAt: logicalAt, publicURL: publicURL,
 		html: html, verification: VerificationVerified,
 		snapshot:        map[string]any{"template_render_hash": tv.RenderHash},
@@ -534,7 +542,7 @@ func (s *Service) buildRollbackPlan(ctx context.Context, req RollbackRequest, co
 	if err != nil {
 		return nil, err
 	}
-	publicURL, err := s.resolvePublicURL(content.FullPath)
+	publicURL, err := s.resolvePublicURL(canonical)
 	if err != nil {
 		return nil, err
 	}
@@ -546,7 +554,7 @@ func (s *Service) buildRollbackPlan(ctx context.Context, req RollbackRequest, co
 	}
 
 	plan := &cutoverPlan{
-		contentID: req.ContentID, fullPath: content.FullPath, contentVersion: source.ContentVersion,
+		contentID: req.ContentID, fullPath: content.FullPath, canonicalPath: canonical, contentVersion: source.ContentVersion,
 		oldActive: oldActive, pubID: pubID, logicalAt: logicalAt, publicURL: publicURL,
 		html: html, verification: verification, snapshot: snapshot,
 		rendererVersion: rendVer, renderDepsHash: depsHash, depSnapshot: depSnap,
@@ -698,13 +706,18 @@ func (s *Service) markTerminal(ctx context.Context, opID *primitive.ObjectID, at
 	_, _ = s.idem.MarkTerminal(ctx, *opID, attempt, code)
 }
 
-func (s *Service) resolvePublicURL(fullPath string) (string, error) {
+// resolvePublicURL builds the public URL from the pathkey-canonical path
+// (lowercased): the resolver preserves casing verbatim, so passing the
+// authored FullPath would mint an URL with no canonical file behind it on a
+// case-sensitive filesystem. Callers pass the canonical they already
+// computed for the DB key.
+func (s *Service) resolvePublicURL(canonical string) (string, error) {
 	if s.urls == nil {
-		return fullPath, nil
+		return canonical, nil
 	}
-	u, err := s.urls.Resolve(fullPath)
+	u, err := s.urls.Resolve(canonical)
 	if err != nil {
-		return "", sagaErr(CodePublicURLFailed, "resolve public URL for "+fullPath, err)
+		return "", sagaErr(CodePublicURLFailed, "resolve public URL for "+canonical, err)
 	}
 	return u.String(), nil
 }
@@ -787,7 +800,7 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 	}
 	staged, err := s.store.Stage(ctx, storage.StageRequest{
 		ContentID: plan.contentID, PublicationID: plan.pubID,
-		CanonicalPath: plan.fullPath, HTML: plan.html, ExpectedSHA256: plan.rawHash,
+		CanonicalPath: plan.canonicalPath, HTML: plan.html, ExpectedSHA256: plan.rawHash,
 	})
 	if oerr := owned(); oerr != nil {
 		return fail(CodePagePublishInProgress, "lease lost during stage; recovery owns staged remnants", oerr)
@@ -828,7 +841,7 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		oldID = &id
 	}
 	if plan.renamed {
-		if exists, eerr := s.store.Exists(ctx, plan.fullPath); eerr != nil {
+		if exists, eerr := s.store.Exists(ctx, plan.canonicalPath); eerr != nil {
 			return s.failCutover(ctx, plan, staged, CodeActivateFailed, "check rename target", eerr)
 		} else if exists {
 			return s.failCutover(ctx, plan, staged, CodePathConflict,
@@ -839,9 +852,9 @@ func (s *Service) executeCutoverPlan(ctx context.Context, plan *cutoverPlan) (Pu
 		return fail(CodePagePublishInProgress, "lease lost before cutover", err)
 	}
 	if oldID == nil {
-		err = s.store.Activate(ctx, staged, plan.fullPath)
+		err = s.store.Activate(ctx, staged, plan.canonicalPath)
 	} else {
-		err = s.store.ActivateWithPrevious(ctx, staged, plan.fullPath, oldID)
+		err = s.store.ActivateWithPrevious(ctx, staged, plan.canonicalPath, oldID)
 	}
 	if err != nil {
 		if oerr := owned(); oerr != nil {
@@ -955,7 +968,7 @@ func (s *Service) compensateCutover(ctx context.Context, plan *cutoverPlan, stag
 	if oldID == nil {
 		// First publish: no previous file exists; remove the uncommitted
 		// canonical only if it still carries our bytes.
-		info, err := s.store.Inspect(ctx, plan.fullPath)
+		info, err := s.store.Inspect(ctx, plan.canonicalPath)
 		if err != nil {
 			return err
 		}
@@ -966,9 +979,9 @@ func (s *Service) compensateCutover(ctx context.Context, plan *cutoverPlan, stag
 			return sagaErr(storage.CodeConflict,
 				"canonical no longer carries the new bytes; refusing compensation", nil)
 		}
-		return s.store.Delete(ctx, plan.fullPath)
+		return s.store.Delete(ctx, plan.canonicalPath)
 	}
-	return s.store.CompensateActivate(ctx, staged, plan.fullPath, oldID)
+	return s.store.CompensateActivate(ctx, staged, plan.canonicalPath, oldID)
 }
 
 // finishCommit runs the post-commit steps: confirm away .previous, finalize a
@@ -977,7 +990,7 @@ func (s *Service) compensateCutover(ctx context.Context, plan *cutoverPlan, stag
 func (s *Service) finishCommit(ctx context.Context, plan *cutoverPlan, oldID *primitive.ObjectID) (PublicationResult, error) {
 	if oldID != nil {
 		// Post-commit cleanup; leftovers are scanner-convergent, never fatal.
-		_ = s.store.ConfirmActivate(ctx, plan.fullPath, *oldID)
+		_ = s.store.ConfirmActivate(ctx, plan.canonicalPath, *oldID)
 	}
 	if plan.renamed {
 		if rerr := s.upsertRedirect(ctx, plan.oldPath, plan.fullPath); rerr != nil {
@@ -989,7 +1002,14 @@ func (s *Service) finishCommit(ctx context.Context, plan *cutoverPlan, oldID *pr
 			return PublicationResult{}, sagaErr(CodeRedirectFailed,
 				"page is live at "+plan.fullPath+" but the redirect from "+plan.oldPath+" was not recorded; retry redirect creation", rerr)
 		}
-		_ = s.store.Delete(ctx, plan.oldPath) // scanner quarantines leftovers.
+		// Retire the old canonical file. Canonicalize first: the retired
+		// file lives at the lowercased path even when authored as /Old/Path
+		// (on a case-sensitive filesystem the raw path misses).
+		oldCanon, oerr := pathkey.Canonical(plan.oldPath)
+		if oerr != nil {
+			oldCanon = plan.oldPath
+		}
+		_ = s.store.Delete(ctx, oldCanon) // scanner quarantines leftovers.
 		s.bestEffortPurge(ctx, []string{plan.oldPath, plan.fullPath})
 	} else {
 		s.bestEffortPurge(ctx, []string{plan.fullPath})

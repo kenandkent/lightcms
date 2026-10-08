@@ -87,23 +87,15 @@ jobs:
         env:
           MONGODB_URI: mongodb://127.0.0.1:27017/lightcms-test?replicaSet=rs0&directConnection=true
         run: |
-          # Stream to the step log AND keep a copy: on failure the next
-          # step greps this file so the culprits are visible without
-          # scrolling, and the full log is uploaded as an artifact.
+          # Stream to the step log AND keep a copy: on failure the culprits
+          # print at the tail (no scrolling) and as ::error:: annotations,
+          # which is what populates this step's "Error" section (annotations
+          # emitted by any other step show up under that step instead).
           go test -p 1 ./... -count=1 2>&1 | tee unit-tests.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             echo "---- failing tests/packages (full log: unit-tests.log artifact) ----"
             grep -E '^(--- FAIL|FAIL[[:space:]]|panic:)' unit-tests.log | head -40 || true
-          fi
-          exit "$status"
-
-      # Fills the job's "Error" section (empty otherwise: GitHub only shows
-      # ::error:: annotations there, and go test output has none by default).
-      - name: Annotate test failures
-        if: failure()
-        run: |
-          if [ -f unit-tests.log ]; then
             python3 - <<'EOF'
           import re
           seen = set()
@@ -119,9 +111,8 @@ jobs:
                       seen.add(m.group(1))
                       print(f"::error::test FAILED: {m.group(1)}")
           EOF
-          else
-            echo "::error::unit-tests.log missing — the test step never produced output"
           fi
+          exit "$status"
 
       - name: Upload full test log
         if: failure()
