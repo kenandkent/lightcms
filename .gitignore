@@ -60,3 +60,7 @@ dist/
 *.out
 go.work
 VIBECTL.md
+---
+# Python bytecode (generator side-effects)
+__pycache__/
+*.pyc
