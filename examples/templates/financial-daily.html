@@ -58,10 +58,12 @@
 {{if .publisher_name_zh}}<template id="zh-publisher">{{.publisher_name_zh}}</template>{{end}}
 {{if .publisher_name}}<template id="custom-publisher">{{.publisher_name}}</template>{{end}}
 <script>
-(function () {
+ (function () {
  'use strict';
- var preferred = (navigator.languages && navigator.languages[0]) || navigator.language || 'en';
- var isChinese = /^zh(?:-|$)/i.test(preferred);
+ /* English default for overseas readers: Chinese article data and UI
+    strings stay stored but are never auto-selected. (Add an explicit UI
+    toggle if manual language switching is ever needed.) */
+ var isChinese = false;
  var messages = {"en": {"loading": "Loading report", "skip": "Skip to article", "masthead": "Markets / Policy / Business", "edition": "MARKETS & ECONOMY", "format": "Financial report", "by": "By", "published": "Published", "copy": "Copy article link", "top": "Back to top", "contents": "In this report", "note_title": "Reader's note", "reader_note": "Read the scope, supporting evidence and limitations before drawing conclusions. This report is not investment advice.", "brand_note": "An independent publishing layout. Publisher identity is supplied by the content owner.", "footer_note": "For information only. Check original sources.", "publisher": "Market Journal", "reading": "{minutes} min read", "copied": "Link copied", "copy_failed": "Could not copy. Use the address bar."}, "zh": {"loading": "正在加载报告", "skip": "跳转到正文", "masthead": "市场 / 政策 / 商业", "edition": "市场与经济", "format": "财经报道", "by": "作者", "published": "发布于", "copy": "复制文章链接", "top": "返回顶部", "contents": "报告目录", "note_title": "阅读提示", "reader_note": "形成结论前，请阅读分析范围、支持证据与局限。 本报告不构成投资建议。", "brand_note": "独立出版版式；发布者身份由内容所有者提供。", "footer_note": "内容仅供参考，请核对原始来源。", "publisher": "市场日报", "reading": "阅读约 {minutes} 分钟", "copied": "链接已复制", "copy_failed": "复制失败，请使用地址栏。"}};
  var t = isChinese ? messages.zh : messages.en;
  document.documentElement.lang = isChinese ? 'zh-CN' : 'en';

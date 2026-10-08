@@ -106,8 +106,9 @@
   </div>
   <script>
     (function () {
-      var preferredLanguage = (navigator.languages && navigator.languages[0]) || navigator.language || 'en';
-      var language = /^zh(?:-|$)/i.test(preferredLanguage) ? 'zh-CN' : 'en';
+      /* English default for overseas readers: Chinese strings stay stored
+         but are never auto-selected. */
+      var language = 'en';
       var translations = {
         en: { loading:'Loading', site_name:'Chain Lens', skip_link:'Skip to article', header_note:'Crypto market analysis · Independent perspective', author_label:'By', published_label:'Published', copy_link:'Copy article link', back_to_top:'Back to top', reading_tip:'Reading note', risk_note:'This article discusses market information and analytical frameworks, not investment advice. Crypto assets are volatile; make decisions based on your own risk tolerance.', method_note:'Our analysis examines sources, market structure, and risk. Short-term price forecasts are no substitute for verified facts.', footer_about:'Chain Lens · Crypto markets and digital assets', footer_disclaimer:'For information only. Not investment advice.', copied:'Link copied', copy_failed:'Could not copy. Use the address bar.' },
         zh: { loading:'加载中', site_name:'链上观察', skip_link:'跳转到正文', header_note:'加密市场分析 · 保持独立判断', author_label:'作者', published_label:'发布时间', copy_link:'复制文章链接', back_to_top:'返回顶部', reading_tip:'阅读提示', risk_note:'本文讨论市场信息与分析框架，并非投资建议。加密资产波动较大，请结合自身风险承受能力独立判断。', method_note:'分析关注信息来源、市场结构与风险边界，不以短期价格预测代替事实核查。', footer_about:'链上观察 · 聚焦加密市场与数字资产', footer_disclaimer:'内容仅供参考，不构成投资建议。', copied:'链接已复制', copy_failed:'复制失败，请使用地址栏' }

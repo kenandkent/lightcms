@@ -40,7 +40,7 @@ All eight layouts use the same data contract. Unknown fields are rejected by the
 | `summary` | textarea | Yes | English introduction and social description |
 | `body` | markdown | Yes | English Markdown body; tables, lists, links and headings supported |
 | `author`, `category` | text | Yes | Author identity and English category |
-| `headline_zh`, `category_zh` | text | No | Chinese text overrides for Chinese browsers |
+| `headline_zh`, `category_zh` | text | No | Stored Chinese overrides (not auto-selected; English renders by default) |
 | `summary_zh` | textarea | No | Chinese introduction |
 | `body_zh` | markdown | No | Chinese Markdown body |
 | `publisher_name`, `publisher_name_zh` | text | No | Actual publisher identity; generic style name if omitted |
@@ -56,9 +56,12 @@ Field `label` values are also Chinese. For example, `headline` is displayed as â
 
 ## Language and initial loading
 
-The initial HTML and social metadata are English. The first preferred browser language (`navigator.languages[0]`, then `navigator.language`) selects Chinese for `zh`, `zh-CN`, `zh-TW`, `zh-HK`, etc. All other languages fall back to English; an English-first preference remains English even when Chinese appears second.
-
-Fixed interface labels have built-in English/Chinese translations. Article values are **not machine-translated**. Chinese headline, summary, category and body are individually substituted only when corresponding fields are provided; otherwise that field stays English. A custom English publisher name stays unchanged unless its Chinese counterpart is supplied. Author names are content values, not translated UI labels.
+The initial HTML and social metadata are English, and English is the runtime
+default for every browser: the page never auto-switches to Chinese regardless
+of `navigator.language`. Chinese article/interface strings stay stored in the
+`*_zh` fields and message dictionaries but are inert until an explicit UI
+language toggle is added. Article values are **not machine-translated**;
+author names are content values, not translated UI labels.
 
 The page remains hidden for a minimum 500 ms after its CSS animation starts. A loading screen is shown during that interval. This is a presentation delay, not deferred network loading: the article and metadata are already delivered in the response. Reduced-motion users retain the delay without the moving indicator. With JavaScript disabled, CSS still reveals the English article after 500 ms and hides nonfunctional action buttons. Printing bypasses the loading screen.
 
@@ -105,6 +108,6 @@ Browser checks use an installed Playwright package (set `PLAYWRIGHT_MODULE` to i
 TMPDIR="$PWD/bin" node examples/templates/verify-report-templates.cjs
 ```
 
-Checks cover all eight styles: desktop English, mobile Chinese, unsupported-language English fallback, minimum loading delay with reduced motion, missing-Chinese-content fallback, server-rendered English metadata, unique table-of-contents links, copy feedback, no horizontal viewport overflow and no-JavaScript article access. Screenshots and the browser result file stay in ignored `bin/template-previews/`.
+Checks cover all eight styles: desktop English, mobile English (incl. zh-CN locale), unsupported-language English fallback, minimum loading delay with reduced motion, missing-Chinese-content fallback, server-rendered English metadata, unique table-of-contents links, copy feedback, no horizontal viewport overflow and no-JavaScript article access. Screenshots and the browser result file stay in ignored `bin/template-previews/`.
 
 Assets can be regenerated with `generate-report-assets.py` using Python/Pillow; its font paths currently target macOS Arial. The committed PNG/SVG files are the deployment assets, so normal use requires neither Python nor Pillow.

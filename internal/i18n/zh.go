@@ -862,6 +862,8 @@ var zhDict = map[string]string{
 	"security.you_are_using_the_default_password_p": "你正在使用默认密码，请立即修改以保障站点安全。",
 
 	// Public site layout.
+	"site.error_404_back": "返回首页",
+	"site.error_404_msg":  "页面未找到",
 	"site.footer_powered": "由 LightCMS 驱动",
 	"site.lang_en":        "EN",
 	"site.lang_zh":        "中文",

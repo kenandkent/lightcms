@@ -38,11 +38,11 @@ async function serveFixtures(context) {
     assert(timing.initiallyHidden,slug+': content appeared before the loading delay');
     assert.equal(timing.delay,500);
     assert(timing.loaderHidden);
-    assert.equal(await page.locator('html').getAttribute('lang'),locale==='zh-CN'?'zh-CN':'en');
-    assert.equal(await page.locator('#headline').textContent(),locale==='zh-CN'?'更清晰地观察下一个市场周期':'A clearer view of the next market cycle');
+    assert.equal(await page.locator('html').getAttribute('lang'),'en');
+    assert.equal(await page.locator('#headline').textContent(),'A clearer view of the next market cycle');
     assert.equal(await page.locator('meta[property="og:title"]').getAttribute('content'),'A clearer view of the next market cycle');
     assert(await page.locator('#toc a').count() >= 4);
-    if(locale!=='zh-CN') assert.equal(await page.locator('#executive-summary').count(),1,'existing article fragment anchors must survive TOC construction');
+    assert.equal(await page.locator('#executive-summary').count(),1,'existing article fragment anchors must survive TOC construction');
     const links = await page.locator('#toc a').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('href')));
     assert.equal(new Set(links).size,links.length);
     for(const link of links) assert.equal(await page.locator(link).count(),1);
@@ -64,7 +64,7 @@ async function serveFixtures(context) {
    await page.waitForTimeout(550);
    assert.equal(await page.locator('#headline').textContent(),'A clearer view of the next market cycle');
    assert.equal(await page.locator('#article-content').getAttribute('lang'),'en');
-   assert.equal(await page.locator('#copy-link').textContent(),'复制文章链接');
+   assert.equal(await page.locator('#copy-link').textContent(),'Copy article link');
    await fallback.close();
    // CSS alone releases content; JavaScript being disabled must not trap readers.
    const noJS = await browser.newContext({javaScriptEnabled:false,viewport:{width:390,height:844}});

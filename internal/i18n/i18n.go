@@ -63,6 +63,28 @@ func LangFromRequest(r *http.Request) string {
 	return LangZh
 }
 
+// PublicLangFromRequest resolves the storefront language with the
+// following precedence: ?lang=zh|en > cookie lc_lang > default en.
+// Unlike LangFromRequest it never sniffs Accept-Language and never
+// defaults to Chinese — the public site is English-first for overseas
+// readers (article templates render English by default; see
+// examples/templates). Explicit choices (?lang= / cookie) are still
+// honored, and the admin console keeps its own default via
+// LangFromRequest.
+func PublicLangFromRequest(r *http.Request) string {
+	if r != nil {
+		if q := normalize(r.URL.Query().Get("lang")); q != "" {
+			return q
+		}
+		if c, err := r.Cookie(CookieName); err == nil {
+			if v := normalize(c.Value); v != "" {
+				return v
+			}
+		}
+	}
+	return LangEn
+}
+
 // SetLang persists the language preference in a long-lived cookie (Path=/).
 // Unsupported values fall back to the default language.
 func SetLang(w http.ResponseWriter, lang string) {

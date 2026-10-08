@@ -4110,7 +4110,9 @@ func (h *Handler) serve404(w http.ResponseWriter, r *http.Request, theme *databa
 	// Fallback to simple 404 (chrome strings resolved server-side: this
 	// content fragment is injected via {{.Content}} so template funcs
 	// cannot reach it; authored DB 404 pages are untouched).
-	lang := i18n.LangFromRequest(r)
+	// Public default is English (overseas readers); explicit ?lang=/cookie
+	// choices are still honored.
+	lang := i18n.PublicLangFromRequest(r)
 	h.renderPublicWithOptions(w, r, theme, `<div style="text-align:center;padding:4rem"><h1>404</h1><p>`+template.HTMLEscapeString(i18n.T("site.error_404_msg", "页面未找到", lang))+`</p><p><a href="/\">`+template.HTMLEscapeString(i18n.T("site.error_404_back", "返回首页", lang))+`</a></p></div>`, true, true)
 }
 
@@ -4234,7 +4236,7 @@ func (h *Handler) renderPublicWithSEO(w http.ResponseWriter, r *http.Request, th
 		"Content":         template.HTML(content),
 		"UseHeader":       useHeader,
 		"UseFooter":       useFooter,
-		"Lang":            i18n.LangFromRequest(r),
+		"Lang":            i18n.PublicLangFromRequest(r),
 		"HeadHTML":        template.HTML(theme.HeadHTML),
 		"HeaderHTML":      template.HTML(theme.HeaderHTML),
 		"FooterHTML":      template.HTML(theme.FooterHTML),

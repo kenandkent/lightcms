@@ -862,6 +862,8 @@ var enDict = map[string]string{
 	"security.you_are_using_the_default_password_p": "You are using the default password. Change it now to keep your site secure.",
 
 	// Public site layout.
+	"site.error_404_back": "Back to homepage",
+	"site.error_404_msg":  "Page not found",
 	"site.footer_powered": "Powered by LightCMS",
 	"site.lang_en":        "EN",
 	"site.lang_zh":        "中文",

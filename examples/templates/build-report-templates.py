@@ -104,10 +104,12 @@ HTML = r'''<!doctype html>
 {{if .publisher_name_zh}}<template id="zh-publisher">{{.publisher_name_zh}}</template>{{end}}
 {{if .publisher_name}}<template id="custom-publisher">{{.publisher_name}}</template>{{end}}
 <script>
-(function () {
+ (function () {
  'use strict';
- var preferred = (navigator.languages && navigator.languages[0]) || navigator.language || 'en';
- var isChinese = /^zh(?:-|$)/i.test(preferred);
+ /* English default for overseas readers: Chinese article data and UI
+    strings stay stored but are never auto-selected. (Add an explicit UI
+    toggle if manual language switching is ever needed.) */
+ var isChinese = false;
  var messages = @@MESSAGES@@;
  var t = isChinese ? messages.zh : messages.en;
  document.documentElement.lang = isChinese ? 'zh-CN' : 'en';

@@ -88,6 +88,37 @@ func TestT_Fallback(t *testing.T) {
 	}
 }
 
+func TestPublicLangFromRequest_DefaultsEnglish(t *testing.T) {
+	// Explicit ?lang= wins (either language).
+	r := httptest.NewRequest("GET", "/?lang=zh", nil)
+	r.Header.Set("Accept-Language", "en-US")
+	if got := PublicLangFromRequest(r); got != LangZh {
+		t.Fatalf("explicit zh: got %q, want zh", got)
+	}
+	// Cookie honored.
+	r = httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(&http.Cookie{Name: CookieName, Value: "zh"})
+	r.Header.Set("Accept-Language", "en-US")
+	if got := PublicLangFromRequest(r); got != LangZh {
+		t.Fatalf("cookie zh: got %q, want zh", got)
+	}
+	// Accept-Language sniffing is OFF on the public site: zh browsers get
+	// English unless they explicitly chose Chinese.
+	r = httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	if got := PublicLangFromRequest(r); got != LangEn {
+		t.Fatalf("zh Accept-Language: got %q, want en (English default)", got)
+	}
+	// No signals at all: English (LangFromRequest would say zh here).
+	r = httptest.NewRequest("GET", "/", nil)
+	if got := PublicLangFromRequest(r); got != LangEn {
+		t.Fatalf("bare request: got %q, want en", got)
+	}
+	if got := LangFromRequest(r); got != LangZh {
+		t.Fatalf("admin default must stay zh, got %q", got)
+	}
+}
+
 func TestDicts_Parity(t *testing.T) {
 	for k := range zhDict {
 		if _, ok := enDict[k]; !ok {
