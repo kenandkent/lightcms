@@ -1,0 +1,223 @@
+# Build → test → deploy to 167.114.210.84.
+#
+# Triggers:
+#   - push to main ............ full pipeline (build, vet, unit tests,
+#                               image build+push, deploy, smoke test)
+#   - workflow_dispatch ....... manual redeploy / rollback to any image tag
+#     (set image_tag, e.g. a previous git SHA; build+test are skipped)
+#
+# Required GitHub Secrets (repo Settings → Secrets and variables → Actions):
+#   SSH_PRIVATE_KEY .... deploy ed25519 private key (pub installed in
+#                        root@167.114.210.84:~/.ssh/authorized_keys)
+#   PROD_BASE_URL ...... public origin, MUST be https (R12 fail-fasts
+#                        otherwise), e.g. https://news.example.com
+#   PROD_SESSION_SECRET  32+ chars server secret (rotation orphans sealed
+#                        API keys — they must then be recreated)
+# Optional (empty = feature disabled, deploy still proceeds):
+#   ANTHROPIC_API_KEY .. admin copilot + chat answer synthesis
+#   RESEND_API_KEY ..... CMS Agent digest email (needs EMAIL_FROM too)
+#   EMAIL_FROM ......... sender address for digests
+#
+# No other setup is needed on first run: the deploy step creates
+# /opt/lightcms, writes docker-compose.prod.yml + .env from this repo and
+# the secrets above, pulls, migrates (boot-time guards), and switches.
+
+name: build-test-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Redeploy an existing image tag (rollback); empty = build from this commit"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+# Deploys queue behind each other; never cancel a deploy in flight.
+concurrency:
+  group: prod-deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/kenandkent/lightcms
+  GO_VERSION: "1.25"
+
+jobs:
+  build-test:
+    if: inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build all binaries
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Unit tests need a replica-set Mongo (transactions). Single-node
+      # rs0 mirrors docker-compose.test.yml.
+      - name: Start MongoDB replica set
+        run: |
+          docker run -d --name mongo-ci -p 27017:27017 mongo:7.0.14 \
+            --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            if docker exec mongo-ci mongosh --quiet --eval 'try { rs.status().ok } catch(e) { rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]}); 1 }' 2>/dev/null | grep -q 1; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec mongo-ci mongosh --quiet --eval 'rs.status().ok'
+
+      - name: Unit tests (full suite, single package at a time)
+        env:
+          MONGODB_URI: mongodb://127.0.0.1:27017/lightcms-test?replicaSet=rs0&directConnection=true
+        run: go test -p 1 ./... -count=1
+
+  image:
+    if: inputs.image_tag == ''
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }},${{ env.IMAGE_NAME }}:latest
+          build-args: GIT_SHA=${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [build-test, image]
+    if: always() && (needs.build-test.result == 'success' && needs.image.result == 'success' || inputs.image_tag != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || needs.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate release inputs
+        env:
+          PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
+        run: |
+          if [ -z "$PROD_BASE_URL" ]; then
+            echo "::error::PROD_BASE_URL secret is empty — set the public https origin first."
+            exit 1
+          fi
+          case "$PROD_BASE_URL" in
+            https://*) ;;
+            *) echo "::error::PROD_BASE_URL must be https (got $PROD_BASE_URL) — the server fail-fasts otherwise (R12)."; exit 1 ;;
+          esac
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "::error::SSH_PRIVATE_KEY secret is empty."
+            exit 1
+          fi
+          if [ -z "${{ secrets.PROD_SESSION_SECRET }}" ]; then
+            echo "::error::PROD_SESSION_SECRET secret is empty (32+ chars)."
+            exit 1
+          fi
+
+      - name: Sync compose file to server
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lightcms_deploy
+          chmod 600 ~/.ssh/lightcms_deploy
+          ssh -i ~/.ssh/lightcms_deploy -o StrictHostKeyChecking=accept-new \
+            root@167.114.210.84 'mkdir -p /opt/lightcms/backups'
+          scp -i ~/.ssh/lightcms_deploy -o StrictHostKeyChecking=accept-new \
+            docker-compose.prod.yml root@167.114.210.84:/opt/lightcms/docker-compose.prod.yml
+          rm -f ~/.ssh/lightcms_deploy
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
+          PROD_SESSION_SECRET: ${{ secrets.PROD_SESSION_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          GH_IMAGE: ${{ env.IMAGE_NAME }}
+        with:
+          host: 167.114.210.84
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 15m
+          envs: IMAGE_TAG,PROD_BASE_URL,PROD_SESSION_SECRET,ANTHROPIC_API_KEY,RESEND_API_KEY,EMAIL_FROM,GH_IMAGE
+          script: |
+            set -euo pipefail
+            mkdir -p /opt/lightcms/backups
+            cd /opt/lightcms
+            # --- .env from secrets (server holds no bespoke files; the
+            # compose file itself was synced by the previous step) ---
+            cat > .env <<ENV_EOF
+            MONGO_URI=mongodb://mongo:27017/lightcms?replicaSet=rs0
+            SESSION_SECRET=${PROD_SESSION_SECRET}
+            BASE_URL=${PROD_BASE_URL}
+            PUBLIC_BASE_URL=${PROD_BASE_URL}
+            ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+            RESEND_API_KEY=${RESEND_API_KEY:-}
+            EMAIL_FROM=${EMAIL_FROM:-}
+            ENV_EOF
+            chmod 600 .env
+            # --- safety backup (best effort, never blocks the deploy) ---
+            if docker compose -f docker-compose.prod.yml ps --status running 2>/dev/null | grep -q lightcms-mongo; then
+              TS=$(date +%Y%m%d-%H%M%S)
+              docker compose -f docker-compose.prod.yml exec -T mongo \
+                mongodump --out /dump/"$TS" >/dev/null 2>&1 || echo "backup skipped/failed (continuing)"
+              ls -dt /opt/lightcms/backups/*/ 2>/dev/null | tail -n +8 | xargs -r rm -rf
+              echo "backup step done"
+            else
+              echo "no running mongo yet — first boot, skipping backup"
+            fi
+            # --- switch ---
+            echo "$GH_IMAGE:$IMAGE_TAG" > .image_tag
+            IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.prod.yml pull app
+            IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            # --- health gate (fail the job if the app never becomes healthy) ---
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8082/health >/dev/null 2>&1; then
+                echo "health OK"
+                break
+              fi
+              if [ "$i" = "30" ]; then
+                echo "health check failed; recent logs:"
+                docker compose -f docker-compose.prod.yml logs --tail=50 app || true
+                exit 1
+              fi
+              sleep 5
+            done
+            # --- smoke test ---
+            curl -fsS http://127.0.0.1:8082/ -o /dev/null
+            curl -s -o /dev/null -w "cm=%{http_code}\n" http://127.0.0.1:8082/cm
+            echo "deployed $GH_IMAGE:$IMAGE_TAG"

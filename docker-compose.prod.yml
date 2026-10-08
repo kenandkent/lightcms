@@ -1,0 +1,106 @@
+# LightCMS production stack for 167.114.210.84 (single instance, R10).
+#
+# Port audit (2026-10-08, verified via ss on the box — never add bindings
+# without re-checking):
+#   - app: host 8082 -> container 8082 (both free; project default port)
+#   - mongo: NO published ports (compose-network only, zero conflict surface)
+#   - 80/443 untouched (box nginx owns the web front; see
+#     deploy/nginx-lightcms.conf.example for the proxy block)
+#
+# Usage (first boot and every redeploy is the same command; data volumes
+# persist across deploys):
+#   IMAGE_TAG=<git-sha> docker compose -f docker-compose.prod.yml up -d
+#
+# Mongo must be a replica set (single-node rs0 is enough): the server
+# fail-fasts on standalone Mongo, and transactions require it.
+
+services:
+  mongo:
+    image: mongo:7.0.14
+    container_name: lightcms-mongo
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    volumes:
+      - mongo-data:/data/db
+      - ./backups:/dump
+    # NOTE: no "ports:" section on purpose — database is reachable only
+    # from the app container on this compose network.
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot replica-set initiator (idempotent across restarts).
+  mongo-init:
+    image: mongo:7.0.14
+    depends_on:
+      mongo:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        for i in $$(seq 1 30); do
+          if mongosh --host mongo --quiet --eval '
+            try {
+              const st = rs.status();
+              if (st.ok === 1) { print("RS already initialized"); quit(0); }
+              quit(1);
+            } catch (e) {
+              const cfg = { _id: "rs0", members: [{ _id: 0, host: "mongo:27017" }] };
+              rs.initiate(cfg);
+              print("RS initiate issued");
+              quit(0);
+            }'; then
+            for j in $$(seq 1 30); do
+              STATE=$$(mongosh --host mongo --quiet --eval 'try { rs.status().myState } catch(e) { -1 }' | tail -n 1)
+              if [ "$$STATE" = "1" ] || [ "$$STATE" = "2" ]; then
+                echo "RS ready (myState=$$STATE)"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "RS initiated but node never reached PRIMARY/SECONDARY" >&2
+            exit 1
+          fi
+          sleep 2
+        done
+        echo "RS initiate never acknowledged" >&2
+        exit 1
+
+  app:
+    image: ghcr.io/kenandkent/lightcms:${IMAGE_TAG:-latest}
+    container_name: lightcms-app
+    ports:
+      - "8082:8082"
+    env_file:
+      - .env
+    environment:
+      PORT: "8082"
+      ENV: production
+      SECURE_COOKIES: "true"
+      MONGO_URI: "mongodb://mongo:27017/lightcms?replicaSet=rs0"
+    volumes:
+      - content-data:/app/content/generated
+      - uploads-data:/app/static/uploads
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+    name: lightcms-mongo-data
+  content-data:
+    name: lightcms-content-data
+  uploads-data:
+    name: lightcms-uploads-data
