@@ -8992,7 +8992,7 @@ const adminLayoutStart = `<!DOCTYPE html>
 
         .main-content {
             padding: 2rem;
-            max-width: 1400px;
+            max-width: 1600px;
         }
         .page-header {
             display: flex;
