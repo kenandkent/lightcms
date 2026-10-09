@@ -11,6 +11,37 @@
   超限返回 429 并带 `Retry-After` 头，请指数退避重试。
 - 请求体一律 `Content-Type: application/json`；单请求体上限 10 MiB。
 
+## 0. 环境与调用方式（本地 / 生产）
+
+两套环境接口**完全同构**，差别只有基址和 TLS：
+
+| | 本地开发 | 生产 |
+|---|---|---|
+| 基址 | `http://127.0.0.1:<端口>/api/v1` | `https://ibreeze.agency/api/v1` |
+| TLS | 无（明文 HTTP） | 有（HTTPS，证书自动续期） |
+| 端口来源 | `config.dev.json` 的 `port`（本仓库当前为 `50491`；缺省 `8082`） | 固定 443（nginx 反代到容器 8082） |
+| Key 获取 | 本地后台 `http://127.0.0.1:<端口>/cm` → API Keys → 新建 | 生产后台 `https://ibreeze.agency/cm` → 同样位置新建 |
+| Key 互通 | **不互通**：两边数据库独立，Key 只在签发环境有效 |
+
+```bash
+# 本地调用（注意 http、无证书问题）
+BASE=http://127.0.0.1:50491/api/v1
+KEY=lc_xxx   # 本地后台建的 Key
+curl "$BASE/content?limit=5" -H "Authorization: Bearer $KEY"
+
+# 生产调用（https；把下面两行换成生产 Key 即可，其余一字不改）
+BASE=https://ibreeze.agency/api/v1
+KEY=lc_yyy   # 生产后台建的 Key
+curl "$BASE/content?limit=5" -H "Authorization: Bearer $KEY"
+```
+
+注意：
+- Key 形如 `lc_` + 32 位十六进制；创建时只明文显示**一次**，请当时复制保存。
+- 切环境只换 `BASE` + `KEY` 两个变量：路径、参数、错误码两边一致，
+  本地调通的脚本可直接上生产。
+- 生产建议给第三方建**专用 Key**（按需给 editor/viewer 角色），不要共用 admin Key；
+  沙盒 Key（`sandbox_only`）只能写 fork、碰不了正式内容与发布/删除。
+
 约定：下文 `curl` 示例中 `$BASE=https://ibreeze.agency/api/v1`，
 `$KEY` 为你的 API Key。
 
