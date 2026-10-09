@@ -305,10 +305,22 @@ jobs:
                   docker stop --time 30 lightcms-app >/dev/null
                   trap 'docker start lightcms-app >/dev/null 2>&1 || true' ERR
                 fi
-                docker cp lightcms-app:/app/content/publications - | \
+                CONTENT_DIRS=$(docker cp lightcms-app:/app/content - | tar -tf -)
+                if printf '%s\n' "$CONTENT_DIRS" | grep -Eq '^content/publications(/|$)'; then
+                  docker cp lightcms-app:/app/content/publications - | \
                   docker run --rm -i --network none --entrypoint tar \
                     --mount type=volume,src=lightcms-publications-data,dst=/publications \
                     mongo:7.0.14 -xf - --strip-components=1 -C /publications
+                else
+                  # Legacy installations may have no Publication records or
+                  # directory yet. Verify this explicitly, not via a failed
+                  # docker exec test. Any archive/database read error aborts.
+                  PUB_COUNT=$(docker exec lightcms-mongo mongosh --quiet --eval 'print(db.getSiblingDB("lightcms").publications.countDocuments({}))')
+                  if [ "$PUB_COUNT" != "0" ]; then
+                    echo "publication directory missing with retained records; refusing switch"
+                    exit 1
+                  fi
+                fi
               elif [ -n "$PUB_MOUNT" ] && [ "$PUB_MOUNT" != "lightcms-publications-data" ]; then
                 echo "unexpected publication volume: $PUB_MOUNT; refusing data switch"
                 exit 1
