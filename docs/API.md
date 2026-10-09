@@ -75,8 +75,9 @@ V3 发布管线（`/page-generation` 及 publications 相关）返回**嵌套信
 
 ### 1.5 版本注释
 
-所有内容写操作建议带 `version_comment`（一句话说明改了什么），版本历史可读。
-系统自动为每次更新建版本，可随时回滚（见 3.4）。
+经典 CRUD 的创建/更新/回滚建议带 `version_comment`（一句话说明改了什么），
+版本历史可读。发布管线（`/page-generation`）**不接受**该字段（传了会 422，
+见 3.2），它会自动生成版本注释。系统为每次更新建版本，可随时回滚（见 3.4）。
 
 ## 2. 模板管理
 
@@ -202,12 +203,13 @@ curl -X POST $BASE/page-generation \
     "folder_path": "/reports",
     "mode": "publish",
     "expected_template_version": 1,
-    "data": {"headline": "Q3 复盘", "body": "# 要点\n\n- ..."},
-    "version_comment": "首发"
+    "data": {"headline": "Q3 复盘", "body": "# 要点\n\n- ..."}
   }'
 ```
 
 要点（缺一即 4xx，message 会明说）：
+- 请求体是**严格模式**：多传未知顶层字段直接 422（`FIELD_UNKNOWN`），
+  字段以本文和 2.4 的 Schema 为准，不要自行加料。
 - `template` 填模板 **slug**；`title`/`slug`/`folder_path`/`data` 按模板 Schema 填。
 - `mode`: `draft` 只存草稿；`publish` 直接上线。
 - `expected_template_version`：发布必填，取自模板当前版本号（模板改版后旧号发布会被拒绝，防止按过期结构渲染）。
@@ -235,7 +237,27 @@ curl -X POST $BASE/content/<id>/versions/<n>/revert \
 curl -X POST $BASE/content/batch-publish \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"ids": ["<id1>", "<id2>"]}'
+# 另支持 {"publish_all_drafts": true} 发布全部草稿
 ```
+
+### 3.6 跳转（Redirects）与根路径
+
+`slug` 在两套写入口都**必填非空**，因此根路径 `/` 无法直接建页。
+站点根访问的标准做法是一条跳转：
+
+```bash
+# 列表
+curl $BASE/redirects -H "Authorization: Bearer $KEY"
+
+# 新建（from_path/to_path 必填；status_code 如 301）
+curl -X POST $BASE/redirects \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"from_path": "/", "to_path": "/reports/flagship",
+       "status_code": 301, "description": "root to flagship"}'
+```
+
+访问时按 `from_path` 精确匹配后按 `status_code` 跳转（页面不存在时先生效，
+先生效于 404）。同理可做旧路径迁移（改版换 slug 时保留外链）。
 
 ## 4. 端到端示例：新模板 + 新页面上线
 
@@ -250,8 +272,7 @@ curl -X POST $BASE/page-generation \
   -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
   -d '{"template":"product-analysis","title":"Q3 复盘","slug":"q3-review",
        "folder_path":"/reports","mode":"publish","expected_template_version":1,
-       "data":{"headline":"Q3 复盘","body":"# 正文"},
-       "version_comment":"首发"}'
+       "data":{"headline":"Q3 复盘","body":"# 正文"}}'
 
 # 3) 验证线上（返回 200 即成功）
 curl -o /dev/null -w "%{http_code}\n" https://ibreeze.agency/reports/q3-review
@@ -266,7 +287,9 @@ curl -o /dev/null -w "%{http_code}\n" https://ibreeze.agency/reports/q3-review
 - 401：Key 错/没传 `Bearer ` 前缀。
 - 403：Key 属主是 viewer，或沙盒 Key 想碰正式内容/发布/删除。
 - 409 `PATH_CONFLICT`：换个 slug，或按 3.3 读回现页。
-- 422 `FIELD_VALIDATION_FAILED`：`data` 对不上模板 Schema，先调 2.4 对字段。
+- 422 `FIELD_VALIDATION_FAILED`：`data` 对不上模板 Schema，先调 2.4 对字段；
+  若是 `FIELD_UNKNOWN`，说明请求体有多余顶层字段（`page-generation` 不收
+  `version_comment`/`author` 这类，删掉）。
 - 428：发布忘记 `Idempotency-Key` 头。
 - 发布报 `TEMPLATE_VERSION_PRECONDITION_REQUIRED`：补 `expected_template_version`
  （模板每次更新版本号都会变，发布前重取）。
