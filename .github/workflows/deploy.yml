@@ -290,7 +290,32 @@ jobs:
             echo "$GH_IMAGE:$IMAGE_TAG" > .image_tag
             IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.prod.yml pull app
             docker logout ghcr.io >/dev/null 2>&1 || true
+            # Immutable publication objects used to live in the app writable
+            # layer. Copy them once before replacing that container; otherwise
+            # recovery/rollback loses the objects even though Mongo is intact.
+            docker volume create lightcms-publications-data >/dev/null
+            if docker container inspect lightcms-app >/dev/null 2>&1; then
+              PUB_MOUNT=$(docker inspect lightcms-app --format '{{range .Mounts}}{{if eq .Destination "/app/content/publications"}}{{.Name}}{{end}}{{end}}')
+              if [ -z "$PUB_MOUNT" ]; then
+                # Freeze writers before the final archive. docker cp also
+                # reads stopped containers; an unexpected/missing source is
+                # a hard failure, never permission to replace it empty.
+                PUB_WAS_RUNNING=$(docker inspect lightcms-app --format '{{.State.Running}}')
+                if [ "$PUB_WAS_RUNNING" = "true" ]; then
+                  docker stop --time 30 lightcms-app >/dev/null
+                  trap 'docker start lightcms-app >/dev/null 2>&1 || true' ERR
+                fi
+                docker cp lightcms-app:/app/content/publications - | \
+                  docker run --rm -i --network none --entrypoint tar \
+                    --mount type=volume,src=lightcms-publications-data,dst=/publications \
+                    mongo:7.0.14 -xf - --strip-components=1 -C /publications
+              elif [ -n "$PUB_MOUNT" ] && [ "$PUB_MOUNT" != "lightcms-publications-data" ]; then
+                echo "unexpected publication volume: $PUB_MOUNT; refusing data switch"
+                exit 1
+              fi
+            fi
             IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            trap - ERR
             # --- health gate (fail the job if the app never becomes healthy) ---
             for i in $(seq 1 30); do
               if curl -fsS http://127.0.0.1:8082/health >/dev/null 2>&1; then

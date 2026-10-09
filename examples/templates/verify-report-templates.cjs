@@ -63,7 +63,7 @@ async function serveFixtures(context) {
    await page.goto('http://127.0.0.1:18083/fallback.html');
    await page.waitForTimeout(550);
    assert.equal(await page.locator('#headline').textContent(),'A clearer view of the next market cycle');
-   assert.equal(await page.locator('#article-content').getAttribute('lang'),'en');
+   assert.equal(await page.locator('#article-content').evaluate(node=>node.closest('[lang]').getAttribute('lang')),'en');
    assert.equal(await page.locator('#copy-link').textContent(),'Copy article link');
    await fallback.close();
    // CSS alone releases content; JavaScript being disabled must not trap readers.

@@ -114,6 +114,8 @@ V3 发布管线（`/page-generation` 及 publications 相关）返回**嵌套信
 
 模板 = 字段定义（JSON Schema）+ HTML 布局。页面发布时按模板渲染成静态 HTML。
 
+`html_layout` 可为HTML片段或包含 `<!doctype html>` / `<html>` 的完整文档。片段沿用系统主题；完整文档直接提供，不再注入系统主题布局与CSS，适合自带CSS/JS的九套报告模板。完整模板应自行定义标题、社交分享元信息、图标及布局；已定义的标题/JSON-LD不会被系统覆盖。模板HTML更新不会自动改变已发布文章，需要显式重新发布或执行模板升级流程。更新样式时只提交 `html_layout`，不要无意替换现有字段定义或文章 `data`。生成及验证方法见 `examples/templates/REPORT-TEMPLATES.md`。
+
 ### 2.1 字段类型
 
 `fields` 数组每项：`{name, label, type, required}`。

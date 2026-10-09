@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +76,17 @@ func TestReportTemplatesRenderWithProductionContract(t *testing.T) {
 					t.Fatal(err)
 				}
 				html := string(out)
+				ld := regexp.MustCompile(`(?s)<script type="application/ld\+json">(.*?)</script>`).FindStringSubmatch(html)
+				if len(ld) != 2 {
+					t.Fatal("frozen structured metadata missing")
+				}
+				var metadata map[string]any
+				if err := json.Unmarshal([]byte(ld[1]), &metadata); err != nil {
+					t.Fatalf("invalid JSON-LD: %v", err)
+				}
+				if metadata["headline"] != "Research <update> & outlook" {
+					t.Fatal("JSON-LD title differs from frozen article")
+				}
 				for _, want := range []string{`<html lang="en"`, `property="og:title" content="Research &lt;update&gt; &amp; outlook"`, `property="og:description" content="Evidence, not certainty."`, `property="og:url" content="https://publisher.example/reports/example"`, `property="og:image" content="https://publisher.example/cover.png"`, `<strong>Verified</strong>`, `name="twitter:card" content="summary_large_image"`} {
 					if !strings.Contains(html, want) {
 						t.Errorf("render missing %s", want)

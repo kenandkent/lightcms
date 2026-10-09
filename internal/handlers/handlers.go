@@ -42,6 +42,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	nethtml "golang.org/x/net/html"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -3979,7 +3980,7 @@ func (h *Handler) servePageContent(w http.ResponseWriter, r *http.Request, conte
 			}
 		}
 		if activeFork != nil {
-			htmlContent = forkPreviewBar(activeFork) + htmlContent
+			htmlContent = withForkPreviewBar(htmlContent, activeFork)
 		}
 		w.Write([]byte(htmlContent))
 		return
@@ -4008,10 +4009,54 @@ func (h *Handler) servePageContent(w http.ResponseWriter, r *http.Request, conte
 
 	rendered := h.renderContent(content, &tmpl)
 	if activeFork != nil {
-		rendered = forkPreviewBar(activeFork) + rendered
+		rendered = withForkPreviewBar(rendered, activeFork)
 	}
 	h.renderPublicWithSEO(w, r, theme, rendered, content.UseHeader, content.UseFooter,
 		content.Title, content.MetaDescription, ogImage, fullPath, jsonLD)
+}
+
+// withForkPreviewBar inserts the toolbar inside standalone documents so a
+// preview cannot reintroduce a nested theme wrapper.
+func withForkPreviewBar(content string, fork *models.ContentFork) string {
+	bar := forkPreviewBar(fork)
+	if !isStandaloneDocument(content) {
+		return bar + content
+	}
+	doc, err := nethtml.Parse(strings.NewReader(content))
+	if err != nil {
+		return content
+	}
+	var body *nethtml.Node
+	var visit func(*nethtml.Node)
+	visit = func(n *nethtml.Node) {
+		if body != nil {
+			return
+		}
+		if n.Type == nethtml.ElementNode && n.Data == "body" {
+			body = n
+			return
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			visit(c)
+		}
+	}
+	visit(doc)
+	if body == nil {
+		return content
+	}
+	nodes, err := nethtml.ParseFragment(strings.NewReader(bar), body)
+	if err != nil {
+		return content
+	}
+	first := body.FirstChild
+	for _, node := range nodes {
+		body.InsertBefore(node, first)
+	}
+	var out strings.Builder
+	if err := nethtml.Render(&out, doc); err != nil {
+		return content
+	}
+	return out.String()
 }
 
 // forkPreviewBar returns the HTML for the floating preview bar injected during fork preview.
@@ -4206,6 +4251,19 @@ func (h *Handler) renderPublicWithOptions(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) renderPublicWithSEO(w http.ResponseWriter, r *http.Request, theme *database.ThemeSettings, content string, useHeader, useFooter bool, title, metaDescription, ogImage, canonicalURL string, structuredData ...string) {
+	// Product templates can be complete authored documents. Nesting them inside
+	// publicLayout duplicates <head>/<body> and leaks theme CSS (.hero/.sidebar)
+	// into the article. Preserve the publication bytes and its own metadata.
+	if isStandaloneDocument(content) {
+		ld := ""
+		if len(structuredData) > 0 {
+			ld = structuredData[0]
+		}
+		content = supplementStandaloneHead(content, title, ld)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, content)
+		return
+	}
 	tmpl := template.Must(template.New("layout").Funcs(template.FuncMap{
 		"i18n": func(key, fallback, lang string) string { return i18n.T(key, fallback, lang) },
 	}).Parse(publicLayout))
@@ -4267,6 +4325,86 @@ func (h *Handler) renderPublicWithSEO(w http.ResponseWriter, r *http.Request, th
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tmpl.Execute(w, data)
+}
+
+// Only a leading document token qualifies; a doctype mentioned in a fragment
+// or code example must not disable the normal site layout.
+func isStandaloneDocument(content string) bool {
+	z := nethtml.NewTokenizer(strings.NewReader(strings.TrimPrefix(content, "\ufeff")))
+	for {
+		switch z.Next() {
+		case nethtml.CommentToken:
+			continue
+		case nethtml.TextToken:
+			if strings.TrimSpace(string(z.Text())) != "" {
+				return false
+			}
+		case nethtml.DoctypeToken:
+			parts := strings.Fields(z.Token().Data)
+			return len(parts) > 0 && strings.EqualFold(parts[0], "html")
+		case nethtml.StartTagToken:
+			return strings.EqualFold(z.Token().Data, "html")
+		default:
+			return false
+		}
+	}
+}
+
+// Authored/frozen metadata wins. Only fill absent legacy title/JSON-LD, without
+// adding the site shell or importing any site styles into the document.
+func supplementStandaloneHead(content, title, jsonLD string) string {
+	z := nethtml.NewTokenizer(strings.NewReader(content))
+	offset, htmlEnd, doctypeEnd, headEnd := 0, 0, 0, -1
+	hasTitle, hasJSONLD := false, false
+	for {
+		tt := z.Next()
+		if tt == nethtml.ErrorToken {
+			break
+		}
+		before := offset
+		offset += len(z.Raw())
+		token := z.Token()
+		if tt == nethtml.DoctypeToken {
+			doctypeEnd = offset
+		}
+		if tt == nethtml.EndTagToken && token.Data == "head" {
+			headEnd = before
+		}
+		if tt != nethtml.StartTagToken {
+			continue
+		}
+		if token.Data == "html" {
+			htmlEnd = offset
+		}
+		if token.Data == "title" {
+			hasTitle = true
+		}
+		if token.Data == "script" {
+			for _, attr := range token.Attr {
+				if attr.Key == "type" && strings.EqualFold(strings.TrimSpace(attr.Val), "application/ld+json") {
+					hasJSONLD = true
+				}
+			}
+		}
+	}
+	var addition strings.Builder
+	if !hasTitle && title != "" {
+		addition.WriteString("<title>" + html.EscapeString(title) + "</title>\n")
+	}
+	if !hasJSONLD && jsonLD != "" {
+		addition.WriteString(jsonLD + "\n")
+	}
+	if addition.Len() == 0 {
+		return content
+	}
+	if headEnd >= 0 {
+		return content[:headEnd] + addition.String() + content[headEnd:]
+	}
+	insert := htmlEnd
+	if insert == 0 {
+		insert = doctypeEnd
+	}
+	return content[:insert] + "<head>" + addition.String() + "</head>" + content[insert:]
 }
 
 // inferOGImage returns the best OG image for a content item.

@@ -50,7 +50,7 @@ import (
 // RendererVersion is recorded on every render (spec §15.2 renderer_version).
 // It identifies the Markdown/Snippet/Wikilink/TOC pipeline, not the product
 // release: a pipeline change bumps this while ProductBuildSHA tracks the binary.
-const RendererVersion = "lightcms-renderer-v1"
+const RendererVersion = "lightcms-renderer-v2"
 
 // ProductBuildSHA identifies the binary that rendered the bytes
 // (spec §15.2 product_build_sha). Overridden at link time by Task 16 wiring
@@ -397,10 +397,18 @@ func RenderDetailed(ctx context.Context, snap RenderSnapshot) (RenderResult, err
 		switch fieldTypes[k] {
 		case "markdown":
 			s = markdownToHTMLFrozen(s, allowUnsafe)
-		default:
-			if !allowUnsafe && fieldTypes[k] == "richtext" {
+		case "richtext":
+			// Existing crypto articles were supplied as Markdown despite the
+			// legacy richtext schema. Preserve that schema and authored HTML;
+			// only this layout's plain Markdown document gets compatibility
+			// conversion. Never reinterpret other richtext/rawhtml fields.
+			if snap.TemplateSlug == "crypto-analysis" && k == "body" && cryptoMarkdownBody(s) {
+				s = markdownToHTMLFrozen(s, allowUnsafe)
+			}
+			if !allowUnsafe {
 				s = renderSafePolicy.Sanitize(s)
 			}
+		default:
 		}
 		data[k] = s
 	}
@@ -649,6 +657,13 @@ var renderSafePolicy = func() *bluemonday.Policy {
 	p.AllowAttrs("srcset", "media", "sizes").OnElements("source", "picture")
 	return p
 }()
+
+var cryptoMarkdownHeading = regexp.MustCompile(`(?m)^#{1,6}\s+\S`)
+var authoredHTMLTag = regexp.MustCompile(`(?i)<[a-z!/][^>]*>`)
+
+func cryptoMarkdownBody(text string) bool {
+	return cryptoMarkdownHeading.MatchString(text) && !authoredHTMLTag.MatchString(text)
+}
 
 func markdownToHTMLFrozen(text string, allowUnsafe bool) string {
 	var opts []goldmark.Option

@@ -1,8 +1,10 @@
 # Report and announcement template collection
 
-Eight standalone LightCMS templates, with embedded CSS and JavaScript. The original `crypto-analysis.html` is preserved. These are reusable layouts, not reports or official exchange announcements.
+Eight standalone LightCMS templates, with embedded CSS and JavaScript, plus the coordinated `crypto-analysis.html` layout. These are reusable layouts, not reports or official exchange announcements.
 
 The curated local library contains these eight layouts plus `crypto-analysis` (nine total). All library names, descriptions, categories and field display labels are Chinese; field identifiers stay unchanged. The crypto template now has its own `.template.json` and `.example.json` import files. Its body is **richtext**, not Markdown, to preserve compatibility with existing articles; it declares eight fields (five article fields and three share/icon fields). The other eight layouts declare fifteen fields each.
+
+Compatibility for existing crypto articles: the renderer converts a `crypto-analysis` body that contains a Markdown heading and no HTML tags through its frozen Markdown pipeline. Authored richtext HTML remains HTML; this exception does not change other templates or field types. Prefer valid HTML for new richtext submissions. Article data is not rewritten by this compatibility rendering.
 
 The local migration preserves custom template IDs and imports revised contracts as new versions. The persisted site setting `settings.type=template_library_policy`, `custom_only=true` disables seeding stock templates and stock pages during `SeedDefaults`. Sites without this setting keep the original default-install behavior. Do not remove this setting or deploy an old binary if the library must remain custom-only; an old binary would seed the seven stock templates again. Migration and backup details are recorded in [the cleanup report](../../docs/reviews/2026-10-04-curated-template-library.md).
 
@@ -15,7 +17,7 @@ The local migration preserves custom template IDs and imports revised contracts 
 | [venture-research](venture-research.html) | Warm paper, plum masthead, editorial callouts | Venture theses, startup and industry research |
 | [binance-announcement-style](binance-announcement-style.html) | Charcoal masthead, restrained yellow accents, single-column notices | Exchange-style announcements |
 | [okx-announcement-style](okx-announcement-style.html) | High-contrast black and white, bold headings, strong rules | Product and trading notices |
-| [editorial-news](editorial-news.html) | Newspaper masthead, cream paper, serif body and drop cap | General news and long-form reporting |
+| [editorial-news](editorial-news.html) | Newspaper masthead, cream paper, readable serif body | General news and long-form reporting |
 | [financial-daily](financial-daily.html) | Salmon paper, navy masthead, financial editorial typography | Markets, economics and business reporting |
 | [technology-report](technology-report.html) | Midnight blue, oversized modern headings, field-note layout | Technology, infrastructure and product research |
 
@@ -91,7 +93,11 @@ For a default social image, use `https://YOUR_PRODUCTION_DOMAIN/static/images/re
 
 ## Regeneration and local validation
 
-The generator `build-report-templates.py` is the source of truth for the HTML, schema payloads and illustrative examples. It prints an `apply_patch` change set for the chosen slug; apply that change set to update files. It does not silently overwrite them. `--check` verifies generated files are in sync. Edit the generator when changing shared chrome or theme styles, then regenerate affected artifacts. Do not leave `.html` and `.template.json` with different layouts.
+The generator `build-report-templates.py` and shared `report-styles.css` are the sources of truth for the eight report layouts, schema payloads and illustrative examples. `crypto-styles.css` and `build-crypto-template.py` maintain the crypto layout and payload. The CSS is embedded during generation; published articles require no additional stylesheet request. Generators print an `apply_patch` change set; apply it to update files. They do not silently overwrite them. `build-report-templates.py <slug> --check` verifies generated report files are in sync. Regenerate after editing shared CSS or chrome. Do not leave `.html` and `.template.json` with different layouts.
+
+Complete HTML documents are served directly, without the system theme wrapper or `/static/css/main.css`. HTML fragments still use the existing theme. This prevents theme `.hero` and `.sidebar` selectors from overriding report typography and layout. Authored title and JSON-LD metadata are preserved. All nine templates embed article JSON-LD using frozen renderer values.
+
+The actual-page regression tool `verify-layout-repair.cjs` accepts `TEMPLATE_BASE_URL`, `TEMPLATE_SNAPSHOT` (an inventory containing template and content IDs), and `TEMPLATE_SCREENSHOT_DIR`. It checks all nine published pages at 1440/768/390/320px, spacing, overlap, headline contrast, print contrast, long body headings, wide tables, unbroken code, replacement characters and page errors. It reads published pages only; use the documented API to update templates and explicitly republish existing articles.
 
 Generate local rendered examples with the real publication renderer:
 
