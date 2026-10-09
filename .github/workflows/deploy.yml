@@ -303,7 +303,7 @@ jobs:
                 PUB_WAS_RUNNING=$(docker inspect lightcms-app --format '{{.State.Running}}')
                 if [ "$PUB_WAS_RUNNING" = "true" ]; then
                   docker stop --time 30 lightcms-app >/dev/null
-                  trap 'docker start lightcms-app >/dev/null 2>&1 || true' ERR
+                  trap 'docker start lightcms-app >/dev/null 2>&1 || true' EXIT
                 fi
                 CONTENT_DIRS=$(docker cp lightcms-app:/app/content - | tar -tf -)
                 if printf '%s\n' "$CONTENT_DIRS" | grep -Eq '^content/publications(/|$)'; then
@@ -327,7 +327,7 @@ jobs:
               fi
             fi
             IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.prod.yml up -d --remove-orphans
-            trap - ERR
+            trap - EXIT
             # --- health gate (fail the job if the app never becomes healthy) ---
             for i in $(seq 1 30); do
               if curl -fsS http://127.0.0.1:8082/health >/dev/null 2>&1; then
