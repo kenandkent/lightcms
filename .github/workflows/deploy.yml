@@ -315,7 +315,7 @@ jobs:
                   # Legacy installations may have no Publication records or
                   # directory yet. Verify this explicitly, not via a failed
                   # docker exec test. Any archive/database read error aborts.
-                  PUB_COUNT=$(docker exec lightcms-mongo mongosh --quiet --eval 'print(db.getSiblingDB("lightcms").publications.countDocuments({}))')
+                  PUB_COUNT=$(docker exec lightcms-mongo mongosh --quiet --eval 'print(db.getSiblingDB("lightcms").content_publications.countDocuments({}))')
                   if [ "$PUB_COUNT" != "0" ]; then
                     echo "publication directory missing with retained records; refusing switch"
                     exit 1
