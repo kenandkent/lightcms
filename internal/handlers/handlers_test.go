@@ -1081,6 +1081,12 @@ func TestListContent_RemarkColumn(t *testing.T) {
 	if !strings.Contains(body, "英文版") {
 		t.Fatalf("list should render the content remark")
 	}
+	if !strings.Contains(body, `title="英文版"`) {
+		t.Fatalf("remark cell should carry the full text as hover tooltip")
+	}
+	if !strings.Contains(body, "text-overflow: ellipsis") {
+		t.Fatalf("list should truncate long title/remark cells with ellipsis")
+	}
 }
 
 // TestUpdateContent_RemarkPersisted proves the edit form remark field round-trips.

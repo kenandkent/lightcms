@@ -564,9 +564,9 @@ var adminTemplates = map[string]string{
                 <tbody>
                     {{range .Content}}
                     <tr{{if .Deleted}} style="opacity: 0.7;"{{end}}>
-                        <td><strong>{{.Title}}</strong></td>
+                        <td style="max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="{{.Title}}"><strong>{{.Title}}</strong></td>
                         <td>{{.TemplateName}}</td>
-                        <td>{{.Remark}}</td>
+                        <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="{{.Remark}}">{{.Remark}}</td>
                         <td>
                             {{if .Deleted}}
                             <span class="status-badge" style="background: var(--danger);">{{i18n "status.deleted" "已删除" $.Lang}}</span>
