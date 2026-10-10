@@ -1108,6 +1108,7 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 
 	// Handle SEO fields
 	metaDescription := r.FormValue("meta_description")
+	remark := r.FormValue("remark")
 	ogImage := ""
 	// Handle OG image upload
 	ogFile, ogHeader, err := r.FormFile("og_image")
@@ -1144,6 +1145,7 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 		Category:        tmpl.Category,
 		Tags:            contentTags,
 		MetaDescription: metaDescription,
+		Remark:          remark,
 		OGImage:         ogImage,
 		Data:            data,
 		Published:       false,
@@ -1660,6 +1662,7 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 
 	// Handle SEO fields
 	metaDescription := r.FormValue("meta_description")
+	remark := r.FormValue("remark")
 	ogImage := existingContent.OGImage // Keep existing if not uploading new
 	// Handle OG image upload
 	ogFile, ogHeader, err := r.FormFile("og_image")
@@ -1704,6 +1707,7 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 			"has_unpublished_changes": hasUnpublished,
 			"tags":                    updatedTags,
 			"meta_description":        metaDescription,
+			"remark":                  remark,
 			"og_image":                ogImage,
 			"data":                    data,
 			"published":               savedPublished,
@@ -1773,6 +1777,7 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	existingContent.FolderPath = folderPath
 	existingContent.FullPath = fullPath
 	existingContent.MetaDescription = metaDescription
+	existingContent.Remark = remark
 	existingContent.OGImage = ogImage
 	existingContent.Data = data
 	existingContent.Published = savedPublished

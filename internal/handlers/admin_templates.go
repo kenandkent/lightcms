@@ -555,6 +555,7 @@ var adminTemplates = map[string]string{
                     <tr>
                         <th>{{i18n "table.title" "标题" $.Lang}}</th>
                         <th>{{i18n "content_list.template" "模板" $.Lang}}</th>
+                        <th>{{i18n "table.remark" "备注" $.Lang}}</th>
                         <th>{{i18n "table.status" "状态" $.Lang}}</th>
                         <th>{{i18n "table.updated" "更新时间" $.Lang}}</th>
                         <th>{{i18n "table.actions" "操作" $.Lang}}</th>
@@ -565,6 +566,7 @@ var adminTemplates = map[string]string{
                     <tr{{if .Deleted}} style="opacity: 0.7;"{{end}}>
                         <td><strong>{{.Title}}</strong></td>
                         <td>{{.TemplateName}}</td>
+                        <td>{{.Remark}}</td>
                         <td>
                             {{if .Deleted}}
                             <span class="status-badge" style="background: var(--danger);">{{i18n "status.deleted" "已删除" $.Lang}}</span>
@@ -1577,6 +1579,11 @@ var adminTemplates = map[string]string{
             <div class="form-group">
                 <label for="title">{{i18n "table.title" "标题" $.Lang}}</label>
                 <input type="text" id="title" name="title" value="{{if .Content}}{{.Content.Title}}{{end}}" required>
+            </div>
+            <div class="form-group">
+                <label for="remark">{{i18n "content_form.remark" "备注" $.Lang}}</label>
+                <input type="text" id="remark" name="remark" value="{{if .Content}}{{.Content.Remark}}{{end}}" placeholder="{{i18n "content_form.remark_placeholder" "如：英文版 / 中文版，仅后台可见" $.Lang}}">
+                <p class="help-text">{{i18n "content_form.remark_help" "选填。给这篇内容的说明（如语言版本），仅显示在内容列表，不会发布到前台。" $.Lang}}</p>
             </div>
             <div class="form-group">
                 <label for="slug">{{i18n "content_form.slug_url_path" "别名（URL 路径）" $.Lang}}</label>

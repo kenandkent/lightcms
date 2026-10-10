@@ -51,6 +51,7 @@ type contentListItem struct {
 	Deleted         bool                   `json:"deleted"`
 	UpdatedAt       string                 `json:"updated_at"`
 	MetaDescription string                 `json:"meta_description,omitempty"`
+	Remark          string                 `json:"remark,omitempty"`
 	TemplateID      string                 `json:"template_id,omitempty"`
 	TemplateName    string                 `json:"template_name,omitempty"`
 	Data            map[string]interface{} `json:"data,omitempty"`
@@ -68,6 +69,7 @@ func (a *APIHandler) formatContentList(contents []models.Content, includeData bo
 				Published: c.Published, Deleted: c.Deleted,
 				UpdatedAt:       c.UpdatedAt.Format("2006-01-02T15:04:05Z"),
 				MetaDescription: c.MetaDescription,
+				Remark:          c.Remark,
 				TemplateID:      c.TemplateID.Hex(), TemplateName: c.TemplateName,
 			}
 		}
@@ -93,6 +95,7 @@ func (a *APIHandler) formatContentList(contents []models.Content, includeData bo
 			Published: c.Published, Deleted: c.Deleted,
 			UpdatedAt:       c.UpdatedAt.Format("2006-01-02T15:04:05Z"),
 			MetaDescription: c.MetaDescription,
+			Remark:          c.Remark,
 			TemplateID:      c.TemplateID.Hex(), TemplateName: c.TemplateName,
 		}
 		if includeFields != nil {
@@ -269,6 +272,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		Category        string                 `json:"category"`
 		Tags            []string               `json:"tags"`
 		MetaDescription string                 `json:"meta_description"`
+		Remark          string                 `json:"remark"`
 		OGImage         string                 `json:"og_image"`
 		Data            map[string]interface{} `json:"data"`
 		Published       bool                   `json:"published"`
@@ -376,6 +380,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		Category:        req.Category,
 		Tags:            req.Tags,
 		MetaDescription: req.MetaDescription,
+		Remark:          req.Remark,
 		OGImage:         req.OGImage,
 		Data:            req.Data,
 		Published:       req.Published,
@@ -2590,7 +2595,7 @@ func (a *APIHandler) APIBulkFieldOperation(w http.ResponseWriter, r *http.Reques
 		"deleted": true, "slug": true, "full_path": true, "folder_path": true,
 		"folder_id": true, "created_at": true, "updated_at": true, "published_at": true,
 		"fork_id": true, "category": true, "tags": true, "meta_description": true,
-		"og_image": true, "content_hash": true, "use_header": true, "use_footer": true,
+		"remark": true, "og_image": true, "content_hash": true, "use_header": true, "use_footer": true,
 		"use_theme": true, "raw_mode": true, "locked_by": true, "locked_at": true,
 	}
 	if blockedFields[req.Field] {

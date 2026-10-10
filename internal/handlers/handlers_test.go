@@ -1059,6 +1059,59 @@ func TestListContent_NoPathColumn(t *testing.T) {
 	}
 }
 
+// TestListContent_RemarkColumn pins the remark column: seeded remarks render
+// in the list (used to tell same-template language variants apart).
+func TestListContent_RemarkColumn(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	tmplID := seedTemplate(t, h.db, "Page", "page")
+	cid := seedContent(t, h.db, tmplID, "Remark Probe", "remark-probe", "/remark-probe")
+	ctx := context.Background()
+	if err := h.db.UpdateOne(ctx, "content", bson.M{"_id": cid},
+		bson.M{"$set": bson.M{"remark": "英文版"}}); err != nil {
+		t.Fatalf("seed remark: %v", err)
+	}
+
+	rr := csrfAuthGet(t, h, "/cm/content", "/cm/content", h.ListContent)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "英文版") {
+		t.Fatalf("list should render the content remark")
+	}
+}
+
+// TestUpdateContent_RemarkPersisted proves the edit form remark field round-trips.
+func TestUpdateContent_RemarkPersisted(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	tmplID := seedTemplate(t, h.db, "Page", "page")
+	contentID := seedContent(t, h.db, tmplID, "Old Title", "old-title", "/old-title")
+
+	form := url.Values{}
+	form.Set("title", "Updated Title")
+	form.Set("slug", "updated-title")
+	form.Set("remark", "中文版")
+
+	rr := csrfAuthPost(t, h, "/cm/content/{id}", "/cm/content/"+contentID.Hex(),
+		h.EditContent, h.UpdateContent, form)
+	if rr.Code != http.StatusSeeOther && rr.Code != http.StatusOK && rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 303/200/403, got %d", rr.Code)
+	}
+
+	var got models.Content
+	if err := h.db.FindOne(context.Background(), "content",
+		bson.M{"_id": contentID}, &got); err != nil {
+		t.Fatalf("read back content: %v", err)
+	}
+	if got.Remark != "中文版" {
+		t.Fatalf("remark = %q, want %q", got.Remark, "中文版")
+	}
+}
+
 func TestNewContent_Authenticated(t *testing.T) {
 	h, cleanup := newTestHandler(t)
 	defer cleanup()

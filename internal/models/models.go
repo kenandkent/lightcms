@@ -64,6 +64,7 @@ type Content struct {
 	Tags            []string               `bson:"tags,omitempty" json:"tags,omitempty"`     // Multi-value tags for lc:query filtering
 	MetaDescription string                 `bson:"meta_description" json:"meta_description"` // SEO meta description
 	OGImage         string                 `bson:"og_image" json:"og_image"`                 // Open Graph image URL
+	Remark          string                 `bson:"remark,omitempty" json:"remark,omitempty"` // Admin-only note (e.g. language variant); never rendered publicly
 	Data            map[string]interface{} `bson:"data" json:"data"`                         // Dynamic field values
 	Published       bool                   `bson:"published" json:"published"`
 	PublishedAt     *time.Time             `bson:"published_at,omitempty" json:"published_at,omitempty"`
