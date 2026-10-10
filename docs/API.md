@@ -203,15 +203,21 @@ curl -X POST $BASE/content \
     "slug": "demo",
     "folder_path": "/reports",
     "data": {"headline": "标题", "body": "# 正文"},
+    "remark": "英文版",
     "version_comment": "首版",
     "upsert": true
   }'
 # 201 返回内容对象（含 id 与 full_path=/reports/demo）
+#
+# remark：后台备注（选填），如区分同模板的中英文版本；
+# 显示在内容管理列表，不会发布到前台。更新时同名字段修改。
 
 # 更新（草稿状态可改；已发布页的正文更新走发布管线重发）
 curl -X PUT $BASE/content/<id> \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"title": "新标题", "version_comment": "改标题"}'
+  -d '{"title": "新标题", "remark": "中文版", "version_comment": "改标题"}'
+
+# MCP 同名工具（create_content / update_content / bulk_*）同样接受 remark 字段。
 
 # 上线 / 下线（经典路径；大流量发布建议 3.2）
 curl -X POST $BASE/content/<id>/publish -H "Authorization: Bearer $KEY"

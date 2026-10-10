@@ -16,6 +16,7 @@ type Content struct {
 	Category        string                 `json:"category"`
 	Tags            []string               `json:"tags,omitempty"`
 	MetaDescription string                 `json:"meta_description"`
+	Remark          string                 `json:"remark,omitempty"`
 	OGImage         string                 `json:"og_image"`
 	Data            map[string]interface{} `json:"data"`
 	Published       bool                   `json:"published"`
@@ -89,6 +90,7 @@ type CreateContentRequest struct {
 	Category        string                 `json:"category,omitempty"`
 	Tags            []string               `json:"tags,omitempty"`
 	MetaDescription string                 `json:"meta_description,omitempty"`
+	Remark          string                 `json:"remark,omitempty"`
 	OGImage         string                 `json:"og_image,omitempty"`
 	Data            map[string]interface{} `json:"data"`
 	Published       bool                   `json:"published,omitempty"`

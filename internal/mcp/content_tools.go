@@ -34,6 +34,7 @@ type CreateContentInput struct {
 	Category        string                 `json:"category,omitempty" jsonschema:"Content category for collections"`
 	Tags            []string               `json:"tags,omitempty" jsonschema:"Tags for lc:query index pages (e.g. ['AI & Machine Intelligence', 'Generative AI'])"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 	OGImage         string                 `json:"og_image,omitempty" jsonschema:"Open Graph image URL"`
 	Data            map[string]interface{} `json:"data" jsonschema:"Template field values,required"`
 	UseHeader       bool                   `json:"use_header,omitempty" jsonschema:"Include site header"`
@@ -54,6 +55,7 @@ type UpdateContentInput struct {
 	Category        string                 `json:"category,omitempty" jsonschema:"Content category"`
 	Tags            []string               `json:"tags,omitempty" jsonschema:"Tags for lc:query index pages"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 	OGImage         string                 `json:"og_image,omitempty" jsonschema:"Open Graph image URL"`
 	Data            map[string]interface{} `json:"data,omitempty" jsonschema:"Template field values"`
 	UseHeader       bool                   `json:"use_header,omitempty" jsonschema:"Include site header"`
@@ -81,6 +83,7 @@ type BulkCreateItem struct {
 	Category        string                 `json:"category,omitempty" jsonschema:"Content category"`
 	Tags            []string               `json:"tags,omitempty" jsonschema:"Tags"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 	OGImage         string                 `json:"og_image,omitempty" jsonschema:"Open Graph image URL"`
 	Data            map[string]interface{} `json:"data" jsonschema:"Template field values,required"`
 	Published       bool                   `json:"published,omitempty" jsonschema:"Publish immediately"`
@@ -129,6 +132,7 @@ type UpdateContentByPathInput struct {
 	Category        string                 `json:"category,omitempty" jsonschema:"Content category"`
 	Tags            []string               `json:"tags,omitempty" jsonschema:"Tags for lc:query index pages"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 	OGImage         string                 `json:"og_image,omitempty" jsonschema:"Open Graph image URL"`
 	Published       *bool                  `json:"published,omitempty" jsonschema:"Publish state"`
 	VersionComment  string                 `json:"version_comment,omitempty" jsonschema:"Version comment"`
@@ -145,6 +149,7 @@ type BulkUpdateItem struct {
 	Data            map[string]interface{} `json:"data,omitempty" jsonschema:"Fields to update (merge semantics)"`
 	ClearFields     []string               `json:"clear_fields,omitempty" jsonschema:"Field names to clear to empty string"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 }
 
 type BulkUpdateContentInput struct {
@@ -357,6 +362,7 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 			Category:        args.Category,
 			Tags:            args.Tags,
 			MetaDescription: args.MetaDescription,
+			Remark:          args.Remark,
 			OGImage:         args.OGImage,
 			Data:            args.Data,
 			Published:       args.Published,
@@ -446,6 +452,9 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 		}
 		if args.MetaDescription != "" {
 			updates["meta_description"] = args.MetaDescription
+		}
+		if args.Remark != "" {
+			updates["remark"] = args.Remark
 		}
 		if args.OGImage != "" {
 			updates["og_image"] = args.OGImage
@@ -841,6 +850,9 @@ Only the fields you provide are changed. Always include a version_comment descri
 		}
 		if args.MetaDescription != "" {
 			updates["meta_description"] = args.MetaDescription
+		}
+		if args.Remark != "" {
+			updates["remark"] = args.Remark
 		}
 		if args.OGImage != "" {
 			updates["og_image"] = args.OGImage

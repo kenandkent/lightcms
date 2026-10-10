@@ -2160,6 +2160,7 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 			Category        string                 `json:"category"`
 			Tags            []string               `json:"tags"`
 			MetaDescription string                 `json:"meta_description"`
+			Remark          string                 `json:"remark"`
 			OGImage         string                 `json:"og_image"`
 			Data            map[string]interface{} `json:"data"`
 			Published       bool                   `json:"published"`
@@ -2238,6 +2239,7 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 			Category:        item.Category,
 			Tags:            item.Tags,
 			MetaDescription: item.MetaDescription,
+			Remark:          item.Remark,
 			OGImage:         item.OGImage,
 			Data:            item.Data,
 			Published:       item.Published,
@@ -2342,6 +2344,7 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 		Data            map[string]interface{} `json:"data,omitempty"`
 		ClearFields     []string               `json:"clear_fields,omitempty"`
 		MetaDescription string                 `json:"meta_description,omitempty"`
+		Remark          string                 `json:"remark,omitempty"`
 	}
 	var req struct {
 		Updates        []updateSpec `json:"updates"`
@@ -2475,6 +2478,9 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 					}
 					if job.upd.MetaDescription != "" {
 						c.MetaDescription = job.upd.MetaDescription
+					}
+					if job.upd.Remark != "" {
+						c.Remark = job.upd.Remark
 					}
 					if job.upd.Data != nil {
 						if c.Data == nil {
