@@ -1037,6 +1037,28 @@ func TestListContent_Authenticated(t *testing.T) {
 	}
 }
 
+// TestListContent_NoPathColumn pins the content-list layout: the path column
+// was removed, so seeded paths must not render as table cells (titles still do).
+func TestListContent_NoPathColumn(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	tmplID := seedTemplate(t, h.db, "Page", "page")
+	seedContent(t, h.db, tmplID, "No Path Cell", "no-path-cell", "/no-path-cell-probe")
+
+	rr := csrfAuthGet(t, h, "/cm/content", "/cm/content", h.ListContent)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "No Path Cell") {
+		t.Fatalf("list should render the seeded title")
+	}
+	if strings.Contains(body, "<code>/no-path-cell-probe</code>") {
+		t.Fatalf("list must not render the path column cell")
+	}
+}
+
 func TestNewContent_Authenticated(t *testing.T) {
 	h, cleanup := newTestHandler(t)
 	defer cleanup()

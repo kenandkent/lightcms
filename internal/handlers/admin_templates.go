@@ -555,7 +555,6 @@ var adminTemplates = map[string]string{
                     <tr>
                         <th>{{i18n "table.title" "标题" $.Lang}}</th>
                         <th>{{i18n "content_list.template" "模板" $.Lang}}</th>
-                        <th>{{i18n "table.path" "路径" $.Lang}}</th>
                         <th>{{i18n "table.status" "状态" $.Lang}}</th>
                         <th>{{i18n "table.updated" "更新时间" $.Lang}}</th>
                         <th>{{i18n "table.actions" "操作" $.Lang}}</th>
@@ -566,7 +565,6 @@ var adminTemplates = map[string]string{
                     <tr{{if .Deleted}} style="opacity: 0.7;"{{end}}>
                         <td><strong>{{.Title}}</strong></td>
                         <td>{{.TemplateName}}</td>
-                        <td><code>{{if .Deleted}}(deleted){{else if .FullPath}}{{.FullPath}}{{else}}/{{.Slug}}{{end}}</code></td>
                         <td>
                             {{if .Deleted}}
                             <span class="status-badge" style="background: var(--danger);">{{i18n "status.deleted" "已删除" $.Lang}}</span>
