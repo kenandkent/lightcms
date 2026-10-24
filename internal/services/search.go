@@ -22,6 +22,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/net/proxy"
 )
 
@@ -561,33 +562,97 @@ func (s *SearchService) SearchHybrid(ctx context.Context, query string, limit in
 	return results, nil
 }
 
-// UpdateContentEmbedding generates and stores an embedding for the given content
+// UpdateContentEmbedding generates and stores an embedding for the given content.
+// Unpinned entry point: the write is stamped with the live CurrentVersion so
+// later pinned jobs can order against it (see
+// UpdateContentEmbeddingForVersion).
 func (s *SearchService) UpdateContentEmbedding(ctx context.Context, contentID primitive.ObjectID) error {
 	var content models.Content
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &content); err != nil {
 		return fmt.Errorf("content not found: %w", err)
 	}
+	_, err := s.UpdateContentEmbeddingForVersion(ctx, contentID, content.CurrentVersion)
+	return err
+}
+
+// UpdateContentEmbeddingForVersion embeds the CURRENT live text but stamps the
+// write with the caller's mutation-time version pin, so out-of-order async
+// jobs converge to the latest text instead of last-writer-winning with older
+// text. A job is stale when a newer version is already indexed
+// (stored embedding_version >= pin): it skips before burning a provider call,
+// and the post-generation conditional write re-checks (the stored version
+// may have advanced during generation). Every mutation spawns its own job, so
+// skipping a stale job never removes the newest version's pending write —
+// liveness is preserved, and BatchGenerateEmbeddings remains the crash-recovery
+// backstop. pin <= 0 preserves the legacy unconditional write for versionless
+// documents. Reports whether this job's write won.
+func (s *SearchService) UpdateContentEmbeddingForVersion(ctx context.Context, contentID primitive.ObjectID, version int64) (bool, error) {
+	var content models.Content
+	if err := s.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &content); err != nil {
+		return false, fmt.Errorf("content not found: %w", err)
+	}
+	if content.ForkID != nil {
+		// Defense in depth: fork copies share the live full_path and must
+		// never enter the embedding index. Callers already guard, but a
+		// direct call with a fork ID must be a no-op, not an index write.
+		return false, nil
+	}
 
 	plainText := ExtractPlainText(&content)
 	if plainText == "" {
-		return nil // Nothing to embed
+		return false, nil // Nothing to embed
+	}
+
+	// Early skip: a same-or-newer version is already indexed.
+	if version > 0 && content.EmbeddingVersion >= version && content.EmbeddingAt != nil {
+		return false, nil
 	}
 
 	embedding, err := s.generateEmbedding(ctx, plainText, "document")
 	if err != nil {
-		return fmt.Errorf("failed to generate embedding: %w", err)
+		return false, fmt.Errorf("failed to generate embedding: %w", err)
 	}
 
+	return s.storeEmbeddingIfNewer(ctx, contentID, version, embedding, plainText)
+}
+
+// storeEmbeddingIfNewer persists an embedding plus its cached plain text (the
+// llms-full.txt source of truth) stamped with the producing version pin. The
+// conditional filter is the exactly-once arbiter: the write lands only when
+// no same-or-newer version is already indexed, so a slow job carrying older
+// text can never overwrite a newer one. Uses the hook-honoring DB wrapper so
+// test fault injection keeps working. The post-write re-read classifies the
+// outcome for callers (a concurrent winner is convergence, not an error).
+func (s *SearchService) storeEmbeddingIfNewer(ctx context.Context, contentID primitive.ObjectID, pin int64, embedding []float32, plainText string) (bool, error) {
 	now := time.Now()
-	update := bson.M{
-		"$set": bson.M{
-			"embedding":    embedding,
-			"embedding_at": now,
-			"plain_text":   plainText,
-		},
+	set := bson.M{
+		"embedding":    embedding,
+		"embedding_at": now,
+		"plain_text":   plainText,
 	}
-
-	return s.db.UpdateOne(ctx, "content", bson.M{"_id": contentID}, update)
+	filter := bson.M{"_id": contentID}
+	if pin > 0 {
+		set["embedding_version"] = pin
+		filter = bson.M{"_id": contentID, "$or": []bson.M{
+			{"embedding_version": bson.M{"$exists": false}},
+			{"embedding_version": bson.M{"$lt": pin}},
+		}}
+	}
+	if err := s.db.UpdateOne(ctx, "content", filter, bson.M{"$set": set}); err != nil {
+		return false, err
+	}
+	if pin <= 0 {
+		return true, nil // legacy unconditional write always wins
+	}
+	// Classify: did our write land, or did a newer version win the race?
+	var stored models.Content
+	if err := s.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &stored); err != nil {
+		return false, err
+	}
+	if stored.EmbeddingVersion > pin {
+		return false, nil // a newer version indexed concurrently; converged
+	}
+	return true, nil
 }
 
 // BatchGenerateEmbeddings generates embeddings for all published content that needs them
@@ -596,20 +661,36 @@ func (s *SearchService) BatchGenerateEmbeddings(ctx context.Context) (processed,
 		return 0, 0, fmt.Errorf("no embedding provider configured (set VOYAGE_API_KEY or LIGHTCMS_EMBEDDINGS_PROVIDER=ollama)")
 	}
 
-	// Find all published, non-deleted live content. Fork copies must never
-	// touch the embedding index.
+	// Find all published, non-deleted, non-fork content. Fork copies share
+	// the live full_path and must never enter the embedding index; the
+	// projection keeps the ~4KB embedding vector (and every other large
+	// field) off the wire — only the inputs to ExtractPlainText and the
+	// version-pin comparisons are loaded.
 	filter := bson.M{
 		"published": true,
 		"deleted":   bson.M{"$ne": true},
+		"fork_id":   nil,
 	}
-	liveOnly(filter)
-
-	var contents []models.Content
-	if err := s.db.FindAll(ctx, "content", filter, &contents); err != nil {
+	proj := options.Find().SetProjection(bson.M{
+		"data": 1, "plain_text": 1, "embedding_at": 1, "updated_at": 1,
+		"current_version": 1, "embedding_version": 1, "full_path": 1,
+		// Title + meta feed ExtractPlainText: omitting them recomputes a
+		// truncated text, which would both regenerate embeddings every
+		// run and persist a damaged plain_text back.
+		"title": 1, "meta_description": 1,
+	})
+	cursor, err := s.db.FindMany(ctx, "content", filter, proj)
+	if err != nil {
 		return 0, 0, fmt.Errorf("failed to list content: %w", err)
 	}
+	defer cursor.Close(ctx)
 
-	for _, c := range contents {
+	for cursor.Next(ctx) {
+		var c models.Content
+		if derr := cursor.Decode(&c); derr != nil {
+			errCount++
+			continue
+		}
 		plainText := ExtractPlainText(&c)
 		if plainText == "" {
 			continue
@@ -617,6 +698,10 @@ func (s *SearchService) BatchGenerateEmbeddings(ctx context.Context) (processed,
 
 		// Skip if embedding is up to date
 		if c.EmbeddingAt != nil && c.EmbeddingAt.After(c.UpdatedAt) && c.PlainText == plainText {
+			continue
+		}
+		// Version-pinned skip: this version's text is already indexed.
+		if c.CurrentVersion > 0 && c.EmbeddingVersion >= c.CurrentVersion && c.PlainText == plainText {
 			continue
 		}
 
@@ -627,28 +712,30 @@ func (s *SearchService) BatchGenerateEmbeddings(ctx context.Context) (processed,
 			continue
 		}
 
-		now := time.Now()
-		update := bson.M{
-			"$set": bson.M{
-				"embedding":    embedding,
-				"embedding_at": now,
-				"plain_text":   plainText,
-			},
-		}
-
-		if updateErr := s.db.UpdateOne(ctx, "content", bson.M{"_id": c.ID}, update); updateErr != nil {
+		// Pinned conditional write: a concurrent async job for a newer
+		// version wins instead of being overwritten here. A converged skip
+		// is not counted as processed.
+		embedded, updateErr := s.storeEmbeddingIfNewer(ctx, c.ID, c.CurrentVersion, embedding, plainText)
+		if updateErr != nil {
 			log.Printf("Failed to save embedding for %s: %v", c.FullPath, updateErr)
 			errCount++
 			continue
 		}
 
-		processed++
+		if embedded {
+			processed++
+		}
+	}
+	if cerr := cursor.Err(); cerr != nil {
+		return processed, errCount + 1, fmt.Errorf("content cursor failed: %w", cerr)
 	}
 
 	return processed, errCount, nil
 }
 
-// EmbeddingStats returns counts of content with and without embeddings
+// EmbeddingStats returns counts of content with and without embeddings.
+// Both filters match the BatchGenerateEmbeddings membership (published,
+// not deleted, not a fork copy) so monitoring agrees with the indexer.
 func (s *SearchService) EmbeddingStats(ctx context.Context) (total, withEmbedding int64, err error) {
 	// Live pages only: fork copies are not part of the embedding index.
 	publishedFilter := bson.M{"published": true, "deleted": bson.M{"$ne": true}}
@@ -661,6 +748,7 @@ func (s *SearchService) EmbeddingStats(ctx context.Context) (total, withEmbeddin
 	embeddedFilter := bson.M{
 		"published":    true,
 		"deleted":      bson.M{"$ne": true},
+		"fork_id":      bson.M{"$exists": false},
 		"embedding_at": bson.M{"$exists": true},
 	}
 	liveOnly(embeddedFilter)

@@ -186,7 +186,7 @@ func TestAgentSendDigest(t *testing.T) {
 	})
 	cs := NewContentService(db)
 	forks := NewForkService(db, cs)
-	fork, _ := forks.Create(ctx, "pending-fork", "", primitive.NewObjectID(), "e@x.com")
+	fork, _ := forks.Create(ctx, "pending-fork", "", primitive.NewObjectID(), "e@x.com", "")
 	liveID := seedLiveContent(t, db, "Live", "/fork-me")
 	_, _ = forks.ForkPage(ctx, fork.ID, liveID)
 

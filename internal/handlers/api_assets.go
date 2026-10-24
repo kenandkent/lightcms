@@ -2,10 +2,12 @@ package handlers
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/metavert-io/lightcms/v7/internal/auth"
 	"github.com/metavert-io/lightcms/v7/internal/netguard"
+	"github.com/metavert-io/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -24,6 +27,55 @@ import (
 // isPrivateOrReservedIP returns true if ip falls in any SSRF-blocked range.
 func isPrivateOrReservedIP(ip net.IP) bool {
 	return netguard.IsPrivateOrReservedIP(ip)
+}
+
+// maxRemoteAssetSize is the fixed MVP bound for POST /api/v1/assets/from-url
+// (spec §25.3): maxSize = 50 MiB. Bodies are read up to maxSize+1 bytes; any
+// length above maxSize is rejected with ASSET_TOO_LARGE and never saved, so a
+// truncated prefix is never persisted.
+const maxRemoteAssetSize int64 = 50 << 20
+
+// validateRemoteAssetURL parses rawURL and enforces fetch safety: http/https
+// only, a host, and no userinfo (spec §25.4 "URL userinfo"). DNS and IP
+// restrictions are enforced at dial time by ssrfSafeClient.
+func validateRemoteAssetURL(rawURL string) (*url.URL, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid url")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil, fmt.Errorf("url must use http or https scheme")
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("url must have a host")
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("url must not contain userinfo")
+	}
+	if u.Opaque != "" {
+		return nil, fmt.Errorf("invalid url")
+	}
+	return u, nil
+}
+
+// readBoundedRemoteBody enforces the 50 MiB bound (spec §25.3). A declared
+// Content-Length above the bound is rejected before reading; unknown or
+// chunked bodies are read up to maxSize+1 bytes and rejected when they exceed
+// the bound. Oversize always returns an ASSET_TOO_LARGE error and never
+// returns truncated bytes for saving.
+func readBoundedRemoteBody(body io.Reader, contentLength int64) ([]byte, error) {
+	if contentLength > maxRemoteAssetSize {
+		return nil, fmt.Errorf("ASSET_TOO_LARGE: remote asset exceeds 50 MiB limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(body, maxRemoteAssetSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxRemoteAssetSize {
+		return nil, fmt.Errorf("ASSET_TOO_LARGE: remote asset exceeds 50 MiB limit")
+	}
+	return data, nil
 }
 
 // ssrfSafeClient is an http.Client whose dialer rejects private/reserved IP ranges.
@@ -197,6 +249,10 @@ func (a *APIHandler) APIUploadAsset(w http.ResponseWriter, r *http.Request) {
 
 	asset, err := a.assetService.UploadAsset(r.Context(), data, req.Filename, req.ServePath, req.Description)
 	if err != nil {
+		if errors.Is(err, services.ErrAssetCanonicalCollision) {
+			a.jsonError(w, http.StatusConflict, err.Error())
+			return
+		}
 		a.jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -264,15 +320,22 @@ func (a *APIHandler) APIUploadAssetFromURL(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Reject non-http(s) schemes before any DNS resolution
-	lower := strings.ToLower(req.URL)
-	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
-		a.jsonError(w, http.StatusBadRequest, "url must use http or https scheme")
+	// Strict URL validation before any DNS resolution: http/https only, a
+	// host, and no userinfo (spec §25.4).
+	parsedURL, err := validateRemoteAssetURL(req.URL)
+	if err != nil {
+		a.jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Fail fast on an unsafe serve_path before fetching remote bytes.
+	if req.ServePath != "" && !isValidAssetServePath(req.ServePath) {
+		a.jsonError(w, http.StatusBadRequest, "serve_path must begin with /assets/, /images/, /docs/, /media/, or /files/")
 		return
 	}
 
 	// ssrfSafeClient resolves the host and blocks private/reserved IPs before connecting
-	resp, err := ssrfSafeClient.Get(req.URL)
+	resp, err := ssrfSafeClient.Get(parsedURL.String())
 	if err != nil {
 		// Return a generic error — never echo network internals back to the caller
 		a.jsonError(w, http.StatusBadGateway, "failed to fetch remote URL")
@@ -285,8 +348,14 @@ func (a *APIHandler) APIUploadAssetFromURL(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20)) // 50 MB cap
+	// Bounded read: Content-Length pre-check plus maxSize+1 LimitReader with an
+	// explicit length check. Oversize never saves truncated bytes.
+	data, err := readBoundedRemoteBody(resp.Body, resp.ContentLength)
 	if err != nil {
+		if strings.Contains(err.Error(), "ASSET_TOO_LARGE") {
+			a.jsonError(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
 		a.jsonError(w, http.StatusBadGateway, "failed to read remote response")
 		return
 	}
@@ -294,11 +363,7 @@ func (a *APIHandler) APIUploadAssetFromURL(w http.ResponseWriter, r *http.Reques
 	// Derive filename from URL path if serve_path not provided
 	servePath := req.ServePath
 	if servePath == "" {
-		urlPath := req.URL
-		if idx := strings.Index(urlPath, "?"); idx != -1 {
-			urlPath = urlPath[:idx]
-		}
-		filename := filepath.Base(urlPath)
+		filename := filepath.Base(parsedURL.Path)
 		if filename == "" || filename == "." || filename == "/" {
 			filename = "asset"
 		}
@@ -312,6 +377,10 @@ func (a *APIHandler) APIUploadAssetFromURL(w http.ResponseWriter, r *http.Reques
 
 	asset, err := a.assetService.UploadAsset(r.Context(), data, filename, servePath, req.Description)
 	if err != nil {
+		if errors.Is(err, services.ErrAssetCanonicalCollision) {
+			a.jsonError(w, http.StatusConflict, err.Error())
+			return
+		}
 		a.jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}

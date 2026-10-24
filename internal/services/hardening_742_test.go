@@ -103,8 +103,8 @@ func TestDeleteContent_ForkCopyFiresNoWebhookOrPurge(t *testing.T) {
 	if n := settle(hooks, 1); n != 1 {
 		t.Errorf("deleting the live page delivered %d webhooks, want 1", n)
 	}
-	if n := settle(purges, 1); n != 1 {
-		t.Errorf("deleting the live page attempted %d purges, want 1", n)
+	if n := atomic.LoadInt32(purges); n != 0 {
+		t.Errorf("draft deletion attempted %d purges before unpublish, want 0", n)
 	}
 }
 

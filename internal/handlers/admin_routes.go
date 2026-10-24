@@ -64,6 +64,7 @@ func (h *Handler) AdminRoutes() []AdminRoute {
 	return []AdminRoute{
 		// Sign-in, sign-out and password flows
 		public("GET", "/login", h.LoginPage, "the sign-in form"),
+		public("GET", "/lang", h.HandleLangSwitch, "changes only the caller's interface language"),
 		public("POST", "/login", h.LoginHandler, "signing in is what creates the session"),
 		public("POST", "/logout", h.LogoutHandler, "signing out only clears the caller's own session"),
 		session("GET", "/change-password", h.ForceChangePasswordPage, "forced change of the user's own password"),
@@ -122,6 +123,32 @@ func (h *Handler) AdminRoutes() []AdminRoute {
 		perm("GET", "/config", h.SiteConfiguration, auth.PermSettingsView),
 		perm("POST", "/config", h.UpdateSiteConfiguration, auth.PermSettingsEdit).audited("config.update"),
 
+		// Independent static delivery and operations remain administrator-only.
+		perm("GET", "/static-delivery", h.AdminStaticDeliveryPage, auth.PermUserManage),
+		perm("GET", "/static-delivery/publish", h.AdminStaticPublishPage, auth.PermContentView),
+		perm("GET", "/static-delivery/maintenance", h.AdminDeliveryMaintenance, auth.PermUserManage),
+		perm("GET", "/tasks", h.AdminTasksPage, auth.PermUserManage),
+		perm("GET", "/operations", h.AdminOperations, auth.PermUserManage),
+		perm("GET", "/dependencies", h.AdminDependencies, auth.PermUserManage),
+		perm("GET", "/artifacts", h.AdminArtifactsPage, auth.PermUserManage),
+		perm("POST", "/artifacts", h.AdminArtifactsPage, auth.PermUserManage).audited("artifact.manage"),
+		perm("POST", "/static-delivery/{kind:accounts|targets}", func(w http.ResponseWriter, r *http.Request) {
+			vars := mux.Vars(r)
+			vars["action"] = "create"
+			h.AdminStaticDeliveryAction(w, mux.SetURLVars(r, vars))
+		}, auth.PermUserManage).audited("delivery.create"),
+		perm("POST", "/static-delivery/{kind:accounts|targets}/{id}/{action}", h.AdminStaticDeliveryAction, auth.PermUserManage).audited("delivery.update"),
+		perm("POST", "/content/{id}/publish", h.AdminProductPublish, auth.PermContentPublish).audited("content.publish"),
+		perm("GET", "/content/{id}/publications", h.AdminProductPublications, auth.PermContentView),
+		perm("POST", "/content/{id}/versions/{version}/restore_and_publish", h.AdminProductRestoreAndPublish, auth.PermContentPublish).audited("content.restore_publish"),
+		perm("POST", "/content/{id}/publications/{publicationID}/revert_live", h.AdminProductRevertLive, auth.PermContentPublish).audited("content.revert_live"),
+		perm("GET", "/templates/{id}/upgrade-preview", h.AdminProductUpgradePreview, auth.PermTemplateEdit),
+		perm("POST", "/templates/{id}/upgrade-start", h.AdminProductUpgradeStart, auth.PermTemplateEdit).audited("template.upgrade"),
+		perm("POST", "/upgrade-jobs/{jobID}/run", h.AdminProductUpgradeRun, auth.PermTemplateEdit).audited("template.upgrade_run"),
+		perm("POST", "/upload", h.UploadFile, auth.PermAssetUpload).audited("asset.upload"),
+		jsonPerm("POST", "/content/{id}/lock/refresh", h.RefreshLock, auth.PermContentEdit).audited("content.lock_refresh"),
+		perm("POST", "/content/{id}/lock/force", h.ForceUnlock, auth.PermUserManage).audited("content.unlock"),
+
 		// Folders
 		perm("GET", "/folders", h.ListFolders, auth.PermSettingsView),
 		perm("GET", "/folders/new", h.NewFolder, auth.PermSettingsEdit),
@@ -154,6 +181,7 @@ func (h *Handler) AdminRoutes() []AdminRoute {
 		perm("GET", "/api-keys", h.APIKeysPage, auth.PermAPIKeyManage),
 		perm("GET", "/api-keys/new", h.NewAPIKeyPage, auth.PermAPIKeyManage),
 		perm("POST", "/api-keys/new", h.CreateAPIKey, auth.PermAPIKeyManage).audited("apikey.create"),
+		jsonPerm("POST", "/api-keys/{id}/reveal", h.RevealAPIKey, auth.PermAPIKeyManage).audited("apikey.reveal"),
 		perm("POST", "/api-keys/{id}/delete", h.DeleteAPIKey, auth.PermAPIKeyManage).audited("apikey.delete"),
 
 		// Approvals dashboard

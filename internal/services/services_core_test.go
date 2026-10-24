@@ -35,6 +35,9 @@ func TestApprovalService_Flow(t *testing.T) {
 		ID: primitive.NewObjectID(), TemplateID: primitive.NewObjectID(),
 		Title: "Draft", Slug: "draft", FullPath: "/draft",
 	}
+	if err := cs.CreateContent(ctx, content); err != nil {
+		t.Fatal(err)
+	}
 	req, err := aps.SubmitContentForApproval(ctx, content, primitive.NewObjectID(), "author@x.com")
 	if err != nil {
 		t.Fatalf("SubmitContentForApproval: %v", err)
@@ -78,6 +81,9 @@ func TestApprovalService_RejectCancel(t *testing.T) {
 
 	mk := func(slug string) *models.ApprovalRequest {
 		c := &models.Content{ID: primitive.NewObjectID(), TemplateID: primitive.NewObjectID(), Title: slug, Slug: slug, FullPath: "/" + slug}
+		if err := cs.CreateContent(ctx, c); err != nil {
+			t.Fatal(err)
+		}
 		req, err := aps.SubmitContentForApproval(ctx, c, primitive.NewObjectID(), "a@x.com")
 		if err != nil {
 			t.Fatalf("submit %s: %v", slug, err)

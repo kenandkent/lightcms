@@ -13,7 +13,15 @@ type contextKey int
 const (
 	// apiUserContextKey stores the authenticated API user in context
 	apiUserContextKey contextKey = iota
+	originalOAuthTokenKey
 )
+
+// OriginalOAuthToken keeps the original credential through the MCP loopback
+// client. It is never accepted from a user-supplied forwarding header.
+func OriginalOAuthToken(ctx context.Context) string {
+	s, _ := ctx.Value(originalOAuthTokenKey).(string)
+	return s
+}
 
 // APIKeyValidateFunc validates an API key and returns the authenticated user (as interface{}).
 // The returned value will be stored in the request context and can be retrieved with APIUserFromContext.
@@ -149,6 +157,7 @@ func (m *APIAuth) Middleware(next http.Handler) http.Handler {
 			}
 			// Replace Authorization header with system API key so downstream
 			// handlers (MCP http_handler, REST API) work correctly
+			r = r.WithContext(context.WithValue(r.Context(), originalOAuthTokenKey, token))
 			r.Header.Set("Authorization", "Bearer "+m.systemAPIKey)
 			next.ServeHTTP(w, r)
 		} else {
@@ -172,5 +181,39 @@ func apiJsonError(w http.ResponseWriter, status int, message string) {
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": message,
+		// Wave-3B parity: machine-readable sibling code alongside the
+		// legacy string error (API.md §12; 401 maps to UNAUTHENTICATED).
+		"code": errorCodeForStatus(status),
 	})
+}
+
+// errorCodeForStatus mirrors the APIHandler default code table
+// (APIHandler.defaultErrorCode in internal/handlers/api.go, docs/API.md
+// §12) for the middleware auth path so both error tracks stay consistent.
+// NOTE: Go import direction (handlers → middleware) forbids sharing the
+// function — this duplicate must be kept identical to defaultErrorCode by
+// hand; the apiauth_code test pins the overlapping statuses.
+func errorCodeForStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "INVALID_REQUEST"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "CONFLICT"
+	case http.StatusUnprocessableEntity:
+		return "VALIDATION_FAILED"
+	case http.StatusTooManyRequests:
+		return "RATE_LIMITED"
+	case http.StatusInternalServerError:
+		return "INTERNAL_ERROR"
+	case http.StatusServiceUnavailable:
+		return "SERVICE_UNAVAILABLE"
+	default:
+		return "ERROR"
+	}
 }

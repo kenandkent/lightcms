@@ -1,0 +1,351 @@
+openapi: 3.0.3
+info:
+  title: LightCMS Independent Static Report Delivery
+  version: 1.1.0
+  description: |
+    Publishing, explicit target maintenance, asynchronous preparation and evidence-based recovery.
+    Bearer API keys inherit
+    current user permissions; sandbox-only credentials are rejected. Export and
+    download need content.view; deploy, preview, options and target history also
+    need content.publish. Account and target management use the existing admin UI.
+    POST JSON is strict (unknown fields rejected), maximum 1 MiB.
+    Admin equivalents prepend /cm/static-delivery/api instead of /api/v1 and
+    require a session and X-CSRF-Token. Errors include code and optional message.
+servers:
+  - url: /api/v1
+security:
+  - ApiKey: []
+paths:
+  /static-delivery/options:
+    get:
+      summary: Enabled accounts with ready Worker targets, including busy indication
+      responses:
+        '200':
+          description: Array of id, name, account_ref, account_name, origin, environment, revision, config_revision and busy. No Token.
+  /static-exports:
+    post:
+      summary: Freeze verified Publication selection and queue export
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [content_id]
+                    properties:
+                      content_id:
+                        $ref: '#/components/schemas/ID'
+                      publication_id:
+                        $ref: '#/components/schemas/ID'
+      responses:
+        '202':
+          $ref: '#/components/responses/Accepted'
+        '409':
+          description: Nonexportable snapshot or same key with different body
+        '428':
+          description: STATIC_IDEMPOTENCY_KEY_REQUIRED
+  /static-exports/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      summary: Read owner-scoped frozen export record
+      responses:
+        '200':
+          description: id, operation_id, job_id, state (queued/building/ready/failed), frozen metadata and error_code
+        '404':
+          description: Missing or not owned (admin can read other owners)
+  /static-exports/{id}/download:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      summary: Stream a verified completed ZIP or standalone single HTML
+      parameters:
+        - in: query
+          name: format
+          required: false
+          schema:
+            type: string
+            enum: [zip, html]
+            default: zip
+      responses:
+        '200':
+          description: Attachment; application/zip or text/html
+          content:
+            application/zip:
+              schema: {type: string, format: binary}
+            text/html:
+              schema: {type: string}
+        '410':
+          description: STATIC_ARTIFACT_UNAVAILABLE (not ready, missing or incomplete)
+        '422':
+          description: STATIC_DOCUMENT_NOT_STANDALONE; use ZIP
+  /static-targets/{id}/deployment-preview:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      summary: Freeze full candidate release and confirmation (no remote write)
+      parameters:
+        - in: header
+          name: Prefer
+          schema: {type: string, enum: [respond-async]}
+          description: Returns a durable preparation job when supported. Omit for the legacy synchronous response.
+        - in: header
+          name: Idempotency-Key
+          schema: {type: string, minLength: 1}
+          description: Required with respond-async; reuse for uncertain-response retries.
+      requestBody:
+        $ref: '#/components/requestBodies/Deploy'
+      responses:
+        '202':
+          description: Preview preparation accepted; poll static-preview-jobs, not static-deployments
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PreparationJob'}
+        '200':
+          description: Confirmation belongs to owner, target and exact request; expires in one hour
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  confirmation_digest: {type: string}
+                  target_id: {$ref: '#/components/schemas/ID'}
+                  delivery_mode:
+                    type: string
+                    enum: [assets-only-v1, assets-first-v1]
+                    description: New releases are pure static assets. The legacy mode remains readable for old frozen previews.
+                  changes:
+                    type: array
+                    items: {$ref: '#/components/schemas/Page'}
+                  preserved_pages: {type: integer}
+                  expires_at: {type: string, format: date-time}
+                  diagnostics: {type: array, items: {type: object}}
+        '409':
+          description: Target busy/not ready, stale revision or path ownership conflict
+        '428':
+          description: Explicit manual_script_review=true required
+  /static-preview-jobs/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      summary: Read an owned preview preparation job and its completed preview
+      responses:
+        '200':
+          description: Preview is present only after successful preparation; no publication has occurred
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PreparationJob'}
+  /static-targets/{id}/recovery-preview:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      summary: Inspect a recorded remote version without uploading or activating it (administrator only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false}
+      responses:
+        '200':
+          description: Owner-bound evidence, target revision, remote version and confirmation_digest; expires in 15 minutes
+        '409':
+          description: Active or uncertain job, foreign Worker, changed settings or unknown version; no forced takeover
+  /static-targets/{id}/recover:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      summary: Queue verification and CAS adoption of the exact recovery evidence (administrator only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirmation_digest, confirmed]
+              properties:
+                confirmation_digest: {type: string}
+                confirmed: {type: boolean, enum: [true]}
+      responses:
+        '202':
+          description: Durable recovery job; the owner and digest identify retries of the same operation
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PreparationJob'}
+        '428':
+          description: Confirmation missing or expired
+  /static-recovery-jobs/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      summary: Read recovery progress; succeeded returns delivery_job_id for verified links
+      responses:
+        '200':
+          description: Recovery workflow state and optional resulting delivery history job
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PreparationJob'}
+  /static-targets/{id}/deployments:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      summary: Queue the exact confirmed release, with CAS target ownership
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        $ref: '#/components/requestBodies/Deploy'
+      responses:
+        '202':
+          $ref: '#/components/responses/Accepted'
+        '409':
+          description: Revision, idempotency or target ownership conflict
+        '428':
+          description: Missing, altered or expired confirmation; preview again
+    get:
+      summary: Recent target jobs (non-admin only own credential owner)
+      parameters:
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+        - in: query
+          name: offset
+          schema: {type: integer, minimum: 0, default: 0}
+      responses:
+        '200':
+          description: Object with jobs, limit and offset; newest created_at first
+  /static-deployments/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      summary: Read export or deployment job and release links
+      responses:
+        '200':
+          description: |
+            Object with job (id, kind, state, export_id, release_id, target_id,
+            checkpoint, error_code) and optional pages. Page links are returned only after
+            state=succeeded. State may be queued/preparing/uploading/version_ready/
+            activating/verifying/activation_unknown/active_unverified/succeeded/
+            blocked/failed/cancelled. Only succeeded proves verification completed.
+            checkpoint.verification contains durable round and offset counters.
+            checkpoint.activation_rejected is true only for a definite synchronous
+            Cloudflare activation refusal; the failed job releases its target.
+        '404':
+          description: Missing or not owned
+  /static-deployments/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      summary: Cancel export/deploy before activation intent; never withdraw live pages
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false}
+      responses:
+        '200':
+          description: Object with cancelled job; repeated cancellation is idempotent
+        '409':
+          description: Activation intent exists or state cannot cancel; reconcile, do not release target
+components:
+  securitySchemes:
+    ApiKey: {type: http, scheme: bearer}
+  parameters:
+    ID:
+      in: path
+      name: id
+      required: true
+      schema: {$ref: '#/components/schemas/ID'}
+    Idempotency:
+      in: header
+      name: Idempotency-Key
+      required: true
+      description: Reuse for retries of the same exact action; new key for a new action
+      schema: {type: string, minLength: 1}
+  requestBodies:
+    Deploy:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [expected_revision, expected_config_revision, manual_script_review]
+            description: >-
+              Missing operation means publish and requires export_ids. Maintenance must omit exports.
+              withdraw requires paths; rollback_pages requires paths and source_release_id;
+              rollback_site requires source_release_id. Origin/environment changes require administrator permission.
+              Only fields relevant to the selected operation are accepted.
+            properties:
+              operation:
+                type: string
+                enum: [publish, withdraw, rollback_pages, rollback_site, change_origin, change_environment]
+                default: publish
+              queue_mode:
+                type: string
+                enum: ['', merge_nonconflicting]
+                description: Publish only. Opt in to queueing and preserving unrelated intervening changes; same-path changes fail. Omit to retain strict revision semantics.
+              paths:
+                type: array
+                minItems: 1
+                maxItems: 100
+                uniqueItems: true
+                items: {type: string}
+              source_release_id: {$ref: '#/components/schemas/ID'}
+              new_origin: {type: string, format: uri, description: HTTPS origin already bound to the same Worker; no DNS mutation}
+              new_environment: {type: string, enum: [test, production]}
+              export_ids:
+                type: array
+                minItems: 1
+                maxItems: 100
+                items: {$ref: '#/components/schemas/ID'}
+              expected_revision: {type: integer, format: int64, minimum: 0}
+              expected_config_revision: {type: integer, format: int64, minimum: 1}
+              manual_script_review: {type: boolean, enum: [true]}
+              confirmation_digest:
+                type: string
+                description: Required on deployment POST, from exact preview; omitted when previewing
+  schemas:
+    PreparationJob:
+      type: object
+      properties:
+        job_id: {$ref: '#/components/schemas/ID'}
+        target_id: {$ref: '#/components/schemas/ID'}
+        state: {type: string, enum: [queued, running, succeeded, failed, cancelled, partial, needs_review]}
+        error_code: {type: string}
+        preview: {type: object, description: Frozen preview including request and confirmation_digest, only on successful preparation}
+        delivery_job_id: {$ref: '#/components/schemas/ID'}
+    ID: {type: string, pattern: '^[a-fA-F0-9]{24}$'}
+    Page:
+      type: object
+      properties:
+        path: {type: string}
+        action: {type: string, enum: [add, replace, remove]}
+        publication_id: {$ref: '#/components/schemas/ID'}
+        url: {type: string, format: uri}
+  responses:
+    Accepted:
+      description: Durable job accepted, not proof of Cloudflare publication
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              job_id: {$ref: '#/components/schemas/ID'}
+              operation_id: {$ref: '#/components/schemas/ID'}
+              export_id: {$ref: '#/components/schemas/ID'}
+              state: {type: string}
+              status_url: {type: string}

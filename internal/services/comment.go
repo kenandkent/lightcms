@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
@@ -37,7 +39,14 @@ func (s *CommentService) SetWebhookService(ws *WebhookService) {
 	s.webhookService = ws
 }
 
+// ErrContentNotFound reports a comment create against a missing content
+// row. Handlers map it to HTTP 404 (no orphan comments).
+var ErrContentNotFound = errors.New("content not found")
+
 // Create inserts a new comment and fires the comment.created webhook.
+// Lane 2C fix 2: refuses orphan comments (the content row must exist) and
+// stamps provenance/session from the request context following the content
+// version-row pattern (EditorEmail + Provenance, Actor "human" default).
 func (s *CommentService) Create(ctx context.Context,
 	contentID, userID primitive.ObjectID,
 	userEmail, displayName, text string,
@@ -46,6 +55,17 @@ func (s *CommentService) Create(ctx context.Context,
 	if text == "" {
 		return nil, fmt.Errorf("comment text is required")
 	}
+	var existing models.Content
+	if err := s.db.FindOne(ctx, "content", bson.M{"_id": contentID}, &existing); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, fmt.Errorf("comment on content %s: %w", contentID.Hex(), ErrContentNotFound)
+		}
+		return nil, fmt.Errorf("looking up content: %w", err)
+	}
+	prov, _ := ProvenanceFromContext(ctx)
+	if prov.Actor == "" {
+		prov.Actor = "human" // default for legacy paths that set no provenance
+	}
 	c := &models.ContentComment{
 		ContentID:       contentID,
 		UserID:          userID,
@@ -53,6 +73,9 @@ func (s *CommentService) Create(ctx context.Context,
 		UserDisplayName: displayName,
 		Text:            text,
 		Mentions:        mentions,
+		Actor:           prov.Actor,
+		Via:             prov.Via,
+		AgentSession:    prov.AgentSession,
 		CreatedAt:       time.Now(),
 	}
 	id, err := s.db.InsertOne(ctx, "content_comments", c)

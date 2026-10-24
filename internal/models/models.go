@@ -15,20 +15,39 @@ type TemplateField struct {
 	Placeholder string `bson:"placeholder,omitempty" json:"placeholder,omitempty"`
 	Options     string `bson:"options,omitempty" json:"options,omitempty"` // comma-separated for select type
 	Default     string `bson:"default,omitempty" json:"default,omitempty"`
+
+	Description string          `bson:"description,omitempty" json:"description,omitempty"`
+	Example     string          `bson:"example,omitempty" json:"example,omitempty"`
+	Validation  FieldValidation `bson:"validation,omitempty" json:"validation,omitempty"`
+}
+
+// FieldValidation holds optional validation constraints for a TemplateField.
+// Defined in models (not templatecontract): templatecontract may import
+// models, but models must never import templatecontract.
+type FieldValidation struct {
+	MinLength        *int     `bson:"min_length,omitempty" json:"min_length,omitempty"`
+	MaxLength        *int     `bson:"max_length,omitempty" json:"max_length,omitempty"`
+	Pattern          string   `bson:"pattern,omitempty" json:"pattern,omitempty"`
+	Min              *float64 `bson:"min,omitempty" json:"min,omitempty"`
+	Max              *float64 `bson:"max,omitempty" json:"max,omitempty"`
+	AllowedProtocols []string `bson:"allowed_protocols,omitempty" json:"allowed_protocols,omitempty"`
+	MaxItems         *int     `bson:"max_items,omitempty" json:"max_items,omitempty"`
 }
 
 // Template defines a content structure template
 type Template struct {
-	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	Name        string             `bson:"name" json:"name"`
-	Slug        string             `bson:"slug" json:"slug"`
-	Description string             `bson:"description" json:"description"`
-	Fields      []TemplateField    `bson:"fields" json:"fields"`
-	HTMLLayout  string             `bson:"html_layout" json:"html_layout"` // HTML template with {{.FieldName}} placeholders
-	Category    string             `bson:"category" json:"category"`       // For grouping content
-	IsSystem    bool               `bson:"is_system" json:"is_system"`     // Built-in templates can't be deleted
-	CreatedAt   time.Time          `bson:"created_at" json:"created_at"`
-	UpdatedAt   time.Time          `bson:"updated_at" json:"updated_at"`
+	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Name           string             `bson:"name" json:"name"`
+	Slug           string             `bson:"slug" json:"slug"`
+	Description    string             `bson:"description" json:"description"`
+	Fields         []TemplateField    `bson:"fields" json:"fields"`
+	HTMLLayout     string             `bson:"html_layout" json:"html_layout"` // HTML template with {{.FieldName}} placeholders
+	Category       string             `bson:"category" json:"category"`       // For grouping content
+	IsSystem       bool               `bson:"is_system" json:"is_system"`     // Built-in templates can't be deleted
+	CurrentVersion int64              `bson:"current_version,omitempty" json:"current_version"`
+	Status         string             `bson:"status,omitempty" json:"status"` // draft | active | deprecated
+	CreatedAt      time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt      time.Time          `bson:"updated_at" json:"updated_at"`
 }
 
 // Content represents a content item created from a template
@@ -45,6 +64,7 @@ type Content struct {
 	Tags            []string               `bson:"tags,omitempty" json:"tags,omitempty"`     // Multi-value tags for lc:query filtering
 	MetaDescription string                 `bson:"meta_description" json:"meta_description"` // SEO meta description
 	OGImage         string                 `bson:"og_image" json:"og_image"`                 // Open Graph image URL
+	Remark          string                 `bson:"remark,omitempty" json:"remark,omitempty"` // Admin-only note (e.g. language variant); never rendered publicly
 	Data            map[string]interface{} `bson:"data" json:"data"`                         // Dynamic field values
 	Published       bool                   `bson:"published" json:"published"`
 	PublishedAt     *time.Time             `bson:"published_at,omitempty" json:"published_at,omitempty"`
@@ -56,10 +76,16 @@ type Content struct {
 	ContentHash     string                 `bson:"content_hash,omitempty" json:"-"`                          // SHA-256 of last generated static HTML
 	Embedding       []float32              `bson:"embedding,omitempty" json:"-"`                             // Voyage AI vector embedding (1024 dims)
 	EmbeddingAt     *time.Time             `bson:"embedding_at,omitempty" json:"-"`                          // When embedding was last generated
-	PlainText       string                 `bson:"plain_text,omitempty" json:"-"`                            // Cached stripped-HTML text for search snippets
-	PublishAt       *time.Time             `bson:"publish_at,omitempty" json:"publish_at,omitempty"`         // Scheduled publish time
-	Deleted         bool                   `bson:"deleted" json:"deleted"`                                   // Soft delete flag
-	DeletedAt       *time.Time             `bson:"deleted_at,omitempty" json:"deleted_at,omitempty"`
+	// EmbeddingVersion pins the embedding (and the cached PlainText written
+	// with it) to the ContentVersion whose text was embedded. Async embed
+	// jobs are exactly-once-safe: a stale job's conditional write is skipped
+	// when a newer version is already indexed, so rapid updates converge to
+	// the latest text instead of last-writer-winning with older text.
+	EmbeddingVersion int64      `bson:"embedding_version,omitempty" json:"-"`
+	PlainText        string     `bson:"plain_text,omitempty" json:"-"`                    // Cached stripped-HTML text for search snippets
+	PublishAt        *time.Time `bson:"publish_at,omitempty" json:"publish_at,omitempty"` // Scheduled publish time
+	Deleted          bool       `bson:"deleted" json:"deleted"`                           // Soft delete flag
+	DeletedAt        *time.Time `bson:"deleted_at,omitempty" json:"deleted_at,omitempty"`
 	// Set by the service's DeleteContent when it unpublishes a published page, so RestoreContent can publish it again (v7.4.4)
 	PublishedBeforeDelete bool   `bson:"published_before_delete,omitempty" json:"-"`
 	SourceURL             string `bson:"source_url,omitempty" json:"source_url,omitempty"` // Original URL for imported content (RSS dedup key)
@@ -70,6 +96,28 @@ type Content struct {
 	ContentModifiedAt *time.Time `bson:"content_modified_at,omitempty" json:"content_modified_at,omitempty"` // Last time the rendered page actually changed (falls back to UpdatedAt)
 	// Hold (v7.4): a held draft cannot be published by any path until the flag is cleared
 	Hold bool `bson:"hold,omitempty" json:"hold,omitempty"`
+	// Canonical path primitives (Task 2 / spec §12.8). FullPath keeps the
+	// author's canonical casing; CanonicalFullPath is the lowercased,
+	// Unicode NFC-normalized business key enforced by the
+	// UNIQUE(canonical_full_path, path_scope) partial index. Live content
+	// uses PathScope "live"; fork copies use their fork ObjectID hex.
+	// PathActive=false releases the path for reuse (soft delete path).
+	CanonicalFullPath string `bson:"canonical_full_path,omitempty" json:"-"`
+	PathScope         string `bson:"path_scope,omitempty" json:"-"`
+	PathActive        bool   `bson:"path_active,omitempty" json:"-"`
+	// CurrentVersion tracks the latest ContentVersion number for CAS
+	// allocation (replaces Count()+1 under concurrency). int64 to match
+	// ContentVersion.Version and the publication interfaces.
+	CurrentVersion int64 `bson:"current_version,omitempty" json:"current_version"`
+	// HasUnpublishedChanges marks a live page with draft edits awaiting Publish.
+	HasUnpublishedChanges bool `bson:"has_unpublished_changes,omitempty" json:"has_unpublished_changes"`
+	// RequiresPublish is the API-facing companion to HasUnpublishedChanges
+	// (spec §12.7): true when the row needs an explicit Publish to change
+	// live output. Transient projection, never stored (bson:"-").
+	RequiresPublish bool `bson:"-" json:"requires_publish,omitempty"`
+	// ActivePublicationID is the control-plane truth pointer resolved by the
+	// Publication repository (spec §15.7). Transient projection, never stored.
+	ActivePublicationID *string `bson:"-" json:"active_publication_id,omitempty"`
 	// Fork fields — set when this content item belongs to a fork workspace
 	ForkID        *primitive.ObjectID `bson:"fork_id,omitempty" json:"fork_id,omitempty"`                 // nil for live content
 	BaseUpdatedAt *time.Time          `bson:"base_updated_at,omitempty" json:"base_updated_at,omitempty"` // updated_at of the live page at fork time (for conflict detection)
@@ -91,18 +139,23 @@ func (c *Content) ModifiedAt() time.Time {
 
 // ContentFork represents a named workspace for staging site changes before merging to live
 type ContentFork struct {
-	ID             primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
-	Name           string              `bson:"name" json:"name"`
-	Description    string              `bson:"description" json:"description"`
-	Status         string              `bson:"status" json:"status"`               // "active" | "merged" | "archived"
-	PreviewToken   string              `bson:"preview_token" json:"preview_token"` // random token for cookie-based preview
-	CreatedBy      primitive.ObjectID  `bson:"created_by" json:"created_by"`
-	CreatedByEmail string              `bson:"created_by_email" json:"created_by_email"`
-	CreatedAt      time.Time           `bson:"created_at" json:"created_at"`
-	MergedAt       *time.Time          `bson:"merged_at,omitempty" json:"merged_at,omitempty"`
-	MergedBy       *primitive.ObjectID `bson:"merged_by,omitempty" json:"merged_by,omitempty"`
-	MergedByEmail  string              `bson:"merged_by_email,omitempty" json:"merged_by_email,omitempty"`
-	ArchivedAt     *time.Time          `bson:"archived_at,omitempty" json:"archived_at,omitempty"`
+	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Name           string             `bson:"name" json:"name"`
+	Description    string             `bson:"description" json:"description"`
+	Status         string             `bson:"status" json:"status"`               // "active" | "merged" | "archived"
+	PreviewToken   string             `bson:"preview_token" json:"preview_token"` // random token for cookie-based preview
+	CreatedBy      primitive.ObjectID `bson:"created_by" json:"created_by"`
+	CreatedByEmail string             `bson:"created_by_email" json:"created_by_email"`
+	// AgentSession binds a fork to the AI-agent session that created it
+	// (from the X-Agent-Session header). The V3 sandbox resolver uses it
+	// to inject only caller-owned active forks — never trust a client
+	// supplied fork ID on its own.
+	AgentSession  string              `bson:"agent_session,omitempty" json:"agent_session,omitempty"`
+	CreatedAt     time.Time           `bson:"created_at" json:"created_at"`
+	MergedAt      *time.Time          `bson:"merged_at,omitempty" json:"merged_at,omitempty"`
+	MergedBy      *primitive.ObjectID `bson:"merged_by,omitempty" json:"merged_by,omitempty"`
+	MergedByEmail string              `bson:"merged_by_email,omitempty" json:"merged_by_email,omitempty"`
+	ArchivedAt    *time.Time          `bson:"archived_at,omitempty" json:"archived_at,omitempty"`
 	// Page counts recorded at merge time (v7.4). The fork's page copies are
 	// deleted after a successful merge, so these are the history of what it did.
 	MergedCreated int `bson:"merged_created,omitempty" json:"merged_created,omitempty"`
@@ -113,7 +166,7 @@ type ContentFork struct {
 type ContentVersion struct {
 	ID              primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
 	ContentID       primitive.ObjectID  `bson:"content_id" json:"content_id"`                                   // Reference to the content item
-	Version         int                 `bson:"version" json:"version"`                                         // Version number (1, 2, 3...)
+	Version         int64               `bson:"version" json:"version"`                                         // Version number (1, 2, 3...)
 	Comment         string              `bson:"comment,omitempty" json:"comment,omitempty"`                     // Optional version comment
 	ModifiedBy      *primitive.ObjectID `bson:"modified_by,omitempty" json:"modified_by,omitempty"`             // User who made this version
 	ModifiedByEmail string              `bson:"modified_by_email,omitempty" json:"modified_by_email,omitempty"` // Denormalized email
@@ -171,16 +224,23 @@ type Collection struct {
 
 // APIKey represents an API key for REST API access
 type APIKey struct {
-	ID          primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
-	Name        string              `bson:"name" json:"name"`
-	Description string              `bson:"description" json:"description"`
-	Prefix      string              `bson:"prefix" json:"prefix"`                                 // First 11 chars (e.g., "lc_a1b2c3d4") for identification
-	KeyHash     string              `bson:"key_hash" json:"-"`                                    // SHA-256 hash of full key
-	UserID      *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"`           // Owning user
-	Scopes      []string            `bson:"scopes,omitempty" json:"scopes,omitempty"`             // Permission allowlist; empty = full owner permissions
-	SandboxOnly bool                `bson:"sandbox_only,omitempty" json:"sandbox_only,omitempty"` // Content writes must target a fork; live mutations rejected
-	LastUsedAt  *time.Time          `bson:"last_used_at,omitempty" json:"last_used_at,omitempty"`
-	CreatedAt   time.Time           `bson:"created_at" json:"created_at"`
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Name        string             `bson:"name" json:"name"`
+	Description string             `bson:"description" json:"description"`
+	Prefix      string             `bson:"prefix" json:"prefix"` // First 11 chars (e.g., "lc_a1b2c3d4") for identification
+	KeyHash     string             `bson:"key_hash" json:"-"`    // SHA-256 hash of full key
+	// KeyCiphertext holds the AES-GCM encrypted raw key (base64 nonce +
+	// ciphertext) so owners can re-copy it from the admin UI. Empty for
+	// keys created before copy support or when no encryption key is
+	// configured — those keys can never be revealed, only recreated.
+	// json:"-" keeps it out of every API response; only the dedicated
+	// reveal path decrypts it, permission-checked and audit-logged.
+	KeyCiphertext string              `bson:"key_ciphertext,omitempty" json:"-"`
+	UserID        *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"`           // Owning user
+	Scopes        []string            `bson:"scopes,omitempty" json:"scopes,omitempty"`             // Permission allowlist; empty = full owner permissions
+	SandboxOnly   bool                `bson:"sandbox_only,omitempty" json:"sandbox_only,omitempty"` // Content writes must target a fork; live mutations rejected
+	LastUsedAt    *time.Time          `bson:"last_used_at,omitempty" json:"last_used_at,omitempty"`
+	CreatedAt     time.Time           `bson:"created_at" json:"created_at"`
 }
 
 // Snippet is a named, reusable HTML fragment used as an item renderer in lc:query directives.

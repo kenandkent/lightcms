@@ -1,0 +1,9 @@
+ok  	github.com/jonradoff/lightcms/v7/internal/product/generation	12.143s	coverage: 85.3% of statements
+ok  	github.com/jonradoff/lightcms/v7/internal/product/httpapi	4.179s	coverage: 92.1% of statements
+ok  	github.com/jonradoff/lightcms/v7/internal/product/idempotency	5.899s	coverage: 89.4% of statements
+ok  	github.com/jonradoff/lightcms/v7/internal/product/migration	16.046s	coverage: 84.5% of statements
+ok  	github.com/jonradoff/lightcms/v7/internal/product/pathkey	0.409s	coverage: 97.4% of statements
+ok  	github.com/jonradoff/lightcms/v7/internal/product/publication	17.812s	coverage: 80.3% of statements
+ok  	github.com/jonradoff/lightcms/v7/internal/product/publicurl	0.399s	coverage: 96.8% of statements
+ok  	github.com/jonradoff/lightcms/v7/internal/product/storage	1.938s	coverage: 83.6% of statements
+ok  	github.com/jonradoff/lightcms/v7/internal/product/templatecontract	3.115s	coverage: 95.6% of statements

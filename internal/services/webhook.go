@@ -10,11 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
 	"github.com/metavert-io/lightcms/v7/internal/database"
 	"github.com/metavert-io/lightcms/v7/internal/netguard"
+	"github.com/metavert-io/lightcms/v7/internal/product/jobs"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -49,6 +51,7 @@ type WebhookDeliveryDoc struct {
 
 // WebhookService manages webhook registration and event delivery.
 type WebhookService struct {
+	durable    *jobs.Runner
 	db         *database.DB
 	httpClient *http.Client
 	// retryDelays overrides the default retry backoff schedule (30s, 5m).
@@ -78,6 +81,16 @@ func NewWebhookService(db *database.DB) *WebhookService {
 	return &WebhookService{db: db, httpClient: client}
 }
 
+// NewWebhookServiceWithClient injects a transport for controlled receivers.
+// Normal application construction always uses NewWebhookService's guarded client.
+func NewWebhookServiceWithClient(db *database.DB, client *http.Client) *WebhookService {
+	s := NewWebhookService(db)
+	if client != nil {
+		s.httpClient = client
+	}
+	return s
+}
+
 // webhookPayload is the JSON body sent to webhook endpoints.
 type webhookPayload struct {
 	Event     string      `json:"event"`
@@ -91,6 +104,13 @@ func (s *WebhookService) FireEvent(ctx context.Context, event string, data inter
 	// as the handler returns — before this goroutine has looked up the
 	// webhooks. Delivery outlives the request, on its own deadline.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	if s.durable != nil {
+		defer cancel()
+		if err := s.RecordEvent(ctx, event, primitive.NewObjectID().Hex(), data); err != nil {
+			log.Printf("webhook event persistence failed event=%s: %v", event, err)
+		}
+		return
+	}
 	go func() {
 		defer cancel()
 		// Build payload once.
@@ -130,6 +150,192 @@ func (s *WebhookService) FireEvent(ctx context.Context, event string, data inter
 			}
 		}
 	}()
+}
+
+// EnableDurable is called once at startup, before serving requests. Existing
+// publication outbox delivery keeps its independent stable identity and runner.
+func (s *WebhookService) EnableDurable(runner *jobs.Runner) {
+	s.durable = runner
+	runner.Register("webhook", jobs.Executor{
+		// These are system-owned notifications of already authorized changes.
+		// Endpoint active/subscription status is rechecked during delivery.
+		Authorize: func(context.Context, jobs.Job) error { return nil },
+		Run: func(ctx context.Context, j jobs.Job) error {
+			items, err := runner.Repo.Items(ctx, j.ID, "", 1)
+			if err != nil {
+				return err
+			}
+			if len(items) != 1 {
+				return fmt.Errorf("webhook input missing")
+			}
+			if items[0].Done {
+				return nil
+			}
+			event, _ := items[0].Input["event"].(string)
+			raw, _ := items[0].Input["payload"].(string)
+			var data map[string]any
+			decoder := json.NewDecoder(bytes.NewBufferString(raw))
+			decoder.UseNumber()
+			if err := decoder.Decode(&data); err != nil {
+				return err
+			}
+			if err := s.DeliverRecordedEvent(ctx, event, "workflow:"+j.ID.Hex(), data); err != nil {
+				if j.Attempts >= 3 {
+					return err
+				}
+				delay := 30 * time.Second
+				if j.Attempts >= 2 {
+					delay = 5 * time.Minute
+				}
+				return &jobs.Retry{After: delay, Code: "WEBHOOK_DELIVERY_FAILED"}
+			}
+			return runner.Repo.CommitItem(ctx, j, items[0].Key, func(mongo.SessionContext) (bson.M, error) { return bson.M{"delivered": true}, nil })
+		},
+	})
+}
+
+// RecordEvent joins the caller's transaction when available. No HTTP request
+// runs in that transaction. key identifies the committed business version.
+func (s *WebhookService) RecordEvent(ctx context.Context, event, key string, data interface{}) error {
+	if s.durable == nil {
+		s.db.AfterCommit(ctx, func(ctx context.Context) { s.FireEvent(ctx, event, data) })
+		return nil
+	}
+	n, err := s.db.Collection("webhooks").CountDocuments(ctx, bson.M{"active": true, "events": event})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	_, err = s.durable.Repo.Submit(ctx, jobs.Submission{Kind: "webhook", Key: event + ":" + key, Actor: "system", Items: []jobs.Input{{Key: "delivery", Data: bson.M{"event": event, "payload": string(raw)}}}})
+	if err == nil {
+		s.db.AfterCommit(ctx, func(context.Context) { s.durable.Wake() })
+	}
+	return err
+}
+
+// recordedPayload is the JSON body for durable outbox delivery (Task 9).
+// Shape contract for Task 18 (API/Agent docs):
+//
+//	{"event_id": "<event_type>:<publication_id hex>",
+//	 "event": "<event_type, e.g. content.publish>",
+//	 "timestamp": "<RFC3339 delivery time; changes per attempt>",
+//	 "data": {<stored outbox payload>}}
+//
+// event_id equals the X-LightCMS-Event-ID header and is stable across
+// retries; timestamp (hence the HMAC) changes per attempt but always verifies
+// with the endpoint secret. Must stay in sync with
+// publication.RecordedPayloadShape / publication.EventID.
+type recordedPayload struct {
+	EventID   string         `json:"event_id"`
+	Event     string         `json:"event"`
+	Timestamp string         `json:"timestamp"`
+	Data      map[string]any `json:"data"`
+}
+
+// DeliverRecordedEvent synchronously delivers one durable outbox event to all
+// active endpoints subscribed to eventType (Task 9 entry point). It reuses
+// the existing endpoint selection (active + events filter), HMAC signing
+// (X-LightCMS-Signature), delivery history (logDelivery), and retry policy:
+// retries are owned by the outbox worker (next_attempt_at backoff mirroring
+// retryWithBackoff's 30s/5m schedule), so this method attempts each endpoint
+// once and returns an error when any endpoint fails, letting the worker
+// requeue the event with the same stable eventID. At-least-once: a retry
+// redelivers to all endpoints; receivers dedupe via eventID. Existing
+// FireEvent/deliver/retryWithBackoff behavior is unchanged.
+func (s *WebhookService) DeliverRecordedEvent(ctx context.Context, eventType, eventID string, data map[string]any) error {
+	if eventType == "" {
+		return fmt.Errorf("webhook: event type is required")
+	}
+	if eventID == "" {
+		return fmt.Errorf("webhook: event ID is required")
+	}
+	if data == nil {
+		data = map[string]any{}
+	}
+	payload, err := json.Marshal(recordedPayload{
+		EventID:   eventID,
+		Event:     eventType,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Data:      data,
+	})
+	if err != nil {
+		return err
+	}
+
+	filter := bson.M{
+		"active": true,
+		"events": eventType,
+	}
+	cursor, err := s.db.FindMany(ctx, "webhooks", filter)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	deliveredTo := 0
+	var firstErr error
+	for cursor.Next(ctx) {
+		var wh WebhookDoc
+		if err := cursor.Decode(&wh); err != nil {
+			continue
+		}
+		if err := s.deliverRecorded(ctx, wh, eventType, eventID, payload); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		deliveredTo++
+	}
+	if err := cursor.Err(); err != nil {
+		return err
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	_ = deliveredTo // zero endpoints is success: nothing to deliver
+	return nil
+}
+
+// deliverRecorded sends one recorded payload to a single endpoint with the
+// stable event-ID header, HMAC signature, and delivery-history logging. It
+// mirrors deliver without altering its behavior.
+func (s *WebhookService) deliverRecorded(ctx context.Context, wh WebhookDoc, event, eventID string, payload []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wh.URL, bytes.NewReader(payload))
+	if err != nil {
+		s.logDelivery(wh.ID, event, 1, 0, false, err.Error())
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-LightCMS-Event", event)
+	req.Header.Set("X-LightCMS-Event-ID", eventID)
+	req.Header.Set("X-LightCMS-Signature", s.sign(wh.Secret, payload))
+	req.Header.Set("User-Agent", "LightCMS-Webhook/1.0")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		s.logDelivery(wh.ID, event, 1, 0, false, err.Error())
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck
+
+	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+	errMsg := ""
+	if !success {
+		errMsg = fmt.Sprintf("unexpected status %d", resp.StatusCode)
+	}
+	s.logDelivery(wh.ID, event, 1, resp.StatusCode, success, errMsg)
+	if !success {
+		return fmt.Errorf("webhook %s returned status %d", wh.URL, resp.StatusCode)
+	}
+	return nil
 }
 
 // deliver sends the payload to the webhook URL and logs the delivery attempt.

@@ -286,6 +286,9 @@ func TestContentModifiedAtAndNoIndexNotify(t *testing.T) {
 	if err := svc.CreateContent(ctx, c); err != nil {
 		t.Fatal(err)
 	}
+	if err := svc.GenerateStaticPage(ctx, c); err != nil {
+		t.Fatal(err)
+	}
 	got, _ := svc.GetContent(ctx, c.ID)
 	if got.ContentModifiedAt == nil {
 		t.Fatal("content_modified_at not stamped on first render")
@@ -303,6 +306,13 @@ func TestContentModifiedAtAndNoIndexNotify(t *testing.T) {
 	got.Data["content"] = "v2"
 	svc.UpdateContent(ctx, got)
 	got, _ = svc.GetContent(ctx, c.ID)
+	if !got.ContentModifiedAt.Equal(first) {
+		t.Error("draft edit moved the public modification date")
+	}
+	if err := svc.GenerateStaticPage(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = svc.GetContent(ctx, c.ID)
 	if !got.ContentModifiedAt.After(first) {
 		t.Error("edit did not move content_modified_at")
 	}
@@ -315,6 +325,7 @@ func TestContentModifiedAtAndNoIndexNotify(t *testing.T) {
 	// excludes the page from full submissions.
 	got.NoIndex = true
 	svc.UpdateContent(ctx, got)
+	svc.NotifyPublishedPaths(ctx, got.FullPath)
 	if p := drain(); !p["/mod"] {
 		t.Errorf("noindex change not notified: %v", p)
 	}

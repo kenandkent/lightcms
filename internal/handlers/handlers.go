@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
+	"html"
 	"html/template"
 	"io"
 	"log"
@@ -18,26 +20,36 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metavert-io/lightcms/v7/internal/auth"
 	"github.com/metavert-io/lightcms/v7/internal/build"
 	"github.com/metavert-io/lightcms/v7/internal/database"
 	"github.com/metavert-io/lightcms/v7/internal/errors"
+	"github.com/metavert-io/lightcms/v7/internal/i18n"
 	"github.com/metavert-io/lightcms/v7/internal/middleware"
 	"github.com/metavert-io/lightcms/v7/internal/models"
+	"github.com/metavert-io/lightcms/v7/internal/product/generation"
+	"github.com/metavert-io/lightcms/v7/internal/product/idempotency"
+	"github.com/metavert-io/lightcms/v7/internal/product/pathkey"
+	"github.com/metavert-io/lightcms/v7/internal/product/publication"
+	"github.com/metavert-io/lightcms/v7/internal/product/templatecontract"
 	"github.com/metavert-io/lightcms/v7/internal/services"
 
 	"github.com/gorilla/csrf"
 	"github.com/gorilla/mux"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	nethtml "golang.org/x/net/html"
 	"golang.org/x/text/unicode/norm"
 )
 
 // adminTemplateFuncMap is built once and shared across all cached templates.
 var adminTemplateFuncMap = template.FuncMap{
+	"i18n":     func(key, fallback, lang string) string { return i18n.T(key, fallback, lang) },
 	"split":    func(s, sep string) []string { return strings.Split(s, sep) },
 	"join":     func(items []string, sep string) string { return strings.Join(items, sep) },
 	"multiply": func(a, b int) int { return a * b },
@@ -71,6 +83,8 @@ func initAdminTemplateCache() {
 }
 
 type Handler struct {
+	dependencyIndex  dependencyReader
+	staticDelivery   *StaticDeliveryAdmin
 	db               *database.DB
 	auth             *auth.Manager
 	baseURL          string
@@ -93,10 +107,33 @@ type Handler struct {
 	anthropicURLOverride string
 	commentService       *services.CommentService
 	approvalService      *services.ApprovalService
+	lockService          *services.LockService
 	maintenanceService   *services.MaintenanceService
 	agentService         *services.AgentService
 	indexNowService      *services.IndexNowService
 	seoService           *services.SEOService
+	// settingsService owns theme persistence (settings row + version
+	// chain + theme-vars.css). Lane 2C fix 4: the admin theme handlers
+	// delegate to it instead of writing through h.db directly, so the API
+	// and admin UI share one writer path. Wired via SetSettingsService;
+	// themeService() falls back to a local instance when unwired.
+	settingsService *services.SettingsService
+	// Task 16C/E: shared V3 publication runtime for the 7 Admin product
+	// handlers (admin_publications.go). Wired once in main.go; nil in unit
+	// tests falls back to the local construction those handlers used pre-16.
+	publicationService *publication.Service
+	idempotencyService *idempotency.Service
+	generationService  *generation.Service
+	// Lane 2B: migration-required degraded-boot reason (see healthz.go
+	// SetMigrationRequired). atomic.Value holding a string; empty = healthy.
+	migrationRequired atomic.Value
+}
+
+// SetPublicationRuntime wires the shared V3 publication runtime (Task 16C/E).
+func (h *Handler) SetPublicationRuntime(pubs *publication.Service, idem *idempotency.Service, gen *generation.Service) {
+	h.publicationService = pubs
+	h.idempotencyService = idem
+	h.generationService = gen
 }
 
 // SetMaintenanceService wires the maintenance scan service (used by the copilot).
@@ -108,6 +145,8 @@ func (h *Handler) SetMaintenanceService(m *services.MaintenanceService) {
 func (h *Handler) SetCloudflareService(cf *services.CloudflareService) {
 	h.cfService = cf
 }
+
+func (h *Handler) SetLockService(ls *services.LockService) { h.lockService = ls }
 
 // SetSearchService sets the search service for end-user search features
 func (h *Handler) SetSearchService(ss *services.SearchService) {
@@ -142,6 +181,22 @@ func (h *Handler) SetCommentService(cs *services.CommentService) {
 // SetApprovalService sets the approval service
 func (h *Handler) SetApprovalService(as *services.ApprovalService) {
 	h.approvalService = as
+}
+
+// SetSettingsService wires the settings service that owns theme writes.
+func (h *Handler) SetSettingsService(ss *services.SettingsService) {
+	h.settingsService = ss
+}
+
+// themeService returns the wired settings service, or a local instance
+// over the handler's DB when unwired (unit tests, forgotten wiring).
+// Either way all theme mutations flow through SettingsService — the single
+// writer path for settings row + version chain + theme-vars.css.
+func (h *Handler) themeService() *services.SettingsService {
+	if h.settingsService != nil {
+		return h.settingsService
+	}
+	return services.NewSettingsService(h.db, h.contentService)
 }
 
 func New(db *database.DB, authManager *auth.Manager, baseURL string, env string, userService *services.UserService, auditService *services.AuditService, snippetService *services.SnippetService) *Handler {
@@ -187,8 +242,20 @@ func formatBytes(n int64) string {
 
 // SeedDefaults creates default templates and hello world page if they don't exist
 func (h *Handler) SeedDefaults(ctx context.Context) error {
+	// A curated library is an explicit persisted site policy. Removing stock
+	// templates must not silently recreate them on the next process restart.
+	var policy struct {
+		CustomOnly bool `bson:"custom_only"`
+	}
+	if err := h.db.FindOne(ctx, "settings", bson.M{"type": "template_library_policy"}, &policy); err != nil && err != mongo.ErrNoDocuments {
+		return fmt.Errorf("load template library policy: %w", err)
+	}
+	defaultTemplates := models.DefaultTemplates
+	if policy.CustomOnly {
+		defaultTemplates = nil
+	}
 	// Seed default templates
-	for _, tmpl := range models.DefaultTemplates {
+	for _, tmpl := range defaultTemplates {
 		count, err := h.db.Count(ctx, "templates", bson.M{"slug": tmpl.Slug})
 		if err != nil {
 			return err
@@ -207,7 +274,7 @@ func (h *Handler) SeedDefaults(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if count == 0 {
+	if count == 0 && !policy.CustomOnly {
 		// Get the explanatory page template
 		var tmpl models.Template
 		err := h.db.FindOne(ctx, "templates", bson.M{"slug": "explanatory-page"}, &tmpl)
@@ -221,6 +288,7 @@ func (h *Handler) SeedDefaults(ctx context.Context) error {
 			TemplateName: tmpl.Name,
 			Title:        "Welcome to LightCMS",
 			Slug:         "",
+			FullPath:     "/",
 			Category:     "pages",
 			Published:    true,
 			PublishedAt:  &now,
@@ -304,7 +372,9 @@ func (h *Handler) SeedDefaults(ctx context.Context) error {
 	}
 
 	// Ensure default pages exist
-	h.ensureDefaultPages(ctx)
+	if !policy.CustomOnly {
+		h.ensureDefaultPages(ctx)
+	}
 
 	// Set default header/footer in theme if not set
 	theme, _ := h.db.GetThemeSettings(ctx)
@@ -335,6 +405,7 @@ func (h *Handler) ensureDefaultPages(ctx context.Context) {
 			TemplateName: tmpl.Name,
 			Title:        "Page Not Found",
 			Slug:         "404",
+			FullPath:     "/404",
 			Category:     "pages",
 			Published:    true,
 			PublishedAt:  &now,
@@ -576,8 +647,13 @@ func (h *Handler) NewTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateCreate) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -615,12 +691,17 @@ func (h *Handler) EditTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.renderAdmin(w, r, "template_form", map[string]interface{}{"IsNew": false, "Template": tmpl})
+	h.renderAdmin(w, r, "template_form", map[string]interface{}{"IsNew": false, "Template": tmpl, "Impact": h.currentTemplateImpact(r.Context(), id, "")})
 }
 
 func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateEdit) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -632,23 +713,49 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tmpl := h.parseTemplateForm(r)
-	tmpl.UpdatedAt = time.Now()
-
 	ctx := r.Context()
-	if err := h.db.UpdateOne(ctx, "templates", bson.M{"_id": id}, bson.M{"$set": tmpl}); err != nil {
+	var original models.Template
+	if err := h.db.FindOne(ctx, "templates", bson.M{"_id": id}, &original); err != nil {
+		http.Error(w, "Template not found", http.StatusNotFound)
+		return
+	}
+	// The edit form has no slug/status controls. Never derive an existing
+	// template's identity from its display name (especially a Chinese name).
+	tmpl.ID = id
+	tmpl.Slug = original.Slug
+	tmpl.Status = original.Status
+	// Keep contract metadata for existing fields which this legacy form does
+	// not expose; a layout-only edit must not erase validation or defaults.
+	for i := range tmpl.Fields {
+		for _, field := range original.Fields {
+			if field.Name == tmpl.Fields[i].Name {
+				tmpl.Fields[i].Default = field.Default
+				tmpl.Fields[i].Description = field.Description
+				tmpl.Fields[i].Example = field.Example
+				tmpl.Fields[i].Validation = field.Validation
+				break
+			}
+		}
+	}
+	if err := services.NewTemplateService(h.db, nil).UpdateTemplate(ctx, &tmpl); err != nil {
 		h.renderAdmin(w, r, "template_form", map[string]interface{}{"IsNew": false, "Error": err.Error(), "Template": tmpl})
 		return
 	}
 
-	// Regenerate all content using this template
-	h.regenerateContentByTemplate(ctx, id)
+	// As with the API, saving creates an immutable version only. Publishing
+	// existing pages is a separate, explicit template upgrade job.
 
 	http.Redirect(w, r, "/cm/templates", http.StatusSeeOther)
 }
 
 func (h *Handler) DeleteTemplate(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateDelete) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -666,8 +773,8 @@ func (h *Handler) DeleteTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.db.DeleteOne(r.Context(), "templates", bson.M{"_id": id}); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err := services.NewTemplateService(h.db, nil).DeleteTemplate(r.Context(), id); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 
@@ -825,14 +932,19 @@ func (h *Handler) ListContent(w http.ResponseWriter, r *http.Request) {
 	var folders []models.Folder
 	folderCursor.All(ctx, &folders)
 
+	versionCtx, versionCancel := context.WithTimeout(ctx, 3*time.Second)
+	versionStates, versionErr := h.contentVersionStates(versionCtx, content)
+	versionCancel()
 	h.renderAdmin(w, r, "content_list", map[string]interface{}{
-		"Content":      content,
-		"Folders":      folders,
-		"ShowDeleted":  showDeleted,
-		"FolderFilter": folderFilter,
-		"CurrentPage":  page,
-		"TotalPages":   totalPages,
-		"Total":        total,
+		"VersionStates":            versionStates,
+		"VersionStatusUnavailable": versionErr != nil,
+		"Content":                  content,
+		"Folders":                  folders,
+		"ShowDeleted":              showDeleted,
+		"FolderFilter":             folderFilter,
+		"CurrentPage":              page,
+		"TotalPages":               totalPages,
+		"Total":                    total,
 	})
 }
 
@@ -881,12 +993,22 @@ func (h *Handler) NewContentWithTemplate(w http.ResponseWriter, r *http.Request)
 		"IsNew":    true,
 		"Template": tmpl,
 		"Folders":  folders,
+		// Non-nil FieldErrors: the template indexes it per field and a
+		// missing key aborts execution with a truncated page.
+		"FieldErrors": map[string][]templatecontract.FieldError{},
 	})
 }
 
 func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	// Wave 4B RBAC gate (same pattern as CreateTemplate): viewers may not
+	// create content; contributor/editor/admin may (content.create).
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermContentCreate) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -958,6 +1080,10 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Spec §16.6: the checkbox is a submit INTENT, never a state write. The
+	// row always lands as a draft and the live transition happens after the
+	// insert (publication saga when the V3 runtime is wired, legacy direct
+	// flag write when it is not).
 	published := r.FormValue("published") == "on"
 
 	// A held page is always created as a draft: hold wins over the publish
@@ -975,12 +1101,6 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 			published = false
 			createContributorApproval = true
 		}
-	}
-
-	var publishedAt *time.Time
-	if published {
-		now := time.Now()
-		publishedAt = &now
 	}
 
 	// For blank pages, check if raw mode is enabled
@@ -1028,6 +1148,7 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 	noIndex := r.FormValue("noindex") == "on"
 	authorName := strings.TrimSpace(r.FormValue("author_name"))
 	authorURL := strings.TrimSpace(r.FormValue("author_url"))
+	remark := r.FormValue("remark")
 	ogImage := ""
 	// Handle OG image upload
 	ogFile, ogHeader, err := r.FormFile("og_image")
@@ -1064,14 +1185,15 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 		Category:        tmpl.Category,
 		Tags:            contentTags,
 		MetaDescription: metaDescription,
+		Remark:          remark,
 		OGImage:         ogImage,
 		NoIndex:         noIndex,
 		Hold:            hold,
 		AuthorName:      authorName,
 		AuthorURL:       authorURL,
 		Data:            data,
-		Published:       published,
-		PublishedAt:     publishedAt,
+		Published:       false,
+		PublishedAt:     nil,
 		PendingApproval: createContributorApproval,
 		UseHeader:       useHeader,
 		UseFooter:       useFooter,
@@ -1084,13 +1206,27 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 	// Extract and track internal links
 	content.InternalLinks = h.extractInternalLinksFromContent(&content)
 
+	// Task 16B: V3 canonical bookkeeping for direct Admin inserts
+	// (spec §12.8). Draft-only: no live file write.
+	if canon, err := pathkey.Canonical(content.FullPath); err == nil {
+		content.CanonicalFullPath = canon
+	}
+	content.PathScope = "live"
+	content.PathActive = true
+	content.CurrentVersion = 1
+	content.HasUnpublishedChanges = false
+	// Transient projection for the Admin response cycle: the row is a fresh
+	// draft, so a publish action is always pending after insert.
+	content.RequiresPublish = true
+
 	id, err := h.db.InsertOne(ctx, "content", content)
 	if err != nil {
 		h.renderAdmin(w, r, "content_form", map[string]interface{}{
-			"IsNew":    true,
-			"Template": tmpl,
-			"Content":  content,
-			"Error":    err.Error(),
+			"IsNew":       true,
+			"Template":    tmpl,
+			"Content":     content,
+			"Error":       err.Error(),
+			"FieldErrors": map[string][]templatecontract.FieldError{},
 		})
 		return
 	}
@@ -1098,15 +1234,62 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 	content.ID = id
 	auditResource(r, id.Hex())
 
+	// Spec §16.6: perform the requested live transition only AFTER the draft
+	// insert, and only through PublicationService. Contributors were already
+	// filtered above (createContributorApproval) and content.publish is
+	// editor/admin only, so `published` here is a publish intent from a
+	// role allowed to go live.
+	publishFailed := false
+	publishFailureCode := ""
+	if published && auth.HasPermission(user.Role, auth.PermContentPublish) {
+		if h.publicationService != nil {
+			res, perr := h.publicationService.Publish(ctx, publication.PublishRequest{
+				ContentID:     id,
+				Reason:        "admin form save",
+				AuthorIsAdmin: user.Role == "admin",
+			})
+			if perr != nil {
+				// Draft stays draft; report the publication code below.
+				publishFailed = true
+				publishFailureCode = publication.CodeOf(perr)
+			} else {
+				content.Published = true
+				content.PublishedAt = &res.LogicalPublishedAt
+			}
+		} else {
+			// Unwired runtime (unit tests / legacy installs): keep the pre-V3
+			// direct flag write. UpdateOne on the just-inserted doc — a
+			// re-read + service UpdateContent would bump a second version.
+			now := time.Now()
+			content.Published = true
+			content.PublishedAt = &now
+			if uerr := h.db.UpdateOne(ctx, "content", bson.M{"_id": id}, bson.M{"$set": bson.M{
+				"published":    true,
+				"published_at": now,
+			}}); uerr != nil {
+				fmt.Printf("Warning: Failed to mark content published: %v\n", uerr)
+				content.Published = false
+				content.PublishedAt = nil
+			}
+		}
+	}
+
 	// Save the initial version (v1)
 	if err := h.saveContentVersion(ctx, &content); err != nil {
 		fmt.Printf("Warning: Failed to save initial content version: %v\n", err)
 	}
 
-	// Generate static page
-	if published {
-		h.generateStaticPage(ctx, &content, &tmpl)
+	// Saga rejected the publish: the draft exists (v1 saved above) with
+	// published=false — hand the operator back to the edit page.
+	if publishFailed {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, formPublishFailureHTML(
+			h.adminPriorURL(r, id, content.FullPath), "/cm/content/"+id.Hex(), publishFailureCode))
+		return
 	}
+
+	// Task 16B: draft-only — no h.generateStaticPage here. Publishing is an
+	// explicit action via PublicationService (Admin Publish button).
 
 	// Submit for approval if contributor attempted to publish
 	if createContributorApproval && h.approvalService != nil {
@@ -1230,28 +1413,54 @@ func (h *Handler) EditContent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Wave 4C publish-form contract: expose the active publication ID so the
+	// template can post expected_active_id (CAS guard, spec §16.6). Empty
+	// when the page has never been published or the lookup fails.
+	activePublicationID := ""
+	if active, aerr := publication.NewRepository(h.db, nil).GetActive(ctx, content.ID); aerr == nil && active != nil {
+		activePublicationID = active.ID.Hex()
+	}
+
 	h.renderAdmin(w, r, "content_form", map[string]interface{}{
-		"IsNew":             false,
-		"Template":          tmpl,
-		"Content":           content,
-		"Folders":           folders,
-		"Versions":          versions,
-		"SameSlugPages":     sameSlugPages,
-		"AllTemplates":      allTemplates,
-		"Error":             errorMsg,
-		"ForkPageID":        forkPageID,
-		"Comments":          comments,
-		"CurrentUserRole":   currentUserRole,
-		"CurrentUserEmail":  currentUserEmail,
-		"PageViews30d":      pageViews30d,
-		"PageViews7d":       pageViews7d,
-		"PageReferrersJSON": pageReferrersJSON,
+		"IsNew":               false,
+		"Template":            tmpl,
+		"Content":             content,
+		"Folders":             folders,
+		"Versions":            versions,
+		"SameSlugPages":       sameSlugPages,
+		"AllTemplates":        allTemplates,
+		"Error":               errorMsg,
+		"ForkPageID":          forkPageID,
+		"Comments":            comments,
+		"CurrentUserRole":     currentUserRole,
+		"CurrentUserEmail":    currentUserEmail,
+		"PageViews30d":        pageViews30d,
+		"PageViews7d":         pageViews7d,
+		"PageReferrersJSON":   pageReferrersJSON,
+		"ActivePublicationID": activePublicationID,
+		// Non-nil FieldErrors: the template indexes it per field and a
+		// missing key aborts execution with a truncated page.
+		"FieldErrors": map[string][]templatecontract.FieldError{},
+		// Per-render idempotency key for the standalone 发布上线 button:
+		// a double-submit of the same page replays instead of minting a
+		// second Publication (M6). Empty only if crypto/rand fails, in
+		// which case the publish handler rejects the submit fail-closed.
+		"IdempotencyKey": newIdempotencyKey(),
 	})
 }
 
 func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	// Wave 4B RBAC gate (Wave 1A pattern). Contributors hold no content.edit
+	// but must REACH this handler to submit for approval — hence the OR with
+	// content.submit_approval. Viewers hold neither → 403.
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermContentEdit) &&
+		!auth.HasPermission(user.Role, auth.PermContentSubmitApproval) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -1266,10 +1475,19 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	// Inject editor identity + provenance into context for version history
-	if user, ok := h.auth.GetCurrentUser(r); ok {
-		ctx = services.WithEditorEmail(ctx, user.Email)
-	}
+	ctx = services.WithEditorEmail(ctx, user.Email)
 	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
+	// Lost-update guard for the checkbox publish below (M6): the edit form
+	// renders the active publication ID at page load; a double-submit (or a
+	// concurrent publish in another tab) sees a stale expectation and gets a
+	// 409 instead of minting a duplicate Publication. Malformed values fail
+	// closed — the value is server-rendered, so anything unparsable is
+	// tampering, not a missing precondition.
+	formExpectedActive, expectedActiveOK := adminExpectedActive(r)
+	if !expectedActiveOK {
+		http.Error(w, "Invalid expected_active_id", http.StatusBadRequest)
+		return
+	}
 	var existingContent models.Content
 	if err := h.db.FindOne(ctx, "content", bson.M{"_id": id}, &existingContent); err != nil {
 		http.Error(w, "Content not found", http.StatusNotFound)
@@ -1365,6 +1583,14 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Spec §16.6: the checkbox is a submit INTENT, never a state write —
+	// PublicationService is the only module allowed to change live page
+	// state. With the shared V3 runtime wired the draft save keeps the live
+	// flag/time untouched and the transition is delegated after the version
+	// pin; an unwired runtime (unit tests / legacy installs) keeps the pre-V3
+	// direct write verbatim.
+	sagaWired := h.publicationService != nil
+
 	published := r.FormValue("published") == "on"
 
 	// A fork copy shares its full_path with the live page. It is never
@@ -1388,11 +1614,19 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	// If they attempt to publish, save as draft and submit for approval instead.
 	contributorSubmittedForApproval := false
 	if published {
-		if u, ok := h.auth.GetCurrentUser(r); ok && u.Role == models.RoleContributor {
+		if user.Role == models.RoleContributor {
 			published = false // keep as draft
 			contributorSubmittedForApproval = true
 		}
 	}
+
+	// Live transitions require content.edit: a contributor "unchecking" a live
+	// page must not unpublish it (their save is draft-only), and a fork copy
+	// never owns the live path (ForkID content must never write live bytes).
+	canTransition := sagaWired && existingContent.ForkID == nil &&
+		auth.HasPermission(user.Role, auth.PermContentEdit)
+	intentPublish := canTransition && published && !existingContent.Published
+	intentUnpublish := canTransition && !published && existingContent.Published
 
 	var publishedAt *time.Time
 	if published && existingContent.PublishedAt == nil {
@@ -1400,6 +1634,21 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 		publishedAt = &now
 	} else {
 		publishedAt = existingContent.PublishedAt
+	}
+
+	// What the draft save persists for the live fields. Under the saga they
+	// pass through unchanged (the saga owns published/published_at); the
+	// unwired path writes the submitted values exactly as before.
+	savedPublished := published
+	savedPublishedAt := publishedAt
+	// A save against a live page creates a draft diff (has_unpublished_changes)
+	// even though the live flag itself does not move; the unwired path keeps
+	// the pre-V3 formula.
+	hasUnpublished := published || originalContent.Published
+	if sagaWired {
+		savedPublished = existingContent.Published
+		savedPublishedAt = existingContent.PublishedAt
+		hasUnpublished = originalContent.Published
 	}
 
 	// Track old full path for dependency updates and file cleanup
@@ -1433,12 +1682,10 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 			createRedirectFromOld = true
 		}
 
-		// Delete old static file if path changed (the old path of a fork
-		// copy is the live page's path: leave its file alone)
-		if !isForkCopy {
-			oldStaticPath := h.getStaticFilePath(oldFullPath)
-			os.Remove(oldStaticPath)
-		}
+		// Task 16B: draft-only — never delete the old canonical file here.
+		// Rename-and-publish is a single PublicationService saga that locks
+		// old+new paths, cuts over atomically and commits redirect metadata
+		// together; a draft rename leaves both files untouched.
 	}
 
 	// Check if checkboxes are checked
@@ -1498,6 +1745,7 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	noIndex := r.FormValue("noindex") == "on"
 	authorName := strings.TrimSpace(r.FormValue("author_name"))
 	authorURL := strings.TrimSpace(r.FormValue("author_url"))
+	remark := r.FormValue("remark")
 	ogImage := existingContent.OGImage // Keep existing if not uploading new
 	// Handle OG image upload
 	ogFile, ogHeader, err := r.FormFile("og_image")
@@ -1517,30 +1765,44 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	tempContent := &models.Content{Data: data}
 	internalLinks := h.extractInternalLinksFromContent(tempContent)
 
+	// Task 16B: V3 draft-only bookkeeping (spec §12.5, §12.8). Live files are
+	// never touched here; explicit Publish via PublicationService is required.
+	newCanonical := fullPath
+	if canon, err := pathkey.Canonical(fullPath); err == nil {
+		newCanonical = canon
+	}
+	newVersion := originalContent.CurrentVersion + 1
+	if newVersion < 1 {
+		newVersion = 1
+	}
+
 	update := bson.M{
 		"$set": bson.M{
-			"title":            title,
-			"slug":             slug,
-			"folder_id":        folderID,
-			"folder_path":      folderPath,
-			"full_path":        fullPath,
-			"tags":             updatedTags,
-			"meta_description": metaDescription,
-			"og_image":         ogImage,
-			"noindex":          noIndex,
-			"hold":             hold,
-			"author_name":      authorName,
-			"author_url":       authorURL,
-			"data":             data,
-			"published":        published,
-			"published_at":     publishedAt,
-			"pending_approval": contributorSubmittedForApproval,
-			"use_header":       useHeader,
-			"use_footer":       useFooter,
-			"use_theme":        useTheme,
-			"raw_mode":         rawMode,
-			"internal_links":   internalLinks,
-			"updated_at":       time.Now(),
+			"title":                   title,
+			"slug":                    slug,
+			"folder_id":               folderID,
+			"folder_path":             folderPath,
+			"full_path":               fullPath,
+			"canonical_full_path":     newCanonical,
+			"path_scope":              "live",
+			"path_active":             true,
+			"current_version":         newVersion,
+			"has_unpublished_changes": hasUnpublished,
+			"tags":                    updatedTags,
+			"meta_description":        metaDescription,
+			"remark":                  remark,
+			"og_image":                ogImage,
+			"data":                    data,
+			"published":               savedPublished,
+			"published_at":            savedPublishedAt,
+			"pending_approval":        contributorSubmittedForApproval,
+			"use_header":              useHeader,
+			"use_footer":              useFooter,
+			"use_theme":               useTheme,
+			"raw_mode":                rawMode,
+			"internal_links":          internalLinks,
+			"updated_at":              time.Now(),
+			"noindex":                 noIndex, "hold": hold, "author_name": authorName, "author_url": authorURL,
 		},
 	}
 
@@ -1600,14 +1862,15 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	existingContent.FolderPath = folderPath
 	existingContent.FullPath = fullPath
 	existingContent.MetaDescription = metaDescription
+	existingContent.Remark = remark
 	existingContent.OGImage = ogImage
 	existingContent.NoIndex = noIndex
 	existingContent.Hold = hold
 	existingContent.AuthorName = authorName
 	existingContent.AuthorURL = authorURL
 	existingContent.Data = data
-	existingContent.Published = published
-	existingContent.PublishedAt = publishedAt
+	existingContent.Published = savedPublished
+	existingContent.PublishedAt = savedPublishedAt
 	existingContent.UseTheme = useTheme
 	existingContent.RawMode = rawMode
 	existingContent.UseHeader = useHeader
@@ -1619,25 +1882,37 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Warning: Failed to save content version: %v\n", err)
 	}
 
-	if isForkCopy {
-		// Nothing on the live site changed: no static file, IndexNow,
-		// sitemap, index-page or wikilink work.
-		http.Redirect(w, r, "/cm/content", http.StatusSeeOther)
-		return
-	}
+	// Task 16B: draft-only — no h.generateStaticPage / os.Remove here.
+	// Live bytes change only via PublicationService.Publish.
 
-	if published {
-		h.generateStaticPage(ctx, &existingContent, &tmpl)
-	} else {
-		// Remove the static file if unpublished — by full path: a slug is
-		// only unique inside its folder, so /docs/about must not take
-		// /about's file with it.
-		h.removeStaticPage(fullPath)
-	}
-	// This handler writes to the DB directly; tell IndexNow about URL
-	// transitions (content edits reach it via the change-stream regen).
-	if h.contentService != nil {
-		h.contentService.NotifyLiveChange(ctx, &originalContent, &existingContent)
+	// Spec §16.6: the checkbox intent runs NOW, after the draft save and the
+	// version pin. Zero-value versions resolve to what was just saved
+	// (content.CurrentVersion under the page lock). On failure the row keeps
+	// its pre-save live state and the operator gets the publication code.
+	publishFailed := false
+	publishFailureCode := ""
+	if intentPublish {
+		// ctx carries the stamped editor identity + provenance (human/ui):
+		// the minted Publication record must attribute this admin-form
+		// publish, otherwise session rollback is blind to it.
+		if _, perr := h.publicationService.Publish(ctx, publication.PublishRequest{
+			ContentID: id,
+			Reason:    "admin form save",
+			Actor:     "human", Via: "ui",
+			AuthorIsAdmin:    user.Role == "admin",
+			ExpectedActiveID: formExpectedActive,
+		}); perr != nil {
+			publishFailed = true
+			publishFailureCode = publication.CodeOf(perr)
+		}
+	} else if intentUnpublish {
+		if perr := h.publicationService.Unpublish(ctx, publication.UnpublishRequest{
+			ContentID: id,
+			Actor:     "human", Via: "ui",
+		}); perr != nil {
+			publishFailed = true
+			publishFailureCode = publication.CodeOf(perr)
+		}
 	}
 
 	// Regenerate sitemap after content update
@@ -1657,13 +1932,47 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 		}(oldTitleForWikilinks, title, oldFullPath, fullPath)
 	}
 
+	// HTTP 200 + failure page (not a redirect): the draft save above stands,
+	// the live transition did not happen, and the page reports why.
+	if publishFailed {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, formPublishFailureHTML(
+			h.adminPriorURL(r, id, fullPath), "/cm/content/"+id.Hex(), publishFailureCode))
+		return
+	}
+
 	http.Redirect(w, r, "/cm/content", http.StatusSeeOther)
+}
+
+// formPublishFailureHTML renders the standalone failure page returned (HTTP
+// 200) when a form-driven publish/unpublish is rejected by PublicationService
+// (spec §16.6). The draft is already saved — only the live transition failed —
+// so the page shows the publication error code, links the prior live URL
+// (best effort) and returns the operator to the content editor. Deliberately
+// self-contained: FailedPublishHTML belongs to the product publish page.
+func formPublishFailureHTML(priorURL, backHref, code string) template.HTML {
+	if code == "" {
+		code = "PUBLISH_FAILED"
+	}
+	return template.HTML(`<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>发布失败</title></head>
+<body>
+<h1>发布失败</h1>
+<p>错误代码：<code>` + html.EscapeString(code) + `</code></p>
+<p>草稿已保存；线上页面保持原状态。</p>
+<p>当前线上页面：<a href="` + html.EscapeString(priorURL) + `">` + html.EscapeString(priorURL) + `</a></p>
+<p><a href="` + html.EscapeString(backHref) + `">返回编辑</a></p>
+</body></html>`)
 }
 
 func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.auth.GetCurrentUser(r)
 	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermContentDelete) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -1703,8 +2012,10 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delete static file using full path
-	h.removeStaticPage(content.FullPath)
+	// Task 16B: draft-only delete — never os.Remove the canonical file here.
+	// Live removal happens only through PublicationService.Unpublish; the
+	// recovery scanner converges leftovers. Direct file delete bypassing
+	// ContentService with no fork guard is removed.
 
 	// Remove any redirects that point to this page
 	// (no point keeping redirects to a deleted page)
@@ -1719,15 +2030,18 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 
 	// Soft delete: mark as deleted instead of removing from database
 	// Use a unique deleted path to avoid unique index conflicts
+	// Task 16B: release the canonical path (path_active=false) without
+	// touching live files.
 	now := time.Now()
 	deletedPath := fmt.Sprintf("__deleted__/%s/%d", id.Hex(), now.UnixNano())
 	update := bson.M{
 		"$set": bson.M{
-			"deleted":    true,
-			"deleted_at": now,
-			"published":  false,       // Unpublish when deleting
-			"full_path":  deletedPath, // Unique path for deleted items
-			"updated_at": now,
+			"deleted":     true,
+			"deleted_at":  now,
+			"published":   false,       // Unpublish when deleting
+			"full_path":   deletedPath, // Unique path for deleted items
+			"path_active": false,
+			"updated_at":  now,
 		},
 	}
 
@@ -1736,14 +2050,43 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Regenerate sitemap after content deletion
-	go h.RegenerateSitemap(context.Background())
-
-	// Regenerate index pages — the deleted item may have appeared in lc:query results
+	// Provenance + audit + webhook parity with the service delete path:
+	// without these the delete is invisible to the session ledger (which
+	// selects rollback targets by provenance) and to webhook consumers.
+	// content still holds the PRE-delete row here (path/title for the record).
+	delCtx := services.WithEditorEmail(ctx, user.Email)
+	sessionID := r.Header.Get("X-Agent-Session")
+	if sessionID != "" {
+		delCtx = services.WithProvenance(delCtx, services.Provenance{Actor: "agent", Via: "ui", AgentSession: sessionID})
+	} else {
+		delCtx = services.WithProvenance(delCtx, services.Provenance{Actor: "human", Via: "ui"})
+	}
 	if h.contentService != nil {
+		var postDelete models.Content
+		if gerr := h.db.FindOne(delCtx, "content", bson.M{"_id": id}, &postDelete); gerr == nil {
+			_ = h.contentService.RecordVersion(delCtx, &postDelete, &content, "删除页面")
+		}
 		h.contentService.TriggerIndexRegen()
 		h.contentService.NotifyLiveChange(ctx, &content, nil)
 	}
+	if h.auditService != nil {
+		userOID, _ := primitive.ObjectIDFromHex(user.ID)
+		h.auditService.LogAsync(models.AuditLog{
+			UserID: userOID, UserEmail: user.Email,
+			Action: "content.delete", Resource: "content", ResourceID: id.Hex(),
+			AgentSession: sessionID,
+			Details:      map[string]interface{}{"path": content.FullPath, "title": content.Title},
+			IPAddress:    r.RemoteAddr,
+		})
+	}
+	if h.webhookService != nil {
+		h.webhookService.FireEvent(delCtx, "content.delete", map[string]interface{}{
+			"id": id.Hex(), "title": content.Title, "path": content.FullPath,
+		})
+	}
+
+	// Regenerate sitemap after content deletion
+	go h.RegenerateSitemap(context.Background())
 
 	http.Redirect(w, r, "/cm/content", http.StatusSeeOther)
 }
@@ -1751,6 +2094,9 @@ func (h *Handler) DeleteContent(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) UndeleteContent(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermContentDelete) {
 		return
 	}
 
@@ -1949,6 +2295,9 @@ func (h *Handler) ConfirmChangeTemplate(w http.ResponseWriter, r *http.Request) 
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermTemplateEdit) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	contentID, err := primitive.ObjectIDFromHex(vars["id"])
@@ -1988,7 +2337,7 @@ func (h *Handler) ConfirmChangeTemplate(w http.ResponseWriter, r *http.Request) 
 
 	// Save current version before making changes
 	cursor, err := h.db.FindMany(ctx, "content_versions", bson.M{"content_id": contentID}, options.Find().SetSort(bson.D{{Key: "version", Value: -1}}).SetLimit(1))
-	nextVersion := 1
+	nextVersion := int64(1)
 	if err == nil {
 		var versions []models.ContentVersion
 		if cursor.All(ctx, &versions) == nil && len(versions) > 0 {
@@ -2040,12 +2389,8 @@ func (h *Handler) ConfirmChangeTemplate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Regenerate static file if published
-	if content.Published {
-		content.TemplateID = newTemplateID
-		content.Data = newData
-		h.generateStaticPage(ctx, &content, &newTemplate)
-	}
+	// Task 16B: draft-only — changing templates never rewrites live bytes.
+	// The merged draft needs an explicit Publish via PublicationService.
 
 	http.Redirect(w, r, "/cm/content/"+contentID.Hex(), http.StatusSeeOther)
 }
@@ -2216,8 +2561,17 @@ func (h *Handler) DiffContentVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RevertContentVersion(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	// Wave 4B RBAC gate: same permission set as UpdateContent — a revert is a
+	// draft edit (content.edit), contributors may revert their own work only
+	// as an approval submission (content.submit_approval); viewers → 403.
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermContentEdit) &&
+		!auth.HasPermission(user.Role, auth.PermContentSubmitApproval) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -2277,13 +2631,9 @@ func (h *Handler) RevertContentVersion(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Warning: Failed to save content version after revert: %v\n", err)
 	}
 
-	// Regenerate static file if published
-	if revertedContent.Published {
-		var tmpl models.Template
-		if err := h.db.FindOne(ctx, "templates", bson.M{"_id": revertedContent.TemplateID}, &tmpl); err == nil {
-			h.generateStaticPage(ctx, &revertedContent, &tmpl)
-		}
-	}
+	// Task 16B: draft-only revert — restore-as-draft only, never rewrites
+	// live bytes. Restore-and-publish / revert-live are separate explicit
+	// actions via Generation/PublicationService.
 
 	http.Redirect(w, r, "/cm/content/"+contentID.Hex(), http.StatusSeeOther)
 }
@@ -2314,9 +2664,9 @@ func (h *Handler) RegenerateContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if content.Published {
-		h.generateStaticPage(ctx, &content, &tmpl)
-	}
+	// Task 16B: manual regenerate no longer rewrites live files. The page
+	// keeps serving its active Publication until an explicit Publish.
+	_ = tmpl
 
 	http.Redirect(w, r, "/cm/content", http.StatusSeeOther)
 }
@@ -2352,6 +2702,9 @@ func (h *Handler) NewCollection(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreateCollection(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -2415,6 +2768,9 @@ func (h *Handler) UpdateCollection(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -2453,6 +2809,9 @@ func (h *Handler) UpdateCollection(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteCollection(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -2515,6 +2874,9 @@ func (h *Handler) NewFolder(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreateFolder(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -2608,6 +2970,9 @@ func (h *Handler) UpdateFolder(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -2686,6 +3051,9 @@ func (h *Handler) UpdateFolder(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteFolder(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -2798,6 +3166,8 @@ func (h *Handler) updateFolderPaths(ctx context.Context, oldPath, newPath string
 }
 
 // Update content folder paths and full paths when folder path changes
+// Task 16B: draft-only — updates paths without touching live files.
+// A folder move is a draft rename; publishing moved pages is explicit.
 func (h *Handler) updateContentFolderPaths(ctx context.Context, oldFolderPath, newFolderPath string) {
 	// Find all content in the folder or below it: the folder's own path or
 	// one that continues with "/" (renaming /blog must not touch /blogging).
@@ -2815,30 +3185,23 @@ func (h *Handler) updateContentFolderPaths(ctx context.Context, oldFolderPath, n
 			updatedFullPath = updatedFolderPath + "/" + c.Slug
 		}
 
-		// Delete the old static file: a live page's only (a fork copy has
-		// none, and its path is the live page's), and never for an empty
-		// full_path, which getStaticFilePath maps to the homepage's file.
-		if c.ForkID == nil {
-			h.removeStaticPage(c.FullPath)
-		}
+		// Task 16B: no os.Remove / generateStaticPage here (draft rename).
 
+		newCanon := updatedFullPath
+		if canon, err := pathkey.Canonical(updatedFullPath); err == nil {
+			newCanon = canon
+		}
 		h.db.UpdateOne(ctx, "content", bson.M{"_id": c.ID}, bson.M{
 			"$set": bson.M{
-				"folder_path": updatedFolderPath,
-				"full_path":   updatedFullPath,
-				"updated_at":  time.Now(),
+				"folder_path":             updatedFolderPath,
+				"full_path":               updatedFullPath,
+				"canonical_full_path":     newCanon,
+				"has_unpublished_changes": c.Published,
+				"updated_at":              time.Now(),
 			},
 		})
 
-		// Regenerate static file at new location if published
-		if c.Published {
-			c.FolderPath = updatedFolderPath
-			c.FullPath = updatedFullPath
-			var tmpl models.Template
-			if err := h.db.FindOne(ctx, "templates", bson.M{"_id": c.TemplateID}, &tmpl); err == nil {
-				h.generateStaticPage(ctx, &c, &tmpl)
-			}
-		}
+		// Task 16B: no regenerate at the new location — explicit Publish required.
 	}
 }
 
@@ -2858,13 +3221,78 @@ func (h *Handler) removeStaticPage(fullPath string) {
 }
 
 // Get the static file path for a content item's full path
+// Lane 1B: traversal guard. Returns "" when fullPath escapes
+// content/generated (.., encoded %2e/%2f vectors, null bytes,
+// backslashes). Dotted slugs (/my.page/about) and nested paths pass:
+// only exact ".." segments (raw or single-URL-decoded) and Abs escapes
+// are rejected, mirroring the upload-side ValidateFilePath+Abs+HasPrefix
+// checks in services/asset.go.
 func (h *Handler) getStaticFilePath(fullPath string) string {
 	if fullPath == "" || fullPath == "/" {
 		return "content/generated/index.html"
 	}
+	if !w1bSafeServeRel(fullPath) {
+		return ""
+	}
 	// Remove leading slash and add .html
 	path := strings.TrimPrefix(fullPath, "/")
-	return filepath.Join("content/generated", path+".html")
+	candidate := filepath.Join("content/generated", path+".html")
+	if !w1bPathWithinGenerated(candidate) {
+		return ""
+	}
+	return candidate
+}
+
+// w1bSafeServeRel rejects traversal vectors in a URL path while allowing
+// legit nested paths, dotted slugs and encoded sequences such as %20.
+// It checks the raw and single-URL-decoded forms for null bytes,
+// backslashes, %00 and exact ".." segments.
+func w1bSafeServeRel(p string) bool {
+	if strings.Contains(p, "\x00") || strings.Contains(p, "\\") {
+		return false
+	}
+	if strings.Contains(strings.ToLower(p), "%00") {
+		return false
+	}
+	for _, form := range [2]string{p, w1bSingleDecode(p)} {
+		for _, seg := range strings.Split(form, "/") {
+			if seg == ".." {
+				return false
+			}
+		}
+		if strings.Contains(form, "\x00") || strings.Contains(form, "\\") {
+			return false
+		}
+	}
+	return true
+}
+
+// w1bSingleDecode URL-decodes p once; on error it returns p unchanged so
+// the raw-form checks still apply.
+func w1bSingleDecode(p string) string {
+	if dec, err := url.PathUnescape(p); err == nil {
+		return dec
+	}
+	return p
+}
+
+// w1bPathWithinGenerated reports whether candidate (a relative filesystem
+// path) resolves inside content/generated. It mirrors the upload-side
+// Abs+HasPrefix check so read paths cannot escape via filepath.Join
+// cleaning (e.g. /a/../../etc/passwd).
+func w1bPathWithinGenerated(candidate string) bool {
+	base, err := filepath.Abs("content/generated")
+	if err != nil {
+		return false
+	}
+	abs, err := filepath.Abs(candidate)
+	if err != nil {
+		return false
+	}
+	if abs == base {
+		return false
+	}
+	return strings.HasPrefix(abs, base+string(filepath.Separator))
 }
 
 // Theme handlers
@@ -2897,11 +3325,11 @@ func (h *Handler) UpdateTheme(w http.ResponseWriter, r *http.Request) {
 
 	r.ParseForm()
 	ctx := r.Context()
-
-	// Get old settings to check if header/footer changed and for versioning
-	oldSettings, _ := h.db.GetThemeSettings(ctx)
-	headerChanged := oldSettings == nil || oldSettings.HeaderHTML != r.FormValue("header_html")
-	footerChanged := oldSettings == nil || oldSettings.FooterHTML != r.FormValue("footer_html")
+	// Inject editor identity + provenance for version attribution.
+	if user, ok := h.auth.GetCurrentUser(r); ok {
+		ctx = services.WithEditorEmail(ctx, user.Email)
+	}
+	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
 
 	settings := &database.ThemeSettings{
 		PrimaryColor:    r.FormValue("primary_color"),
@@ -2921,7 +3349,9 @@ func (h *Handler) UpdateTheme(w http.ResponseWriter, r *http.Request) {
 		FooterHTML:      r.FormValue("footer_html"),
 	}
 
-	if err := h.db.SaveThemeSettings(ctx, settings); err != nil {
+	// Lane 2C fix 4: single writer path — SettingsService owns the
+	// settings row, the collision-safe version chain and theme-vars.css.
+	if err := h.themeService().UpdateTheme(ctx, settings); err != nil {
 		h.renderAdmin(w, r, "theme", map[string]interface{}{
 			"Settings": settings,
 			"Error":    err.Error(),
@@ -2929,96 +3359,10 @@ func (h *Handler) UpdateTheme(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Save theme version
-	h.saveThemeVersion(ctx, settings, oldSettings)
-
-	// Regenerate CSS file
-	h.generateThemeCSS(settings)
-
-	// If header or footer changed, regenerate all published content
-	if headerChanged || footerChanged {
-		h.regenerateAllContent(ctx)
-	}
-
 	h.renderAdmin(w, r, "theme", map[string]interface{}{
 		"Settings": settings,
 		"Success":  "Theme updated successfully!",
 	})
-}
-
-// saveThemeVersion saves a new version of the theme settings
-func (h *Handler) saveThemeVersion(ctx context.Context, theme *database.ThemeSettings, original *database.ThemeSettings) {
-	// Get the current version count
-	count, err := h.db.GetThemeVersionCount(ctx)
-	if err != nil {
-		return
-	}
-
-	// If no versions exist and we have original theme, save it as v1 first
-	if count == 0 && original != nil {
-		v1 := &database.ThemeVersion{
-			Version:         1,
-			PrimaryColor:    original.PrimaryColor,
-			SecondaryColor:  original.SecondaryColor,
-			AccentColor:     original.AccentColor,
-			BackgroundColor: original.BackgroundColor,
-			TextColor:       original.TextColor,
-			FontFamily:      original.FontFamily,
-			HeadingFont:     original.HeadingFont,
-			BorderRadius:    original.BorderRadius,
-			CustomCSS:       original.CustomCSS,
-			SiteName:        original.SiteName,
-			SiteTagline:     original.SiteTagline,
-			LogoURL:         original.LogoURL,
-			HeadHTML:        original.HeadHTML,
-			HeaderHTML:      original.HeaderHTML,
-			FooterHTML:      original.FooterHTML,
-		}
-		h.db.SaveThemeVersion(ctx, v1)
-		count = 1
-	}
-
-	version := int(count) + 1
-
-	themeVersion := &database.ThemeVersion{
-		Version:         version,
-		PrimaryColor:    theme.PrimaryColor,
-		SecondaryColor:  theme.SecondaryColor,
-		AccentColor:     theme.AccentColor,
-		BackgroundColor: theme.BackgroundColor,
-		TextColor:       theme.TextColor,
-		FontFamily:      theme.FontFamily,
-		HeadingFont:     theme.HeadingFont,
-		BorderRadius:    theme.BorderRadius,
-		CustomCSS:       theme.CustomCSS,
-		SiteName:        theme.SiteName,
-		SiteTagline:     theme.SiteTagline,
-		LogoURL:         theme.LogoURL,
-		HeadHTML:        theme.HeadHTML,
-		HeaderHTML:      theme.HeaderHTML,
-		FooterHTML:      theme.FooterHTML,
-	}
-
-	h.db.SaveThemeVersion(ctx, themeVersion)
-}
-
-func (h *Handler) generateThemeCSS(settings *database.ThemeSettings) {
-	css := fmt.Sprintf(`:root {
-    --primary: %s;
-    --secondary: %s;
-    --accent: %s;
-    --background: %s;
-    --text: %s;
-    --font-family: %s;
-    --heading-font: %s;
-    --border-radius: %s;
-}
-
-%s`, settings.PrimaryColor, settings.SecondaryColor, settings.AccentColor,
-		settings.BackgroundColor, settings.TextColor, settings.FontFamily,
-		settings.HeadingFont, settings.BorderRadius, settings.CustomCSS)
-
-	os.WriteFile(services.ThemeCSSFile, []byte(css), 0644)
 }
 
 // ThemeVersions shows the theme version history
@@ -3094,71 +3438,20 @@ func (h *Handler) RevertThemeVersion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	version, err := h.db.GetThemeVersion(ctx, versionNum)
-	if err != nil {
-		auditSkip(r) // no such version: nothing was reverted
+	// Inject editor identity + provenance for version attribution.
+	if user, ok := h.auth.GetCurrentUser(r); ok {
+		ctx = services.WithEditorEmail(ctx, user.Email)
+	}
+	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
+
+	// Lane 2C fix 4: single writer path — the revert (settings row, new
+	// collision-safe version with revert comment, theme-vars.css) is owned
+	// by SettingsService.
+	if err := h.themeService().RevertThemeToVersion(ctx, versionNum,
+		fmt.Sprintf("Reverted to version %d", versionNum)); err != nil {
+		auditSkip(r)
 		http.Redirect(w, r, "/cm/theme/versions", http.StatusSeeOther)
 		return
-	}
-
-	// Create theme settings from version
-	theme := &database.ThemeSettings{
-		PrimaryColor:    version.PrimaryColor,
-		SecondaryColor:  version.SecondaryColor,
-		AccentColor:     version.AccentColor,
-		BackgroundColor: version.BackgroundColor,
-		TextColor:       version.TextColor,
-		FontFamily:      version.FontFamily,
-		HeadingFont:     version.HeadingFont,
-		BorderRadius:    version.BorderRadius,
-		CustomCSS:       version.CustomCSS,
-		SiteName:        version.SiteName,
-		SiteTagline:     version.SiteTagline,
-		LogoURL:         version.LogoURL,
-		HeadHTML:        version.HeadHTML,
-		HeaderHTML:      version.HeaderHTML,
-		FooterHTML:      version.FooterHTML,
-	}
-
-	// Get old settings to check if header/footer changed
-	oldSettings, _ := h.db.GetThemeSettings(ctx)
-	headerChanged := oldSettings == nil || oldSettings.HeaderHTML != theme.HeaderHTML
-	footerChanged := oldSettings == nil || oldSettings.FooterHTML != theme.FooterHTML
-
-	if err := h.db.SaveThemeSettings(ctx, theme); err != nil {
-		http.Redirect(w, r, "/cm/theme/versions", http.StatusSeeOther)
-		return
-	}
-
-	// Save as new version with revert comment
-	count, _ := h.db.GetThemeVersionCount(ctx)
-	newVersion := &database.ThemeVersion{
-		Version:         int(count) + 1,
-		Comment:         fmt.Sprintf("Reverted to version %d", versionNum),
-		PrimaryColor:    theme.PrimaryColor,
-		SecondaryColor:  theme.SecondaryColor,
-		AccentColor:     theme.AccentColor,
-		BackgroundColor: theme.BackgroundColor,
-		TextColor:       theme.TextColor,
-		FontFamily:      theme.FontFamily,
-		HeadingFont:     theme.HeadingFont,
-		BorderRadius:    theme.BorderRadius,
-		CustomCSS:       theme.CustomCSS,
-		SiteName:        theme.SiteName,
-		SiteTagline:     theme.SiteTagline,
-		LogoURL:         theme.LogoURL,
-		HeadHTML:        theme.HeadHTML,
-		HeaderHTML:      theme.HeaderHTML,
-		FooterHTML:      theme.FooterHTML,
-	}
-	h.db.SaveThemeVersion(ctx, newVersion)
-
-	// Regenerate CSS
-	h.generateThemeCSS(theme)
-
-	// If header or footer changed, regenerate all published content
-	if headerChanged || footerChanged {
-		h.regenerateAllContent(ctx)
 	}
 
 	http.Redirect(w, r, "/cm/theme/versions", http.StatusSeeOther)
@@ -3361,10 +3654,70 @@ func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// SetAPIKeyEncryptionKey enables sealed storage + reveal on the handler's
+// own API key service (wired once at boot from the session secret).
+func (h *Handler) SetAPIKeyEncryptionKey(key []byte) {
+	if h.apiKeyService != nil {
+		h.apiKeyService.SetEncryptionKey(key)
+	}
+}
+
+// RevealAPIKey returns the raw key value for the admin copy button.
+// Session + CSRF protected (POST-only route). Only the owning user or an
+// admin may reveal; every successful reveal is audit-logged.
+func (h *Handler) RevealAPIKey(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	vars := mux.Vars(r)
+	id, err := primitive.ObjectIDFromHex(vars["id"])
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	isAdmin := user.Role == models.RoleAdmin
+	rawKey, rerr := h.apiKeyService.RevealAPIKey(r.Context(), id, user.ID, isAdmin)
+	if rerr != nil {
+		switch {
+		case stderrors.Is(rerr, services.ErrAPIKeyNotFound):
+			http.Error(w, "API key not found", http.StatusNotFound)
+		case stderrors.Is(rerr, services.ErrAPIKeyForbidden):
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		case stderrors.Is(rerr, services.ErrAPIKeyNotRevealable):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			fmt.Fprint(w, `{"error":"key created before copy support; delete and recreate it to enable copying"}`)
+		default:
+			log.Printf("API key reveal failed for %s: %v", id.Hex(), rerr)
+			http.Error(w, "Reveal failed", http.StatusInternalServerError)
+		}
+		return
+	}
+	if h.auditService != nil {
+		userOID, _ := primitive.ObjectIDFromHex(user.ID)
+		h.auditService.LogAsync(models.AuditLog{
+			UserID:     userOID,
+			UserEmail:  user.Email,
+			Action:     "apikey.reveal",
+			Resource:   "apikey",
+			ResourceID: id.Hex(),
+			IPAddress:  r.RemoteAddr,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprintf(w, `{"key":%q}`, rawKey)
+}
+
 // DeleteAPIKey deletes an API key
 func (h *Handler) DeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermAPIKeyManage) {
 		return
 	}
 
@@ -3469,6 +3822,9 @@ func (h *Handler) SiteConfiguration(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) UpdateSiteConfiguration(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -3587,10 +3943,21 @@ func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check for static asset first (for files uploaded via Asset Library)
-	// These are served from content/generated at any path
+	// These are served from content/generated at any path.
+	// Lane 1B: validate before touching the filesystem; traversal vectors
+	// (../, %2e/%2f, null bytes, backslashes) are rejected 400 and never
+	// reach os.Stat/http.ServeFile. Dotted slugs (a.page/b) pass.
 	if slug != "" && strings.Contains(slug, ".") {
 		// Looks like a file (has extension) - check if it exists as a static asset
+		if !w1bSafeServeRel(fullPath) {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
 		assetPath := filepath.Join("content/generated", fullPath)
+		if !w1bPathWithinGenerated(assetPath) {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
 		if info, err := os.Stat(assetPath); err == nil && !info.IsDir() {
 			// Serve the static file with proper MIME type
 			ext := strings.ToLower(filepath.Ext(slug))
@@ -3746,7 +4113,7 @@ func (h *Handler) servePageContent(w http.ResponseWriter, r *http.Request, conte
 		}
 		if activeFork != nil {
 			w.Header().Set("Cache-Control", "private, no-store")
-			htmlContent = forkPreviewBar(activeFork) + htmlContent
+			htmlContent = withForkPreviewBar(htmlContent, activeFork)
 		}
 		w.Write([]byte(htmlContent))
 		return
@@ -3780,10 +4147,54 @@ func (h *Handler) servePageContent(w http.ResponseWriter, r *http.Request, conte
 	rendered := h.renderContent(content, &tmpl)
 	head := h.pageSEOHead(r, content, &tmpl, ogImage, rendered)
 	if activeFork != nil {
-		rendered = forkPreviewBar(activeFork) + rendered
+		rendered = withForkPreviewBar(rendered, activeFork)
 	}
 	h.renderPublicWithSEO(w, r, theme, rendered, content.UseHeader, content.UseFooter,
 		content.Title, content.MetaDescription, ogImage, canonical, head)
+}
+
+// withForkPreviewBar inserts the toolbar inside standalone documents so a
+// preview cannot reintroduce a nested theme wrapper.
+func withForkPreviewBar(content string, fork *models.ContentFork) string {
+	bar := forkPreviewBar(fork)
+	if !isStandaloneDocument(content) {
+		return bar + content
+	}
+	doc, err := nethtml.Parse(strings.NewReader(content))
+	if err != nil {
+		return content
+	}
+	var body *nethtml.Node
+	var visit func(*nethtml.Node)
+	visit = func(n *nethtml.Node) {
+		if body != nil {
+			return
+		}
+		if n.Type == nethtml.ElementNode && n.Data == "body" {
+			body = n
+			return
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			visit(c)
+		}
+	}
+	visit(doc)
+	if body == nil {
+		return content
+	}
+	nodes, err := nethtml.ParseFragment(strings.NewReader(bar), body)
+	if err != nil {
+		return content
+	}
+	first := body.FirstChild
+	for _, node := range nodes {
+		body.InsertBefore(node, first)
+	}
+	var out strings.Builder
+	if err := nethtml.Render(&out, doc); err != nil {
+		return content
+	}
+	return out.String()
 }
 
 // forkPreviewBar returns the HTML for the floating preview bar injected during fork preview.
@@ -3886,8 +4297,13 @@ func (h *Handler) serve404(w http.ResponseWriter, r *http.Request, theme *databa
 		}
 	}
 
-	// Fallback to simple 404
-	h.renderPublicWithOptions(w, r, theme, `<div style="text-align:center;padding:4rem"><h1>404</h1><p>Page not found</p></div>`, true, true)
+	// Fallback to simple 404 (chrome strings resolved server-side: this
+	// content fragment is injected via {{.Content}} so template funcs
+	// cannot reach it; authored DB 404 pages are untouched).
+	// Public default is English (overseas readers); explicit ?lang=/cookie
+	// choices are still honored.
+	lang := i18n.PublicLangFromRequest(r)
+	h.renderPublicWithOptions(w, r, theme, `<div style="text-align:center;padding:4rem"><h1>404</h1><p>`+template.HTMLEscapeString(i18n.T("site.error_404_msg", "页面未找到", lang))+`</p><p><a href="/\">`+template.HTMLEscapeString(i18n.T("site.error_404_back", "返回首页", lang))+`</a></p></div>`, true, true)
 }
 
 func (h *Handler) renderContent(content *models.Content, tmpl *models.Template) string {
@@ -3920,8 +4336,12 @@ func (h *Handler) renderContent(content *models.Content, tmpl *models.Template) 
 }
 
 func (h *Handler) generateStaticPage(ctx context.Context, content *models.Content, tmpl *models.Template) error {
-	// Fork copies share full_path with their live counterpart — generating
-	// them would overwrite the live page's static file with fork content.
+	// Task 16B fork-safety + live-write guard (spec §12.5, §16.6): fork
+	// copies share full_path with live pages and must never touch static
+	// files. Live mutation paths must go through PublicationService;
+	// this legacy helper is retained only for SeedDefaults bootstrapping.
+	// All Admin/REST mutation call sites in Task 16B/C were routed to the
+	// draft-only ContentService and no longer call this helper.
 	if content.ForkID != nil {
 		return nil
 	}
@@ -3948,47 +4368,16 @@ func (h *Handler) generateStaticPage(ctx context.Context, content *models.Conten
 }
 
 // regenerateAllContent regenerates all published content (used when header/footer/templates change)
+// Task 16B: disabled — V3 never auto-regenerates live pages. Explicit
+// Upgrade/Publish via PublicationService is required.
 func (h *Handler) regenerateAllContent(ctx context.Context) {
-	// Regenerate all published content items
-	cursor, err := h.db.FindMany(ctx, "content", bson.M{"published": true, "deleted": bson.M{"$ne": true}, "fork_id": nil})
-	if err != nil {
-		return
-	}
-
-	var contents []models.Content
-	if err := cursor.All(ctx, &contents); err != nil {
-		return
-	}
-
-	for _, content := range contents {
-		var tmpl models.Template
-		if err := h.db.FindOne(ctx, "templates", bson.M{"_id": content.TemplateID}, &tmpl); err != nil {
-			continue
-		}
-		h.generateStaticPage(ctx, &content, &tmpl)
-	}
+	return
 }
 
 // regenerateContentByTemplate regenerates all content using a specific template
+// Task 16B: disabled — see above.
 func (h *Handler) regenerateContentByTemplate(ctx context.Context, templateID primitive.ObjectID) {
-	cursor, err := h.db.FindMany(ctx, "content", bson.M{"template_id": templateID, "published": true, "deleted": bson.M{"$ne": true}, "fork_id": nil})
-	if err != nil {
-		return
-	}
-
-	var tmpl models.Template
-	if err := h.db.FindOne(ctx, "templates", bson.M{"_id": templateID}, &tmpl); err != nil {
-		return
-	}
-
-	var contents []models.Content
-	if err := cursor.All(ctx, &contents); err != nil {
-		return
-	}
-
-	for _, content := range contents {
-		h.generateStaticPage(ctx, &content, &tmpl)
-	}
+	return
 }
 
 func (h *Handler) renderPublic(w http.ResponseWriter, r *http.Request, theme *database.ThemeSettings, content string) {
@@ -4007,7 +4396,43 @@ func (h *Handler) renderPublicWithOptions(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) renderPublicWithSEO(w http.ResponseWriter, r *http.Request, theme *database.ThemeSettings, content string, useHeader, useFooter bool, title, metaDescription, ogImage, canonicalURL string, structuredData ...string) {
-	tmpl := template.Must(template.New("layout").Parse(publicLayout))
+	// Product templates can be complete authored documents. Nesting them inside
+	// publicLayout duplicates <head>/<body> and leaks theme CSS (.hero/.sidebar)
+	// into the article. Preserve the publication bytes and its own metadata.
+	if isStandaloneDocument(content) {
+		ld := ""
+		if len(structuredData) > 0 {
+			ld = structuredData[0]
+			if ld != "" {
+				if canonicalURL != "" && !strings.Contains(strings.ToLower(content), `rel="canonical"`) && !strings.Contains(strings.ToLower(content), `rel='canonical'`) {
+					ld += `<link rel="canonical" href="` + html.EscapeString(canonicalURL) + `">`
+				}
+				if canonicalURL != "" {
+					ld += h.feedLinks(r, h.seoConfig(r.Context()), theme.SiteName)
+				}
+			}
+		}
+		content = supplementStandaloneHead(content, title, ld)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if h.getActiveForkPreview(r) != nil {
+			w.Header().Set("Cache-Control", "private, no-store")
+		} else {
+			hash := sha256.Sum256([]byte(content))
+			etag := fmt.Sprintf(`"%x"`, hash)
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Cache-Control", "public, max-age=300, s-maxage=3600")
+			w.Header().Set("Vary", "Accept-Encoding")
+			if r.Header.Get("If-None-Match") == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+		_, _ = io.WriteString(w, content)
+		return
+	}
+	tmpl := template.Must(template.New("layout").Funcs(template.FuncMap{
+		"i18n": func(key, fallback, lang string) string { return i18n.T(key, fallback, lang) },
+	}).Parse(publicLayout))
 
 	// Get site config for title template
 	ctx := r.Context()
@@ -4035,6 +4460,7 @@ func (h *Handler) renderPublicWithSEO(w http.ResponseWriter, r *http.Request, th
 		"Content":         template.HTML(content),
 		"UseHeader":       useHeader,
 		"UseFooter":       useFooter,
+		"Lang":            i18n.PublicLangFromRequest(r),
 		"HeadHTML":        template.HTML(theme.HeadHTML),
 		"HeaderHTML":      template.HTML(theme.HeaderHTML),
 		"FooterHTML":      template.HTML(theme.FooterHTML),
@@ -4080,6 +4506,186 @@ func (h *Handler) renderPublicWithSEO(w http.ResponseWriter, r *http.Request, th
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tmpl.Execute(w, data)
+}
+
+// Only a leading document token qualifies; a doctype mentioned in a fragment
+// or code example must not disable the normal site layout.
+func isStandaloneDocument(content string) bool {
+	z := nethtml.NewTokenizer(strings.NewReader(strings.TrimPrefix(content, "\ufeff")))
+	for {
+		switch z.Next() {
+		case nethtml.CommentToken:
+			continue
+		case nethtml.TextToken:
+			if strings.TrimSpace(string(z.Text())) != "" {
+				return false
+			}
+		case nethtml.DoctypeToken:
+			parts := strings.Fields(z.Token().Data)
+			return len(parts) > 0 && strings.EqualFold(parts[0], "html")
+		case nethtml.StartTagToken:
+			return strings.EqualFold(z.Token().Data, "html")
+		default:
+			return false
+		}
+	}
+}
+
+// Authored/frozen metadata wins. Only fill absent legacy title/JSON-LD, without
+// adding the site shell or importing any site styles into the document.
+func supplementStandaloneHead(content, title, jsonLD string) string {
+	z := nethtml.NewTokenizer(strings.NewReader(content))
+	offset, htmlEnd, doctypeEnd, headEnd := 0, 0, 0, -1
+	hasTitle, hasJSONLD := false, false
+	for {
+		tt := z.Next()
+		if tt == nethtml.ErrorToken {
+			break
+		}
+		before := offset
+		offset += len(z.Raw())
+		token := z.Token()
+		if tt == nethtml.DoctypeToken {
+			doctypeEnd = offset
+		}
+		if tt == nethtml.EndTagToken && token.Data == "head" {
+			headEnd = before
+		}
+		if tt != nethtml.StartTagToken {
+			continue
+		}
+		if token.Data == "html" {
+			htmlEnd = offset
+		}
+		if token.Data == "title" {
+			hasTitle = true
+		}
+		if token.Data == "script" {
+			for _, attr := range token.Attr {
+				if attr.Key == "type" && strings.EqualFold(strings.TrimSpace(attr.Val), "application/ld+json") {
+					hasJSONLD = true
+				}
+			}
+		}
+	}
+	var addition strings.Builder
+	if !hasTitle && title != "" {
+		addition.WriteString("<title>" + html.EscapeString(title) + "</title>\n")
+	}
+	if missing := missingStandaloneSEO(content, jsonLD, hasJSONLD); missing != "" {
+		addition.WriteString(missing + "\n")
+	}
+	if addition.Len() == 0 {
+		return content
+	}
+	if headEnd >= 0 {
+		return content[:headEnd] + addition.String() + content[headEnd:]
+	}
+	insert := htmlEnd
+	if insert == 0 {
+		insert = doctypeEnd
+	}
+	return content[:insert] + "<head>" + addition.String() + "</head>" + content[insert:]
+}
+
+var standaloneJSONLD = regexp.MustCompile(`(?is)<script\b[^>]*\btype\s*=\s*["']application/ld\+json["'][^>]*>(.*?)</script\s*>`)
+var standaloneLink = regexp.MustCompile(`(?is)<link\b[^>]*>`)
+
+func standaloneSchemaTypes(raw string) map[string]bool {
+	var value any
+	_ = json.Unmarshal([]byte(raw), &value)
+	types := map[string]bool{}
+	var visit func(any)
+	visit = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			switch t := x["@type"].(type) {
+			case string:
+				types[t] = true
+			case []any:
+				for _, one := range t {
+					if name, ok := one.(string); ok {
+						types[name] = true
+					}
+				}
+			}
+			if graph, ok := x["@graph"]; ok {
+				visit(graph)
+			}
+		case []any:
+			for _, one := range x {
+				visit(one)
+			}
+		}
+	}
+	visit(value)
+	return types
+}
+
+// Authored structured data and discovery links win independently. An Article
+// script must not suppress a missing canonical, feed, or BreadcrumbList.
+func missingStandaloneSEO(content, addition string, hasJSONLD bool) string {
+	seen := map[string]bool{}
+	for _, match := range standaloneJSONLD.FindAllStringSubmatch(content, -1) {
+		for kind := range standaloneSchemaTypes(match[1]) {
+			seen[kind] = true
+		}
+	}
+	addition = standaloneJSONLD.ReplaceAllStringFunc(addition, func(script string) string {
+		match := standaloneJSONLD.FindStringSubmatch(script)
+		types := standaloneSchemaTypes(match[1])
+		if len(types) == 0 && hasJSONLD {
+			return ""
+		}
+		missing := len(types) == 0
+		for kind := range types {
+			if !seen[kind] {
+				missing = true
+			}
+		}
+		if !missing {
+			return ""
+		}
+		for kind := range types {
+			seen[kind] = true
+		}
+		return script
+	})
+	links := map[string]bool{}
+	key := func(raw string) string {
+		z := nethtml.NewTokenizer(strings.NewReader(raw))
+		tt := z.Next()
+		token := z.Token()
+		if (tt != nethtml.StartTagToken && tt != nethtml.SelfClosingTagToken) || token.Data != "link" {
+			return ""
+		}
+		rel, typ := "", ""
+		for _, a := range token.Attr {
+			if a.Key == "rel" {
+				rel = strings.ToLower(a.Val)
+			}
+			if a.Key == "type" {
+				typ = strings.ToLower(a.Val)
+			}
+		}
+		if rel == "" {
+			return ""
+		}
+		return rel + ":" + typ
+	}
+	for _, raw := range standaloneLink.FindAllString(content, -1) {
+		if k := key(raw); k != "" {
+			links[k] = true
+		}
+	}
+	return standaloneLink.ReplaceAllStringFunc(addition, func(raw string) string {
+		k := key(raw)
+		if k != "" && links[k] {
+			return ""
+		}
+		links[k] = true
+		return raw
+	})
 }
 
 // inferOGImage returns the best OG image for a content item.
@@ -4159,6 +4765,10 @@ func (h *Handler) renderAdminStatus(w http.ResponseWriter, r *http.Request, stat
 		auditSkip(r)
 	}
 	data["IsAuthenticated"] = h.auth.IsAuthenticated(r)
+	data["StaticDeliveryAvailable"] = h.staticDelivery != nil && h.staticDelivery.Commands != nil
+	// UI-A i18n: per-request language flows through template data (templates
+	// are parsed once and cached, so there are no per-language trees).
+	data["Lang"] = i18n.LangFromRequest(r)
 
 	// Inject current user into template data for sidebar/nav, and what the
 	// role may do so templates can hide controls it cannot use:
@@ -4216,7 +4826,12 @@ func (h *Handler) renderAdminStatus(w http.ResponseWriter, r *http.Request, stat
 	if status != http.StatusOK {
 		w.WriteHeader(status)
 	}
-	tmpl.Execute(w, data)
+	// Log template execution errors: Execute may have partially written the
+	// response already, so the status cannot change — but silent truncation
+	// (e.g. a bad field reference inside a range block) must be visible.
+	if err := tmpl.Execute(w, data); err != nil {
+		log.Printf("admin template %q execute error: %v", name, err)
+	}
 }
 
 func slugify(s string) string {
@@ -4330,7 +4945,7 @@ func (h *Handler) saveContentVersionWithOriginal(ctx context.Context, content *m
 		count = 1
 	}
 
-	version := int(count) + 1
+	version := count + 1
 
 	modifiedByEmail := services.EditorEmailFromContext(ctx)
 	contentVersion := models.ContentVersion{
@@ -4460,24 +5075,19 @@ func (h *Handler) updateDependentContentByPath(ctx context.Context, oldPath, new
 			// Re-extract internal links after update
 			content.InternalLinks = h.extractInternalLinksFromContent(&content)
 
-			// Update in database
+			// Update in database (draft-only: mark unpublished changes, no file write)
 			if err := h.db.UpdateOne(ctx, "content", bson.M{"_id": content.ID}, bson.M{
 				"$set": bson.M{
-					"data":           content.Data,
-					"internal_links": content.InternalLinks,
-					"updated_at":     time.Now(),
+					"data":                    content.Data,
+					"internal_links":          content.InternalLinks,
+					"has_unpublished_changes": content.Published,
+					"updated_at":              time.Now(),
 				},
 			}); err != nil {
 				return err
 			}
 
-			// Regenerate static page if published
-			if content.Published {
-				var tmpl models.Template
-				if err := h.db.FindOne(ctx, "templates", bson.M{"_id": content.TemplateID}, &tmpl); err == nil {
-					h.generateStaticPage(ctx, &content, &tmpl)
-				}
-			}
+			// Task 16B: no generateStaticPage here — draft link fix only.
 		}
 	}
 
@@ -4500,8 +5110,8 @@ func (h *Handler) updateDependentContentByPath(ctx context.Context, oldPath, new
 
 		if themeUpdated {
 			h.db.SaveThemeSettings(ctx, theme)
-			// Regenerate all content since header/footer changed
-			h.regenerateAllContent(ctx)
+			// Task 16B: no regenerateAllContent here — theme changes require
+			// explicit per-page Publish via PublicationService.
 		}
 	}
 
@@ -4533,7 +5143,7 @@ func updateLinksInHTMLByPath(html, oldPath, newPath string) string {
 
 // Public layout template
 const publicLayout = `<!DOCTYPE html>
-<html lang="en">
+<html lang="{{.Lang}}">
 <head>
 {{if .HeadHTML}}{{.HeadHTML}}{{end}}
     <meta charset="UTF-8">
@@ -4553,6 +5163,26 @@ const publicLayout = `<!DOCTYPE html>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/theme-vars.css">
     <link rel="stylesheet" href="/static/css/main.css">
+    <style>
+    /* UI-C: macOS-style overlay scrollbars (public site). The track/thumb
+       slot keeps a constant width so revealing the thumb never shifts
+       layout; only the thumb paint fades in on hover and while scrolling
+       or touch-dragging (html.is-scrolling, 800ms idle timeout). */
+    html{scrollbar-width:thin;scrollbar-color:rgba(148,163,184,0) transparent;}
+    html:hover,html.is-scrolling{scrollbar-color:rgba(148,163,184,.55) transparent;}
+    ::-webkit-scrollbar{width:10px;height:10px;background:transparent;}
+    ::-webkit-scrollbar-track{background:transparent;}
+    ::-webkit-scrollbar-corner{background:transparent;}
+    ::-webkit-scrollbar-thumb{background-color:rgba(148,163,184,0);border-radius:8px;border:3px solid transparent;background-clip:content-box;}
+    html:hover::-webkit-scrollbar-thumb,html.is-scrolling::-webkit-scrollbar-thumb{background-color:rgba(148,163,184,.55);border:3px solid transparent;background-clip:content-box;}
+    ::-webkit-scrollbar-thumb:hover{background-color:rgba(148,163,184,.8);border:3px solid transparent;background-clip:content-box;}
+    /* UI-C: header language switch, matches dark nav style. */
+    .lang-switch{display:flex;align-items:center;gap:.5rem;font-size:.85rem;}
+    .lang-switch a{color:rgba(226,232,240,.7);}
+    .lang-switch a:hover{color:#fff;}
+    .lang-switch a.active{color:#fff;font-weight:600;}
+    .lang-switch .lang-sep{color:rgba(148,163,184,.4);}
+    </style>
 </head>
 <body>
     {{if .UseHeader}}
@@ -4564,8 +5194,13 @@ const publicLayout = `<!DOCTYPE html>
             <div class="nav-container">
                 <a href="/" class="logo">{{if .Theme.LogoURL}}<img src="{{.Theme.LogoURL}}" alt="{{.Theme.SiteName}}" class="site-logo">{{else}}{{.Theme.SiteName}}{{end}}</a>
                 <div class="nav-links">
-                    <a href="/">Home</a>
-                    <a href="/blog">Blog</a>
+                    <a href="/">{{i18n "site.nav_home" "首页" $.Lang}}</a>
+                    <a href="/blog">{{i18n "site.nav_blog" "博客" $.Lang}}</a>
+                </div>
+                <div class="lang-switch">
+                    <a href="?lang=zh"{{if eq .Lang "zh"}} class="active"{{end}}>{{i18n "site.lang_zh" "中文" $.Lang}}</a>
+                    <span class="lang-sep">|</span>
+                    <a href="?lang=en"{{if eq .Lang "en"}} class="active"{{end}}>{{i18n "site.lang_en" "EN" $.Lang}}</a>
                 </div>
             </div>
         </nav>
@@ -4586,11 +5221,15 @@ const publicLayout = `<!DOCTYPE html>
         {{else}}
         <div class="container">
             <p>{{.Theme.SiteTagline}}</p>
-            <p class="copyright">&copy; 2026 {{.Theme.SiteName}}. Powered by LightCMS.</p>
+            <p class="copyright">&copy; 2026 {{.Theme.SiteName}}. {{i18n "site.footer_powered" "由 LightCMS 驱动" $.Lang}}</p>
         </div>
         {{end}}
     </footer>
     {{end}}
+    <script>
+    /* UI-C: reveal overlay scrollbar thumb while scrolling / touch-dragging. */
+    (function(){var t=null;function on(){var el=document.documentElement;el.classList.add('is-scrolling');if(t){clearTimeout(t);}t=setTimeout(function(){el.classList.remove('is-scrolling');t=null;},800);}window.addEventListener('scroll',on,{passive:true});window.addEventListener('touchmove',on,{passive:true});})();
+    </script>
 </body>
 </html>`
 
@@ -4635,6 +5274,9 @@ func (h *Handler) NewRedirect(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreateRedirect(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -4711,6 +5353,9 @@ func (h *Handler) UpdateRedirect(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -4758,6 +5403,9 @@ func (h *Handler) UpdateRedirect(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteRedirect(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermSettingsEdit) {
 		return
 	}
 
@@ -4908,6 +5556,9 @@ func (h *Handler) ViewContactMessage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -4940,6 +5591,9 @@ func (h *Handler) DeleteContactMessage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermContentDelete) {
+		return
+	}
 
 	vars := mux.Vars(r)
 	id, err := primitive.ObjectIDFromHex(vars["id"])
@@ -4963,6 +5617,10 @@ func (h *Handler) MarkAllMessagesRead(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit) {
+		return
+	}
+
 	h.db.Collection("contact_messages").UpdateMany(r.Context(), bson.M{"read": false}, bson.M{"$set": bson.M{"read": true}}) //nolint:errcheck
 	http.Redirect(w, r, "/cm/messages", http.StatusSeeOther)
 }
@@ -5029,6 +5687,9 @@ func (h *Handler) AssetUpload(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermAssetUpload) {
+		return
+	}
 
 	maxBytes := h.uploadMaxBytes(r.Context())
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
@@ -5092,6 +5753,16 @@ func (h *Handler) AssetUpload(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(servePath, "..") {
 		http.Error(w, "Invalid file path", http.StatusBadRequest)
 		return
+	}
+
+	// Served-truth guard (shared with AssetService.UploadAsset): assets share
+	// the content/generated tree with page canonicals, so an *.html asset
+	// would land on the exact bytes of a same-path page canonical.
+	if strings.HasSuffix(strings.ToLower(servePath), ".html") {
+		if clash := services.CheckAssetCanonicalCollision(r.Context(), h.db, servePath); clash != "" {
+			http.Error(w, fmt.Sprintf("asset path %q collides with the canonical of an existing page (%q) — choose a different asset name", servePath, clash), http.StatusConflict)
+			return
+		}
 	}
 
 	// Get filename from serve path
@@ -5179,8 +5850,23 @@ func (h *Handler) AssetUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 // ServeAsset serves an asset file by path (legacy /assets/ path support)
+// Lane 1B: both filesystem candidates are validated (raw + decoded ".."
+// segments, null bytes, backslashes, Abs+HasPrefix) before os.Stat, mirroring
+// the upload-side checks. Traversal vectors yield 400 and never reach
+// ServeFile; legit nested asset paths keep serving.
+//
+// Cache-header story (Lane 1B fix 5c): the two static-file branches here
+// intentionally use "Cache-Control: no-cache" (assets are mutable library
+// files; browsers must revalidate), while ServePage's dotted-slug asset
+// shortcut uses "public, max-age=31536000" (immutable hashed page-adjacent
+// files served as page fallbacks). The collision guard in
+// AssetService.UploadAsset (reject *.html canonical collisions) plus the
+// scanner asset-skip ensures a *.html asset never masquerades as a page
+// canonical, so the divergent headers cannot cause a stale page to be
+// cached as an asset or vice versa.
 func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
-	// Get full path from URL
+	// Get full path from URL (decoded form drives filesystem lookups so
+	// legit %20 files resolve to their space-named files on disk).
 	fullPath := r.URL.Path
 	if !strings.HasPrefix(fullPath, "/assets") {
 		http.NotFound(w, r)
@@ -5192,16 +5878,35 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 		assetPath = "/"
 	}
 
+	// Lane 1B: reject traversal before any filesystem or DB lookup.
+	// Inspect both the decoded Path and the raw EscapedPath so %2e/%2f
+	// vectors are caught whether Go decoded them or the caller set
+	// URL.Path explicitly (as traversal tests do).
+	escaped := r.URL.EscapedPath()
+	if !w1bSafeServeRel(assetPath) || !w1bSafeServeRel(fullPath) ||
+		(escaped != "" && (!w1bSafeServeRel(escaped) || !w1bSafeServeRel(strings.TrimPrefix(escaped, "/assets")))) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
 	// First check for static file (new style)
 	// Try without /assets prefix first, then with it (handles assets
 	// uploaded before the prefix-stripping normalization was added)
 	staticFilePath := filepath.Join("content/generated", assetPath)
+	if !w1bPathWithinGenerated(staticFilePath) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
 	if info, err := os.Stat(staticFilePath); err == nil && !info.IsDir() {
 		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, staticFilePath)
 		return
 	}
 	staticFilePathFull := filepath.Join("content/generated", fullPath)
+	if !w1bPathWithinGenerated(staticFilePathFull) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
 	if info, err := os.Stat(staticFilePathFull); err == nil && !info.IsDir() {
 		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, staticFilePathFull)
@@ -5240,6 +5945,9 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteAsset(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.IsAuthenticated(r) {
 		http.Redirect(w, r, "/cm/login", http.StatusSeeOther)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermAssetDelete) {
 		return
 	}
 
@@ -5389,8 +6097,6 @@ func (h *Handler) BrokenLinkScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	// The scan fetches every external link in published content from this
-	// server: it needs the permission the broken-link fix needs.
 	if !auth.HasPermission(user.Role, auth.PermContentEdit) {
 		adminJSONError(w, http.StatusForbidden, forbiddenMessage([]string{auth.PermContentEdit}))
 		return
@@ -5742,6 +6448,9 @@ func (h *Handler) FixBrokenLink(w http.ResponseWriter, r *http.Request) {
 	}
 	if !auth.HasPermission(user.Role, auth.PermContentEdit) {
 		adminJSONError(w, http.StatusForbidden, "Fixing links requires permission to edit content.")
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermContentEdit) {
 		return
 	}
 
@@ -6364,6 +7073,9 @@ func (h *Handler) ReplaceExecute(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !h.adminRequirePerm(w, r, auth.PermSearchReplace) {
+		return
+	}
 
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -6581,8 +7293,13 @@ func (h *Handler) NewSnippet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateSnippet(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusFound)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateEdit) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 	name := strings.TrimSpace(r.FormValue("name"))
@@ -6625,12 +7342,18 @@ func (h *Handler) EditSnippet(w http.ResponseWriter, r *http.Request) {
 	h.renderAdmin(w, r, "snippet_form", map[string]interface{}{
 		"Title":   "Edit Snippet",
 		"Snippet": snip,
+		"Impact":  h.currentTemplateImpact(r.Context(), primitive.NilObjectID, snip.Name),
 	})
 }
 
 func (h *Handler) UpdateSnippet(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusFound)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateEdit) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 	vars := mux.Vars(r)
@@ -6667,8 +7390,13 @@ func (h *Handler) UpdateSnippet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteSnippet(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.IsAuthenticated(r) {
+	user, ok := h.auth.GetCurrentUser(r)
+	if !ok {
 		http.Redirect(w, r, "/cm/login", http.StatusFound)
+		return
+	}
+	if !auth.HasPermission(user.Role, auth.PermTemplateEdit) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 	vars := mux.Vars(r)
@@ -6733,3 +7461,62 @@ func (h *Handler) ApprovalsPage(w http.ResponseWriter, r *http.Request) {
 		"Workflows":    workflows,
 	})
 }
+
+// File upload handler
+func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
+	if !h.auth.IsAuthenticated(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !h.adminRequirePerm(w, r, auth.PermAssetUpload) {
+		return
+	}
+
+	maxBytes := h.uploadMaxBytes(r.Context())
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	r.ParseMultipartForm(maxBytes)
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "No file uploaded", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Validate file extension
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if !middleware.IsAllowedFileType(ext) {
+		http.Error(w, "File type not allowed", http.StatusBadRequest)
+		return
+	}
+
+	// Read file data (bounded to configured max upload size)
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes))
+	if err != nil {
+		h.errors.HTTPError(w, err, http.StatusInternalServerError)
+		return
+	}
+
+	// Validate MIME type matches extension
+	detectedMIME := http.DetectContentType(data)
+	if !middleware.ValidateMIMEType(ext, detectedMIME) {
+		log.Printf("MIME type mismatch in upload: extension=%s, detected=%s", ext, detectedMIME)
+		http.Error(w, "File content does not match its extension", http.StatusBadRequest)
+		return
+	}
+
+	// Sanitize the original filename (remove any path components)
+	safeFilename := filepath.Base(header.Filename)
+	// Generate unique filename with timestamp
+	filename := fmt.Sprintf("%d_%s", time.Now().UnixNano(), safeFilename)
+	uploadPath := filepath.Join("static/uploads", filename)
+
+	if err := os.WriteFile(uploadPath, data, 0644); err != nil {
+		h.errors.HTTPError(w, err, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"location": "/uploads/%s"}`, filename)
+}
+
+// API handler for template fields

@@ -499,8 +499,9 @@ func TestAdminUI_MutationsAreAuditLogged(t *testing.T) {
 	}
 
 	// Template delete last (the page above used it)
-	ok("delete template", routed(r, "admin", "POST", "/cm/templates/"+tplID+"/delete", nil))
-	expect("delete template", "template.delete", tplID)
+	if rr := routed(r, "admin", "POST", "/cm/templates/"+tplID+"/delete", nil); rr.Code != http.StatusConflict {
+		t.Errorf("referenced template delete: %d, want 409", rr.Code)
+	}
 }
 
 // ---------------------------------------------------------------- item 9
@@ -626,8 +627,8 @@ func TestUpdateContentFolderPaths_LeavesHomepageAndLiveFilesAlone(t *testing.T) 
 
 	assertStatic(t, "folder rename with a legacy empty-path row", "/index", home)
 	assertStatic(t, "folder rename with a fork copy in the folder", "/f10-elsewhere", live)
-	if _, err := os.Stat(staticFile("/f10-old/page")); err == nil {
-		t.Error("the moved page's old static file is still there")
+	if _, err := os.Stat(staticFile("/f10-old/page")); err != nil {
+		t.Error("draft folder rename removed the published file before cutover")
 	}
 	if c := loadPage(t, h.db, page); c.FullPath != "/f10-new/page" || c.FolderPath != "/f10-new" {
 		t.Errorf("page not moved: %q in %q", c.FullPath, c.FolderPath)
@@ -642,18 +643,26 @@ func TestUpdateContentFolderPaths_LeavesHomepageAndLiveFilesAlone(t *testing.T) 
 
 // --------------------------------------------------------------- item 12
 
-// /cm/upload and the two /cm lock routes had no caller and are gone; the
-// lock API they duplicated is still there.
-func TestRemovedAdminRoutes(t *testing.T) {
+// Legacy editor integrations still use upload and lease heartbeat routes.
+// Keep those entries guarded in the central route table after upstream sync.
+func TestLegacyEditorRoutesRemainPermissionGuarded(t *testing.T) {
 	h := routesTestHandler()
-	r := adminRouter(h)
-	id := "000000000000000000000001"
-	for _, target := range []string{"/cm/upload", "/cm/content/" + id + "/lock/refresh", "/cm/content/" + id + "/lock/force"} {
-		rr := routed(r, "admin", "POST", target, nil)
-		if rr.Code != http.StatusNotFound && rr.Code != http.StatusMethodNotAllowed {
-			t.Errorf("POST %s: %d, want 404/405 (the route was removed)", target, rr.Code)
+	want := map[string]bool{"POST /cm/upload": false, "POST /cm/content/{id}/lock/refresh": false, "POST /cm/content/{id}/lock/force": false}
+	for _, rt := range h.AdminRoutes() {
+		key := routeKey(rt.Method, rt.Path)
+		if _, ok := want[key]; ok {
+			if len(rt.Perms) == 0 {
+				t.Errorf("%s has no permission", key)
+			}
+			want[key] = true
 		}
 	}
+	for key, seen := range want {
+		if !seen {
+			t.Errorf("missing compatibility route %s", key)
+		}
+	}
+
 	src, err := os.ReadFile("../../cmd/server/main.go")
 	if err != nil {
 		t.Fatalf("read main.go: %v", err)

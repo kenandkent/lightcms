@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/metavert-io/lightcms/v7/internal/auth"
+	"github.com/metavert-io/lightcms/v7/internal/models"
 	"github.com/metavert-io/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
@@ -97,7 +98,7 @@ func (a *APIHandler) APICreateFork(w http.ResponseWriter, r *http.Request) {
 		userID, _ = primitive.ObjectIDFromHex(user.ID)
 		userEmail = user.Email
 	}
-	fork, err := a.forkService.Create(r.Context(), body.Name, body.Description, userID, userEmail)
+	fork, err := a.forkService.Create(r.Context(), body.Name, body.Description, userID, userEmail, r.Header.Get("X-Agent-Session"))
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -326,7 +327,8 @@ func (a *APIHandler) APIMergeFork(w http.ResponseWriter, r *http.Request) {
 		userID, _ = primitive.ObjectIDFromHex(user.ID)
 		userEmail = user.Email
 	}
-	result, err := a.forkService.Merge(r.Context(), forkID, userID, userEmail, body.PublishNew)
+	ctx := services.WithAuthorIsAdmin(r.Context(), user != nil && user.Role == models.RoleAdmin)
+	result, err := a.forkService.Merge(ctx, forkID, userID, userEmail, body.PublishNew)
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -357,15 +359,18 @@ func (a *APIHandler) APIMergeFork(w http.ResponseWriter, r *http.Request) {
 		notPublished[i] = map[string]string{"id": n.ID.Hex(), "path": n.Path, "reason": n.Reason}
 	}
 	a.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"success":       true,
-		"updated":       result.Updated,
-		"created":       result.Created,
-		"created_ids":   hexIDs(result.CreatedIDs),
-		"updated_ids":   hexIDs(result.UpdatedIDs),
-		"publish_new":   body.PublishNew,
-		"not_published": notPublished,
-		"conflicts":     conflicts,
-		"message":       fmt.Sprintf("Fork merged: %d updated, %d created, %d conflicts (fork won)", result.Updated, result.Created, len(result.Conflicts)),
+		"success":          true,
+		"updated":          result.Updated,
+		"created":          result.Created,
+		"created_ids":      hexIDs(result.CreatedIDs),
+		"updated_ids":      hexIDs(result.UpdatedIDs),
+		"publish_new":      body.PublishNew,
+		"not_published":    notPublished,
+		"content_ids":      result.ContentIDs,
+		"requires_publish": result.RequiresPublish,
+		"failed":           result.Failed,
+		"conflicts":        conflicts,
+		"message":          fmt.Sprintf("Fork merged: %d updated, %d created, %d conflicts (fork won)", result.Updated, result.Created, len(result.Conflicts)),
 	})
 }
 

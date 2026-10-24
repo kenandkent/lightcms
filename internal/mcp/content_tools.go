@@ -35,6 +35,7 @@ type CreateContentInput struct {
 	Category        string                 `json:"category,omitempty" jsonschema:"Content category for collections"`
 	Tags            []string               `json:"tags,omitempty" jsonschema:"Tags for lc:query index pages (e.g. ['AI & Machine Intelligence', 'Generative AI'])"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 	OGImage         string                 `json:"og_image,omitempty" jsonschema:"Open Graph image URL"`
 	NoIndex         bool                   `json:"noindex,omitempty" jsonschema:"Hide this page from search engines and AI (noindex; excluded from sitemap, llms.txt, feeds, IndexNow)"`
 	Hold            bool                   `json:"hold,omitempty" jsonschema:"Put the page on hold: it cannot be published (directly, in bulk, on a schedule or by merging a fork) until hold is cleared. Cannot be combined with published=true"`
@@ -59,6 +60,7 @@ type UpdateContentInput struct {
 	Category        string                 `json:"category,omitempty" jsonschema:"Content category"`
 	Tags            []string               `json:"tags,omitempty" jsonschema:"Tags for lc:query index pages"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 	OGImage         string                 `json:"og_image,omitempty" jsonschema:"Open Graph image URL"`
 	NoIndex         *bool                  `json:"noindex,omitempty" jsonschema:"true hides the page from search engines and AI; false makes it visible again"`
 	Hold            *bool                  `json:"hold,omitempty" jsonschema:"true puts the page on hold so it cannot be published; false clears the hold. Holding a published page does not unpublish it"`
@@ -90,6 +92,7 @@ type BulkCreateItem struct {
 	Category        string                 `json:"category,omitempty" jsonschema:"Content category"`
 	Tags            []string               `json:"tags,omitempty" jsonschema:"Tags"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 	OGImage         string                 `json:"og_image,omitempty" jsonschema:"Open Graph image URL"`
 	Data            map[string]interface{} `json:"data" jsonschema:"Template field values,required"`
 	Published       bool                   `json:"published,omitempty" jsonschema:"Publish immediately"`
@@ -138,6 +141,7 @@ type UpdateContentByPathInput struct {
 	Category        string                 `json:"category,omitempty" jsonschema:"Content category"`
 	Tags            []string               `json:"tags,omitempty" jsonschema:"Tags for lc:query index pages"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 	OGImage         string                 `json:"og_image,omitempty" jsonschema:"Open Graph image URL"`
 	NoIndex         *bool                  `json:"noindex,omitempty" jsonschema:"true hides the page from search engines and AI; false makes it visible again"`
 	Hold            *bool                  `json:"hold,omitempty" jsonschema:"true puts the page on hold so it cannot be published; false clears the hold. Holding a published page does not unpublish it"`
@@ -158,6 +162,7 @@ type BulkUpdateItem struct {
 	Data            map[string]interface{} `json:"data,omitempty" jsonschema:"Fields to update (merge semantics)"`
 	ClearFields     []string               `json:"clear_fields,omitempty" jsonschema:"Field names to clear to empty string"`
 	MetaDescription string                 `json:"meta_description,omitempty" jsonschema:"SEO meta description"`
+	Remark          string                 `json:"remark,omitempty" jsonschema:"Admin-only note (e.g. language variant); shown in content list, never published"`
 }
 
 type BulkUpdateContentInput struct {
@@ -375,6 +380,7 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 			Category:        args.Category,
 			Tags:            args.Tags,
 			MetaDescription: args.MetaDescription,
+			Remark:          args.Remark,
 			OGImage:         args.OGImage,
 			NoIndex:         args.NoIndex,
 			Hold:            args.Hold,
@@ -469,6 +475,9 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 		if args.MetaDescription != "" {
 			updates["meta_description"] = args.MetaDescription
 		}
+		if args.Remark != "" {
+			updates["remark"] = args.Remark
+		}
 		if args.OGImage != "" {
 			updates["og_image"] = args.OGImage
 		}
@@ -560,9 +569,13 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 
 	// Publish content
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "publish_content",
-		Title:       "Publish Content",
-		Description: "Publish a content item, making it visible on the public site. Generates the static HTML page.",
+		Name:  "publish_content",
+		Title: "Publish Content",
+		Description: `Publish a content item, making it visible on the public site. Generates the static HTML page.
+
+Returns publication_id, public_url, full_path, and content_version for the new publication.
+
+This tool publishes by content ID and always requires content.edit + content.publish. To publish a brand-new page, create it first with create_content (which requires content.create), then publish it here.`,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Publish Content",
 			ReadOnlyHint:    false,
@@ -574,10 +587,20 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 		if blocked := s.sandboxBlock("publish_content"); blocked != nil {
 			return blocked, nil, nil
 		}
-		if err := s.client.PublishContent(ctx, args.ID); err != nil {
+		res, err := s.client.PublishContentResult(ctx, args.ID)
+		if err != nil {
 			return errorResult(err), nil, nil
 		}
-		return textResult(fmt.Sprintf("Content %s published successfully", args.ID)), nil, nil
+		return jsonResult(map[string]interface{}{
+			"success":         true,
+			"id":              args.ID,
+			"publication_id":  res.PublicationID,
+			"public_url":      res.PublicURL,
+			"full_path":       res.FullPath,
+			"content_id":      res.ContentID,
+			"content_version": res.ContentVersion,
+			"message":         fmt.Sprintf("Content %s published successfully", args.ID),
+		}), nil, nil
 	})
 
 	// Unpublish content
@@ -740,7 +763,9 @@ Examples:
 
 Held pages and fork copies are never published by this tool: they come back in "skipped" as {id, reason}. publish_all_drafts ignores fork copies entirely.
 
-Returns published IDs, skipped items, and any failures.`,
+Returns published_count, the published IDs, per-item publications ({id, publication_id, public_url}), and any failed entries ({id, error}).
+
+Each item is an existing page (by ID) and always requires content.edit + content.publish. To publish brand-new pages, create them first with create_content (which requires content.create), then publish them here.`,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Publish Multiple",
 			ReadOnlyHint:    false,
@@ -756,7 +781,19 @@ Returns published IDs, skipped items, and any failures.`,
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
-		return jsonResult(result), nil, nil
+		reply := make(map[string]interface{}, len(result)+1)
+		for k, v := range result {
+			reply[k] = v
+		}
+		published, _ := result["published"].([]interface{})
+		reply["published_count"] = len(published)
+		if _, ok := reply["publications"]; !ok {
+			reply["publications"] = []map[string]string{}
+		}
+		if _, ok := reply["failed"]; !ok {
+			reply["failed"] = []map[string]string{}
+		}
+		return jsonResult(reply), nil, nil
 	})
 
 	// Preview content
@@ -851,6 +888,9 @@ Only the fields you provide are changed. Always include a version_comment descri
 		}
 		if args.MetaDescription != "" {
 			updates["meta_description"] = args.MetaDescription
+		}
+		if args.Remark != "" {
+			updates["remark"] = args.Remark
 		}
 		if args.OGImage != "" {
 			updates["og_image"] = args.OGImage

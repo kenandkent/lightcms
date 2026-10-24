@@ -119,7 +119,7 @@ func (h *Handler) executeCopilotTool(ctx context.Context, role, sessionID string
 		return string(b), action
 	}
 
-	ctx = servicesWithCopilotProvenance(ctx, sessionID)
+	ctx = servicesWithCopilotProvenance(ctx, sessionID, role == "admin")
 
 	switch name {
 	case "search_content":
@@ -329,6 +329,15 @@ func (h *Handler) executeCopilotTool(ctx context.Context, role, sessionID string
 		}
 
 	case "publish_content", "unpublish_content":
+		// Copilot deliberately requires content.edit + content.publish for
+		// BOTH verbs — stricter than REST for unpublish (which requires
+		// only publish): the assistant acts with ambient authority and the
+		// tighter gate keeps the two matrices from drifting apart again.
+		// No current role distinguishes them (publish holders also hold
+		// edit), so this is defense-in-depth, not a behavior change.
+		if !auth.HasPermission(role, auth.PermContentEdit) {
+			return deny(auth.PermContentEdit)
+		}
 		if !auth.HasPermission(role, auth.PermContentPublish) {
 			return deny(auth.PermContentPublish)
 		}
@@ -338,8 +347,19 @@ func (h *Handler) executeCopilotTool(ctx context.Context, role, sessionID string
 		}
 		verb := "Published"
 		if name == "publish_content" {
-			err = h.contentService.PublishContent(ctx, id)
+			// Task 16D: publish through PublicationService under a stable
+			// per-session/version operation key — a retried tool call
+			// replays instead of minting a duplicate Publication.
+			var version int64
+			if cur, gerr := h.contentService.GetContent(ctx, id); gerr == nil && cur != nil {
+				version = cur.CurrentVersion
+			}
+			err = h.contentService.PublishInternal(ctx, id,
+				"copilot:"+sessionID, "/cm/copilot/publish",
+				services.CopilotOpKey(sessionID, id, version))
 		} else {
+			// Unpublish is naturally idempotent; the saga delegation in
+			// UnpublishContent needs no operation key.
 			err = h.contentService.UnpublishContent(ctx, id)
 			verb = "Unpublished"
 		}
@@ -529,8 +549,11 @@ func (h *Handler) copilotCallAnthropic(ctx context.Context, msgs []anthropicMess
 }
 
 // servicesWithCopilotProvenance stamps copilot provenance on tool contexts.
-func servicesWithCopilotProvenance(ctx context.Context, sessionID string) context.Context {
-	return services.WithProvenance(ctx, services.Provenance{
+func servicesWithCopilotProvenance(ctx context.Context, sessionID string, isAdmin bool) context.Context {
+	ctx = services.WithProvenance(ctx, services.Provenance{
 		Actor: "agent", Via: "copilot", AgentSession: sessionID,
 	})
+	// R02: the publishing principal's admin flag resolves script policy
+	// admin_only for service-layer renders (fail-closed when unknown).
+	return services.WithAuthorIsAdmin(ctx, isAdmin)
 }

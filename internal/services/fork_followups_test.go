@@ -257,11 +257,11 @@ func TestDeleteContent_ForkCopyKeepsLiveStaticFile(t *testing.T) {
 		t.Errorf("fork copy not soft-deleted: %v", err)
 	}
 
-	// The live page's own delete still removes the file.
+	// Draft deletion also leaves the live file until explicit unpublish.
 	if err := svc.DeleteContent(ctx, live.ID); err != nil {
 		t.Fatalf("DeleteContent(live): %v", err)
 	}
-	if _, err := os.Stat(file); err == nil {
-		t.Error("deleting the live page left its static file behind")
+	if _, err := os.Stat(file); err != nil {
+		t.Error("draft deletion removed canonical bytes before unpublish")
 	}
 }

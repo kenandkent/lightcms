@@ -155,8 +155,13 @@ func TestLoginPage_Returns200(t *testing.T) {
 		t.Fatalf("expected text/html content-type, got %s", ct)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "Login") {
-		t.Fatal("expected 'Login' in HTML body")
+	// UI-A i18n: default language is zh, so assert language-stable markers
+	// (brand + lang switch) instead of the English word "Login".
+	if !strings.Contains(body, "LightCMS") {
+		t.Fatal("expected 'LightCMS' in HTML body")
+	}
+	if !strings.Contains(body, "/cm/lang?lang=") {
+		t.Fatal("expected lang switch links in HTML body")
 	}
 }
 
@@ -923,8 +928,8 @@ func TestAdminDashboard_Authenticated(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "Dashboard") {
-		t.Fatal("expected 'Dashboard' in response body")
+	if !strings.Contains(rr.Body.String(), "仪表盘") {
+		t.Fatal("expected dashboard title in response body")
 	}
 }
 
@@ -940,8 +945,8 @@ func TestListTemplates_Authenticated(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "Templates") {
-		t.Fatal("expected 'Templates' in response body")
+	if !strings.Contains(rr.Body.String(), "模板") {
+		t.Fatal("expected templates title in response body")
 	}
 }
 
@@ -1027,6 +1032,87 @@ func TestListContent_Authenticated(t *testing.T) {
 	rr := csrfAuthGet(t, h, "/cm/content", "/cm/content", h.ListContent)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+}
+
+// TestListContent_NoPathColumn pins the content-list layout: the path column
+// was removed, so seeded paths must not render as table cells (titles still do).
+func TestListContent_NoPathColumn(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	tmplID := seedTemplate(t, h.db, "Page", "page")
+	seedContent(t, h.db, tmplID, "No Path Cell", "no-path-cell", "/no-path-cell-probe")
+
+	rr := csrfAuthGet(t, h, "/cm/content", "/cm/content", h.ListContent)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "No Path Cell") {
+		t.Fatalf("list should render the seeded title")
+	}
+	if strings.Contains(body, "<code>/no-path-cell-probe</code>") {
+		t.Fatalf("list must not render the path column cell")
+	}
+}
+
+// TestListContent_RemarkColumn pins the remark column: seeded remarks render
+// in the list (used to tell same-template language variants apart).
+func TestListContent_RemarkColumn(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	tmplID := seedTemplate(t, h.db, "Page", "page")
+	cid := seedContent(t, h.db, tmplID, "Remark Probe", "remark-probe", "/remark-probe")
+	ctx := context.Background()
+	if err := h.db.UpdateOne(ctx, "content", bson.M{"_id": cid},
+		bson.M{"$set": bson.M{"remark": "英文版"}}); err != nil {
+		t.Fatalf("seed remark: %v", err)
+	}
+
+	rr := csrfAuthGet(t, h, "/cm/content", "/cm/content", h.ListContent)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "英文版") {
+		t.Fatalf("list should render the content remark")
+	}
+	if !strings.Contains(body, `title="英文版"`) {
+		t.Fatalf("remark cell should carry the full text as hover tooltip")
+	}
+	if !strings.Contains(body, "text-overflow: ellipsis") {
+		t.Fatalf("list should truncate long title/remark cells with ellipsis")
+	}
+}
+
+// TestUpdateContent_RemarkPersisted proves the edit form remark field round-trips.
+func TestUpdateContent_RemarkPersisted(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	tmplID := seedTemplate(t, h.db, "Page", "page")
+	contentID := seedContent(t, h.db, tmplID, "Old Title", "old-title", "/old-title")
+
+	form := url.Values{}
+	form.Set("title", "Updated Title")
+	form.Set("slug", "updated-title")
+	form.Set("remark", "中文版")
+
+	rr := csrfAuthPost(t, h, "/cm/content/{id}", "/cm/content/"+contentID.Hex(),
+		h.EditContent, h.UpdateContent, form)
+	if rr.Code != http.StatusSeeOther && rr.Code != http.StatusOK && rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 303/200/403, got %d", rr.Code)
+	}
+
+	var got models.Content
+	if err := h.db.FindOne(context.Background(), "content",
+		bson.M{"_id": contentID}, &got); err != nil {
+		t.Fatalf("read back content: %v", err)
+	}
+	if got.Remark != "中文版" {
+		t.Fatalf("remark = %q, want %q", got.Remark, "中文版")
 	}
 }
 

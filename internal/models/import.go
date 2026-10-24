@@ -46,20 +46,32 @@ const (
 
 // ImportJob represents one execution of an import
 type ImportJob struct {
-	ID         primitive.ObjectID  `bson:"_id,omitempty" json:"id,omitempty"`
-	SourceID   *primitive.ObjectID `bson:"source_id,omitempty" json:"source_id,omitempty"` // nil for manual uploads
-	SourceName string              `bson:"source_name,omitempty" json:"source_name,omitempty"`
-	Type       ImportType          `bson:"type" json:"type"`
-	Status     ImportStatus        `bson:"status" json:"status"`
-	TotalPages int                 `bson:"total_pages" json:"total_pages"`
-	Created    int                 `bson:"created" json:"created"`
-	Updated    int                 `bson:"updated" json:"updated"`
-	Failed     int                 `bson:"failed" json:"failed"`
-	Skipped    int                 `bson:"skipped" json:"skipped"`
-	ErrorMsg   string              `bson:"error_msg,omitempty" json:"error_msg,omitempty"`
-	StartedAt  time.Time           `bson:"started_at" json:"started_at"`
-	FinishedAt *time.Time          `bson:"finished_at,omitempty" json:"finished_at,omitempty"`
-	CreatedBy  string              `bson:"created_by,omitempty" json:"created_by,omitempty"` // email or "scheduler"
+	Authority       *ImportAuthority    `bson:"authority,omitempty" json:"-"`
+	RequiresPublish bool                `bson:"requires_publish,omitempty" json:"requires_publish,omitempty"`
+	WorkflowID      *primitive.ObjectID `bson:"workflow_id,omitempty" json:"workflow_id,omitempty"`
+	ID              primitive.ObjectID  `bson:"_id,omitempty" json:"id,omitempty"`
+	SourceID        *primitive.ObjectID `bson:"source_id,omitempty" json:"source_id,omitempty"` // nil for manual uploads
+	SourceName      string              `bson:"source_name,omitempty" json:"source_name,omitempty"`
+	Type            ImportType          `bson:"type" json:"type"`
+	Status          ImportStatus        `bson:"status" json:"status"`
+	TotalPages      int                 `bson:"total_pages" json:"total_pages"`
+	Created         int                 `bson:"created" json:"created"`
+	Updated         int                 `bson:"updated" json:"updated"`
+	Failed          int                 `bson:"failed" json:"failed"`
+	Skipped         int                 `bson:"skipped" json:"skipped"`
+	ErrorMsg        string              `bson:"error_msg,omitempty" json:"error_msg,omitempty"`
+	StartedAt       time.Time           `bson:"started_at" json:"started_at"`
+	FinishedAt      *time.Time          `bson:"finished_at,omitempty" json:"finished_at,omitempty"`
+	CreatedBy       string              `bson:"created_by,omitempty" json:"created_by,omitempty"` // email or "scheduler"
+}
+
+// ImportAuthority freezes identity and permission ceilings, never tokens.
+type ImportAuthority struct {
+	UserID      string   `bson:"user_id"`
+	Owner       string   `bson:"owner"`
+	Role        string   `bson:"role"`
+	Scopes      []string `bson:"scopes"`
+	SandboxOnly bool     `bson:"sandbox_only"`
 }
 
 // ImportLogLevel is the severity of a log line

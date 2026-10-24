@@ -10,8 +10,12 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o lightcms ./cmd/server
+# Build the binary.
+# Task 16E: stamp the git SHA into Publication records via ldflags
+# (main.ProductBuildSHA; code defaults to the build version string when
+# unset). Pass --build-arg GIT_SHA=$(git rev-parse --short HEAD) at release.
+ARG GIT_SHA=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.ProductBuildSHA=$GIT_SHA" -o lightcms ./cmd/server
 
 # Runtime stage (Debian for Cloudflare WARP support)
 FROM debian:bookworm-slim

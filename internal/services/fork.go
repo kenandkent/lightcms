@@ -3,22 +3,29 @@ package services
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/metavert-io/lightcms/v7/internal/database"
 	"github.com/metavert-io/lightcms/v7/internal/models"
+	"github.com/metavert-io/lightcms/v7/internal/product/jobs"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // ForkService manages content forks — isolated workspaces for staging site changes.
 type ForkService struct {
+	durable        *jobs.Runner
+	authorizeMerge func(context.Context, jobs.Job) error
 	db             *database.DB
 	contentService *ContentService
 }
@@ -29,29 +36,40 @@ func NewForkService(db *database.DB, cs *ContentService) *ForkService {
 }
 
 // MergeResult summarises what happened when a fork was merged into live.
+// Task 16B (spec §12.6): draft merge only — never publishes. Published merges
+// land in RequiresPublish; canonical HTML is untouched until explicit Publish.
 type MergeResult struct {
-	Updated    int
-	Created    int
-	CreatedIDs []primitive.ObjectID // live pages created by the merge
-	UpdatedIDs []primitive.ObjectID // live pages updated by the merge
-	Conflicts  []ForkConflict
-	// NotPublished lists created pages that publishNew left as drafts
-	// (held pages, or pages whose publish failed).
-	NotPublished []MergeNotPublished
+	CreatedVersions map[string]int64
+	CreatedIDs      []primitive.ObjectID
+	UpdatedIDs      []primitive.ObjectID
+	NotPublished    []MergeNotPublished
+	Updated         int
+	Created         int
+	Conflicts       []ForkConflict
+	ContentIDs      []string
+	RequiresPublish []string
+	Failed          []MergeFailure
 }
 
-// MergeNotPublished records a page created by a merge that stayed a draft
-// even though the merge was asked to publish new pages.
 type MergeNotPublished struct {
 	ID     primitive.ObjectID
 	Path   string
 	Reason string
 }
 
-// ForkCopyRef identifies one page copy belonging to a fork.
 type ForkCopyRef struct {
 	ID       primitive.ObjectID `bson:"_id" json:"id"`
 	FullPath string             `bson:"full_path" json:"full_path"`
+}
+
+// MergeConflict is the spec §12.6 conflict detail alias (fork-wins, reported).
+type MergeConflict = ForkConflict
+
+// MergeFailure records a per-page merge failure; other pages still commit
+// (spec §12.6 per-page partial results).
+type MergeFailure struct {
+	FullPath string `json:"full_path"`
+	Error    string `json:"error"`
 }
 
 // ForkConflict records a page that was modified on the live site after the fork was made.
@@ -71,7 +89,11 @@ func generatePreviewToken() (string, error) {
 }
 
 // Create creates a new fork workspace.
-func (s *ForkService) Create(ctx context.Context, name, description string, userID primitive.ObjectID, userEmail string) (*models.ContentFork, error) {
+func (s *ForkService) Create(ctx context.Context, name, description string, userID primitive.ObjectID, userEmail string, sessions ...string) (*models.ContentFork, error) {
+	session := ""
+	if len(sessions) > 0 {
+		session = sessions[0]
+	}
 	token, err := generatePreviewToken()
 	if err != nil {
 		return nil, fmt.Errorf("generate preview token: %w", err)
@@ -85,12 +107,37 @@ func (s *ForkService) Create(ctx context.Context, name, description string, user
 		PreviewToken:   token,
 		CreatedBy:      userID,
 		CreatedByEmail: userEmail,
+		AgentSession:   session,
 		CreatedAt:      now,
 	}
 	if _, err := s.db.InsertOne(ctx, "content_forks", fork); err != nil {
 		return nil, fmt.Errorf("insert fork: %w", err)
 	}
 	return fork, nil
+}
+
+// FindActiveSandboxFork resolves the caller's active agent-sandbox fork by
+// (owner, session) — the R09 server-side binding for V3 mode=sandbox. Only a
+// fork that is still active AND created by this user in this session
+// resolves; merged/archived forks, other users' forks, and empty sessions
+// never do. Callers must fail closed when this errors.
+func FindActiveSandboxFork(ctx context.Context, db *database.DB, userIDHex, session string) (*primitive.ObjectID, error) {
+	if strings.TrimSpace(session) == "" {
+		return nil, fmt.Errorf("agent session is required for sandbox resolution")
+	}
+	uid, err := primitive.ObjectIDFromHex(strings.TrimSpace(userIDHex))
+	if err != nil {
+		return nil, fmt.Errorf("invalid user ID for sandbox resolution: %w", err)
+	}
+	var fork models.ContentFork
+	err = db.FindOne(ctx, "content_forks", bson.M{
+		"created_by": uid, "agent_session": session, "status": "active",
+	}, &fork, options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}}))
+	if err != nil {
+		return nil, fmt.Errorf("no active sandbox fork for this session: %w", err)
+	}
+	id := fork.ID
+	return &id, nil
 }
 
 // GetByID returns a fork by its ObjectID.
@@ -211,161 +258,354 @@ func (s *ForkService) RemovePage(ctx context.Context, forkID primitive.ObjectID,
 	return nil
 }
 
-// Merge merges all fork pages into live content, marks the fork as merged
-// (recording the created/updated counts on it) and deletes the fork's page
-// copies. Returns a MergeResult summarising what was created, updated, and
-// any conflicts.
-//
-// New pages are created with the fork copy's published flag. With publishNew,
-// new pages that would be drafts are then published through the normal
-// publish path. Held pages always stay drafts.
-func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, mergedByID primitive.ObjectID, mergedByEmail string, publishNew bool) (*MergeResult, error) {
-	fork, err := s.GetByID(ctx, forkID)
-	if err != nil {
-		return nil, fmt.Errorf("fork not found: %w", err)
+// Merge merges all fork pages into live content and marks the fork as merged.
+// Returns a MergeResult summarising what was created, updated, and any conflicts.
+// Task 16B (spec §12.3, §12.6, §16.6): draft merge only — merges data and
+// creates ContentVersions via the draft-only ContentService, preserves the
+// active Publication and canonical bytes, and returns requires_publish.
+// It never calls GenerateStaticPage, never deletes canonical files, and never
+// publishes. Each page commits independently (partial results on failure).
+func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, mergedByID primitive.ObjectID, mergedByEmail string, publishNew ...bool) (*MergeResult, error) {
+	requestedPublish := len(publishNew) > 0 && publishNew[0]
+	if s.durable != nil {
+		return s.mergeDurablyAndWait(ctx, forkID, mergedByID, mergedByEmail, requestedPublish)
 	}
-	if fork.Status != "active" {
-		return nil, fmt.Errorf("fork is %s, cannot merge", fork.Status)
+	result, err := s.mergeDraft(ctx, forkID, mergedByID, mergedByEmail)
+	if err != nil || result == nil {
+		return result, err
 	}
-
-	pages, err := s.ListPages(ctx, forkID)
-	if err != nil {
-		return nil, fmt.Errorf("list fork pages: %w", err)
-	}
-
-	result := &MergeResult{}
-
-	for _, forkPage := range pages {
-		// Look for existing live page with the same full_path
-		var livePage models.Content
-		liveErr := s.db.FindOne(ctx, "content", bson.M{
-			"full_path": forkPage.FullPath,
-			"fork_id":   nil,
-			"deleted":   bson.M{"$ne": true},
-		}, &livePage)
-
-		now := time.Now()
-
-		if liveErr != nil {
-			// No live page — create new
-			newPage := forkPage
-			newPage.ID = primitive.NewObjectID()
-			newPage.ForkID = nil
-			newPage.BaseUpdatedAt = nil
-			newPage.CreatedAt = now
-			newPage.UpdatedAt = now
-			if newPage.Hold {
-				// A held page never goes live through a merge.
-				newPage.Published = false
-				newPage.PublishedAt = nil
+	if requestedPublish {
+		for _, id := range result.CreatedIDs {
+			var page models.Content
+			if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &page); err != nil {
+				return result, err
 			}
-			if _, err := s.db.InsertOne(ctx, "content", &newPage); err != nil {
-				return nil, fmt.Errorf("create live page %s: %w", forkPage.FullPath, err)
+			if reason := s.publishMerged(ctx, &page, result.CreatedVersions[id.Hex()]); reason != "" {
+				result.NotPublished = append(result.NotPublished, MergeNotPublished{ID: id, Path: page.FullPath, Reason: reason})
 			}
-			// Regenerate static file if published
-			if newPage.Published && s.contentService != nil {
-				_ = s.contentService.GenerateStaticPage(ctx, &newPage)
-			}
-			if publishNew && !newPage.Published {
-				if reason := s.publishMerged(ctx, &newPage); reason != "" {
-					result.NotPublished = append(result.NotPublished, MergeNotPublished{
-						ID: newPage.ID, Path: newPage.FullPath, Reason: reason,
-					})
-				}
-			}
-			result.Created++
-			result.CreatedIDs = append(result.CreatedIDs, newPage.ID)
-		} else {
-			// Live page exists — check for conflict
-			if forkPage.BaseUpdatedAt != nil && livePage.UpdatedAt.After(*forkPage.BaseUpdatedAt) {
-				result.Conflicts = append(result.Conflicts, ForkConflict{
-					ForkItem:  forkPage,
-					LiveTitle: livePage.Title,
-					LivePath:  livePage.FullPath,
-				})
-				// Still merge (fork wins), just record the conflict
-			}
-
-			// Update live page fields from fork
-			update := bson.M{"$set": bson.M{
-				"title":            forkPage.Title,
-				"slug":             forkPage.Slug,
-				"folder_id":        forkPage.FolderID,
-				"folder_path":      forkPage.FolderPath,
-				"full_path":        forkPage.FullPath,
-				"category":         forkPage.Category,
-				"tags":             forkPage.Tags,
-				"meta_description": forkPage.MetaDescription,
-				"og_image":         forkPage.OGImage,
-				"data":             forkPage.Data,
-				"use_header":       forkPage.UseHeader,
-				"use_footer":       forkPage.UseFooter,
-				"use_theme":        forkPage.UseTheme,
-				"raw_mode":         forkPage.RawMode,
-				"noindex":          forkPage.NoIndex,
-				"author_name":      forkPage.AuthorName,
-				"author_url":       forkPage.AuthorURL,
-				"template_id":      forkPage.TemplateID,
-				"template_name":    forkPage.TemplateName,
-				"updated_at":       now,
-			}}
-			if err := s.db.UpdateOne(ctx, "content", bson.M{"_id": livePage.ID}, update); err != nil {
-				return nil, fmt.Errorf("update live page %s: %w", forkPage.FullPath, err)
-			}
-			// Regenerate static file if published
-			if livePage.Published && s.contentService != nil {
-				livePage.Title = forkPage.Title
-				livePage.Data = forkPage.Data
-				livePage.UseHeader = forkPage.UseHeader
-				livePage.UseFooter = forkPage.UseFooter
-				livePage.UseTheme = forkPage.UseTheme
-				livePage.TemplateID = forkPage.TemplateID
-				livePage.TemplateName = forkPage.TemplateName
-				_ = s.contentService.GenerateStaticPage(ctx, &livePage)
-			}
-			result.Updated++
-			result.UpdatedIDs = append(result.UpdatedIDs, livePage.ID)
 		}
 	}
-
-	// Mark fork as merged, keeping the page counts as its history.
-	now := time.Now()
-	if err := s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID}, bson.M{"$set": bson.M{
-		"status":          "merged",
-		"merged_at":       now,
-		"merged_by":       mergedByID,
-		"merged_by_email": mergedByEmail,
-		"merged_created":  result.Created,
-		"merged_updated":  result.Updated,
-	}}); err != nil {
-		return nil, fmt.Errorf("mark fork merged: %w", err)
+	if len(result.Failed) == 0 {
+		if err := s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID}, bson.M{"$set": bson.M{"merged_created": result.Created, "merged_updated": result.Updated}}); err != nil {
+			return result, err
+		}
+		if err := s.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
+			left, err := s.cleanupMergedCopies(sc, forkID, true)
+			if err != nil {
+				return err
+			}
+			if left {
+				result.Failed = append(result.Failed, MergeFailure{Error: "new fork edits were preserved; review before merging again"})
+				return s.db.UpdateOne(sc, "content_forks", bson.M{"_id": forkID}, bson.M{"$set": bson.M{"status": "partially_merged"}})
+			}
+			return nil
+		}); err != nil {
+			return result, err
+		}
 	}
-
-	// The copies have served their purpose: left behind they would only be
-	// stale duplicates of live pages. A failure here does not undo the merge —
-	// PurgeCopies removes whatever remains.
-	if _, err := s.db.Collection("content").DeleteMany(ctx, bson.M{"fork_id": forkID}); err != nil {
-		fmt.Printf("Warning: failed to delete page copies of merged fork %s: %v\n", forkID.Hex(), err)
-	}
-
 	return result, nil
+}
+
+// Only copies identical to the committed draft checkpoints may be removed.
+// New pages and edits after submission remain available for review.
+func (s *ForkService) cleanupMergedCopies(ctx context.Context, forkID primitive.ObjectID, remove bool) (bool, error) {
+	var state struct {
+		Items map[string]forkMergeCheckpoint `bson:"merge_items"`
+	}
+	if err := s.db.FindOne(ctx, "content_forks", bson.M{"_id": forkID}, &state); err != nil {
+		return false, err
+	}
+	cur, err := s.db.Collection("content").Find(ctx, bson.M{"fork_id": forkID})
+	if err != nil {
+		return false, err
+	}
+	defer cur.Close(ctx)
+	var copies []models.Content
+	if err := cur.All(ctx, &copies); err != nil {
+		return false, err
+	}
+	left := false
+	for _, copy := range copies {
+		done, ok := state.Items[copy.ID.Hex()]
+		if !ok || done.Version != copy.CurrentVersion || !done.UpdatedAt.Equal(copy.UpdatedAt) || done.SourceHash == "" || done.SourceHash != forkSourceHash(copy) {
+			left = true
+			continue
+		}
+		if remove {
+			filter := bson.M{"_id": copy.ID, "fork_id": forkID, "updated_at": copy.UpdatedAt}
+			if copy.CurrentVersion == 0 {
+				filter["current_version"] = bson.M{"$in": bson.A{0, nil}}
+			} else {
+				filter["current_version"] = copy.CurrentVersion
+			}
+			res, err := s.db.Collection("content").DeleteOne(ctx, filter)
+			if err != nil {
+				return false, err
+			}
+			if res.DeletedCount != 1 {
+				left = true
+			}
+		}
+	}
+	return left, nil
+}
+
+func (s *ForkService) mergeDraft(ctx context.Context, forkID primitive.ObjectID, mergedByID primitive.ObjectID, mergedByEmail string) (*MergeResult, error) {
+	if s.durable != nil {
+		return s.mergeDurablyAndWait(ctx, forkID, mergedByID, mergedByEmail)
+	}
+	fork, err := s.GetByID(ctx, forkID)
+	if err != nil {
+		return nil, err
+	}
+	if fork.Status != "active" && fork.Status != "partially_merged" {
+		return nil, fmt.Errorf("fork is %s, cannot merge", fork.Status)
+	}
+	pages, err := s.ListPages(ctx, forkID)
+	if err != nil {
+		return nil, err
+	}
+	result := &MergeResult{}
+	for _, page := range pages {
+		item, err := s.mergePageAtomic(ctx, forkID, page)
+		if err != nil {
+			result.Failed = append(result.Failed, MergeFailure{FullPath: page.FullPath, Error: err.Error()})
+			continue
+		}
+		result.Created += item.Created
+		result.Updated += item.Updated
+		result.CreatedIDs = append(result.CreatedIDs, item.CreatedIDs...)
+		if result.CreatedVersions == nil {
+			result.CreatedVersions = map[string]int64{}
+		}
+		for id, version := range item.CreatedVersions {
+			result.CreatedVersions[id] = version
+		}
+		result.UpdatedIDs = append(result.UpdatedIDs, item.UpdatedIDs...)
+		result.ContentIDs = append(result.ContentIDs, item.ContentIDs...)
+		result.RequiresPublish = append(result.RequiresPublish, item.RequiresPublish...)
+		result.Conflicts = append(result.Conflicts, item.Conflicts...)
+	}
+	status := "merged"
+	set := bson.M{"status": status, "merged_at": time.Now(), "merged_by": mergedByID, "merged_by_email": mergedByEmail}
+	if len(result.Failed) > 0 {
+		set = bson.M{"status": "partially_merged"}
+	}
+	_, err = s.db.UpdateOneMatched(ctx, "content_forks", bson.M{"_id": forkID, "status": bson.M{"$in": bson.A{"active", "partially_merged"}}}, bson.M{"$set": set})
+	if err != nil {
+		return result, fmt.Errorf("persist merge outcome: %w", err)
+	}
+	return result, nil
+}
+
+type forkMergeCheckpoint struct {
+	Version    int64        `bson:"version"`
+	UpdatedAt  time.Time    `bson:"updated_at"`
+	ContentIDs []string     `bson:"content_ids"`
+	Result     *MergeResult `bson:"result,omitempty"`
+	SourceHash string       `bson:"source_hash,omitempty"`
+}
+
+func forkSourceHash(page models.Content) string {
+	page.RequiresPublish = false
+	page.ActivePublicationID = nil
+	raw, _ := json.Marshal(page)
+	return fmt.Sprintf("%x", sha256.Sum256(raw))
+}
+
+// A page mutation and its checkpoint commit together. Competing merge calls
+// serialize on the fork row, and a retry cannot apply an already committed page.
+func (s *ForkService) mergePageAtomic(ctx context.Context, forkID primitive.ObjectID, page models.Content) (*MergeResult, error) {
+	var result *MergeResult
+	err := s.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
+		ctx := context.Context(sc)
+		result = &MergeResult{}
+		var state struct {
+			Status string                         `bson:"status"`
+			Items  map[string]forkMergeCheckpoint `bson:"merge_items"`
+		}
+		if err := s.db.FindOne(ctx, "content_forks", bson.M{"_id": forkID}, &state); err != nil {
+			return err
+		}
+		if done, ok := state.Items[page.ID.Hex()]; ok {
+			if done.Version != page.CurrentVersion || !done.UpdatedAt.Equal(page.UpdatedAt) {
+				return fmt.Errorf("fork page changed after it was merged; create a new fork for the new edit")
+			}
+			if done.Result != nil {
+				result = done.Result
+				return nil
+			}
+			result.ContentIDs = done.ContentIDs
+			result.RequiresPublish = done.ContentIDs
+			return nil
+		}
+		if state.Status != "active" && state.Status != "partially_merged" {
+			return fmt.Errorf("fork is no longer mergeable")
+		}
+		if err := s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID}, bson.M{"$inc": bson.M{"merge_generation": 1}}); err != nil {
+			return err
+		}
+		for _, forkPage := range []models.Content{page} {
+			// Look for existing live page with the same full_path
+			var livePage models.Content
+			liveErr := s.db.FindOne(ctx, "content", bson.M{
+				"full_path": forkPage.FullPath,
+				"fork_id":   bson.M{"$exists": false},
+				"deleted":   bson.M{"$ne": true},
+			}, &livePage)
+
+			if liveErr != nil && liveErr != mongo.ErrNoDocuments {
+				return liveErr
+			}
+			if liveErr != nil {
+				// No live page — create new unpublished draft via the
+				// draft-only service (versioned, no live file write).
+				newPage := forkPage
+				newPage.ID = primitive.ObjectID{}
+				newPage.ForkID = nil
+				newPage.BaseUpdatedAt = nil
+				newPage.Published = false
+				newPage.PublishedAt = nil
+				if s.contentService != nil {
+					if err := s.contentService.CreateContent(ctx, &newPage, "fork merge"); err != nil {
+						result.Failed = append(result.Failed, MergeFailure{FullPath: forkPage.FullPath, Error: err.Error()})
+						continue
+					}
+				} else {
+					newPage.ID = primitive.NewObjectID()
+					now := time.Now()
+					newPage.CreatedAt = now
+					newPage.UpdatedAt = now
+					if _, err := s.db.InsertOne(ctx, "content", &newPage); err != nil {
+						result.Failed = append(result.Failed, MergeFailure{FullPath: forkPage.FullPath, Error: err.Error()})
+						continue
+					}
+				}
+				// Task 16B: no GenerateStaticPage — draft only.
+				result.Created++
+				result.CreatedIDs = append(result.CreatedIDs, newPage.ID)
+				if result.CreatedVersions == nil {
+					result.CreatedVersions = map[string]int64{}
+				}
+				result.CreatedVersions[newPage.ID.Hex()] = newPage.CurrentVersion
+				result.ContentIDs = append(result.ContentIDs, newPage.ID.Hex())
+				result.RequiresPublish = append(result.RequiresPublish, newPage.ID.Hex())
+			} else {
+				// Live page exists — check for conflict (fork wins, recorded).
+				if forkPage.BaseUpdatedAt != nil && livePage.UpdatedAt.After(*forkPage.BaseUpdatedAt) {
+					result.Conflicts = append(result.Conflicts, ForkConflict{
+						ForkItem:  forkPage,
+						LiveTitle: livePage.Title,
+						LivePath:  livePage.FullPath,
+					})
+					// Still merge (fork wins), just record the conflict
+				}
+
+				// Draft merge through the versioned service: preserves the
+				// active Publication + canonical bytes, marks
+				// has_unpublished_changes. Never via raw UpdateOne + generate.
+				merged := livePage
+				merged.Title = forkPage.Title
+				merged.Slug = forkPage.Slug
+				merged.FolderID = forkPage.FolderID
+				merged.FolderPath = forkPage.FolderPath
+				merged.FullPath = forkPage.FullPath
+				merged.Category = forkPage.Category
+				merged.Tags = forkPage.Tags
+				merged.MetaDescription = forkPage.MetaDescription
+				merged.OGImage = forkPage.OGImage
+				merged.Data = forkPage.Data
+				merged.UseHeader = forkPage.UseHeader
+				merged.UseFooter = forkPage.UseFooter
+				merged.UseTheme = forkPage.UseTheme
+				merged.RawMode = forkPage.RawMode
+				merged.NoIndex = forkPage.NoIndex
+				merged.Hold = forkPage.Hold
+				merged.AuthorName = forkPage.AuthorName
+				merged.AuthorURL = forkPage.AuthorURL
+				merged.TemplateID = forkPage.TemplateID
+				merged.TemplateName = forkPage.TemplateName
+				if s.contentService != nil {
+					if err := s.contentService.UpdateContent(ctx, &merged, "fork merge"); err != nil {
+						result.Failed = append(result.Failed, MergeFailure{FullPath: forkPage.FullPath, Error: err.Error()})
+						continue
+					}
+				} else {
+					now := time.Now()
+					update := bson.M{"$set": bson.M{
+						"title":            forkPage.Title,
+						"slug":             forkPage.Slug,
+						"folder_id":        forkPage.FolderID,
+						"folder_path":      forkPage.FolderPath,
+						"full_path":        forkPage.FullPath,
+						"category":         forkPage.Category,
+						"tags":             forkPage.Tags,
+						"meta_description": forkPage.MetaDescription,
+						"og_image":         forkPage.OGImage,
+						"data":             forkPage.Data,
+						"use_header":       forkPage.UseHeader,
+						"use_footer":       forkPage.UseFooter,
+						"use_theme":        forkPage.UseTheme,
+						"raw_mode":         forkPage.RawMode,
+						"template_id":      forkPage.TemplateID,
+						"template_name":    forkPage.TemplateName,
+						"updated_at":       now,
+					}}
+					if err := s.db.UpdateOne(ctx, "content", bson.M{"_id": livePage.ID}, update); err != nil {
+						result.Failed = append(result.Failed, MergeFailure{FullPath: forkPage.FullPath, Error: err.Error()})
+						continue
+					}
+				}
+				// Task 16B: no GenerateStaticPage — live bytes unchanged.
+				result.Updated++
+				result.UpdatedIDs = append(result.UpdatedIDs, livePage.ID)
+				result.ContentIDs = append(result.ContentIDs, livePage.ID.Hex())
+				result.RequiresPublish = append(result.RequiresPublish, livePage.ID.Hex())
+			}
+		}
+
+		if len(result.Failed) > 0 {
+			return fmt.Errorf("%s", result.Failed[0].Error)
+		}
+		return s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID}, bson.M{"$set": bson.M{"merge_items." + page.ID.Hex(): forkMergeCheckpoint{Version: page.CurrentVersion, UpdatedAt: page.UpdatedAt, ContentIDs: result.ContentIDs, Result: result, SourceHash: forkSourceHash(page)}}})
+	})
+	return result, err
 }
 
 // publishMerged publishes a page that a merge just created, through the
 // normal publish path so versioning, static generation, embeddings, IndexNow
 // and webhooks behave as for any other publish. It returns "" on success, or
 // the reason the page stayed a draft.
-func (s *ForkService) publishMerged(ctx context.Context, page *models.Content) string {
-	if page.Hold {
-		return "on hold"
+func (s *ForkService) publishMerged(ctx context.Context, page *models.Content, versions ...int64) string {
+	version := page.CurrentVersion
+	if len(versions) > 0 {
+		version = versions[0]
 	}
-	if s.contentService == nil {
-		return "no content service"
-	}
-	if err := s.contentService.PublishContent(ctx, page.ID); err != nil {
+	if err := s.publishMergedVersion(ctx, page, version); err != nil {
+		if errors.Is(err, ErrContentHeld) {
+			return "on hold"
+		}
 		return err.Error()
 	}
 	return ""
+}
+
+var errNoMergePublisher = errors.New("no content service")
+
+func (s *ForkService) publishMergedVersion(ctx context.Context, page *models.Content, version int64) error {
+	if s.contentService == nil {
+		return errNoMergePublisher
+	}
+	if internalIdem == nil {
+		if page.Hold {
+			return ErrContentHeld
+		}
+		if page.CurrentVersion != version {
+			return ErrVersionConflict
+		}
+		return s.contentService.PublishContent(ctx, page.ID)
+	}
+	return s.contentService.publishInternalVersion(ctx, page.ID, version, "fork-merge", "/internal/forks/publish", fmt.Sprintf("fork/%s/v%d", page.ID.Hex(), version))
 }
 
 // Archive marks a fork as archived without merging.

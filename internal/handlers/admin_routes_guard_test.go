@@ -152,16 +152,38 @@ func TestAdminRoutes_EveryWriteRouteIsGuarded(t *testing.T) {
 // or tightening a route there fails here until the change is made on purpose.
 // "*" marks the session/public routes (every signed-in role).
 var adminRoleMatrix = map[string]string{
-	"GET /cm/login":              "*",
-	"POST /cm/login":             "*",
-	"POST /cm/logout":            "*",
-	"GET /cm/change-password":    "*",
-	"POST /cm/change-password":   "*",
-	"GET /cm":                    "*",
-	"GET /cm/":                   "*",
-	"GET /cm/security":           "*",
-	"POST /cm/security":          "*",
-	"GET /cm/forks/exit-preview": "*",
+	"GET /cm/lang":                                     "*",
+	"GET /cm/static-delivery":                          "---a",
+	"GET /cm/static-delivery/publish":                  "vcea",
+	"GET /cm/static-delivery/maintenance":              "---a",
+	"GET /cm/tasks":                                    "---a",
+	"GET /cm/operations":                               "---a",
+	"GET /cm/dependencies":                             "---a",
+	"GET /cm/artifacts":                                "---a",
+	"POST /cm/artifacts":                               "---a",
+	"POST /cm/static-delivery/{kind:accounts|targets}": "---a",
+	"POST /cm/static-delivery/{kind:accounts|targets}/{id}/{action}": "---a",
+	"POST /cm/content/{id}/publish":                                  "--ea",
+	"GET /cm/content/{id}/publications":                              "vcea",
+	"POST /cm/content/{id}/versions/{version}/restore_and_publish":   "--ea",
+	"POST /cm/content/{id}/publications/{publicationID}/revert_live": "--ea",
+	"GET /cm/templates/{id}/upgrade-preview":                         "---a",
+	"POST /cm/templates/{id}/upgrade-start":                          "---a",
+	"POST /cm/upgrade-jobs/{jobID}/run":                              "---a",
+	"POST /cm/upload":                                                "-cea",
+	"POST /cm/content/{id}/lock/refresh":                             "--ea",
+	"POST /cm/content/{id}/lock/force":                               "---a",
+	"POST /cm/api-keys/{id}/reveal":                                  "-cea",
+	"GET /cm/login":                                                  "*",
+	"POST /cm/login":                                                 "*",
+	"POST /cm/logout":                                                "*",
+	"GET /cm/change-password":                                        "*",
+	"POST /cm/change-password":                                       "*",
+	"GET /cm":                                                        "*",
+	"GET /cm/":                                                       "*",
+	"GET /cm/security":                                               "*",
+	"POST /cm/security":                                              "*",
+	"GET /cm/forks/exit-preview":                                     "*",
 
 	// Templates and snippets: everyone reads, only admin writes
 	"GET /cm/templates":              "vcea",
@@ -355,7 +377,7 @@ func TestAdminRoutes_RoleMatrix(t *testing.T) {
 		if (want == "*") != (rt.Session != "" || rt.Public != "") {
 			t.Errorf("%s: matrix says %q but the route is declared with Perms=%v Session=%q Public=%q", key, want, rt.Perms, rt.Session, rt.Public)
 		}
-		target := "/cm" + routeVarRe.ReplaceAllString(rt.Path, "000000000000000000000001")
+		target := "/cm" + routeVarRe.ReplaceAllString(strings.ReplaceAll(rt.Path, "{kind:accounts|targets}", "accounts"), "000000000000000000000001")
 
 		for i, role := range roles {
 			allowed := want == "*" || want[i] != '-'

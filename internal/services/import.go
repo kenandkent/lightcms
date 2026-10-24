@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,17 +12,21 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/metavert-io/lightcms/v7/internal/database"
 	"github.com/metavert-io/lightcms/v7/internal/models"
+	"github.com/metavert-io/lightcms/v7/internal/product/jobs"
 	"github.com/metavert-io/lightcms/v7/internal/services/importer"
 )
 
 // ImportService manages import sources, jobs, and streaming log delivery.
 type ImportService struct {
-	db             *database.DB
-	contentService *ContentService
+	durable         *jobs.Runner
+	authorizeImport func(context.Context, jobs.Job) error
+	db              *database.DB
+	contentService  *ContentService
 
 	// SSE subscribers: jobID -> list of channels
 	mu          sync.RWMutex
@@ -112,6 +117,11 @@ func (s *ImportService) ListJobs(ctx context.Context, limit int) ([]models.Impor
 	if err := cursor.All(ctx, &jobs); err != nil {
 		return nil, fmt.Errorf("decode import jobs: %w", err)
 	}
+	for i := range jobs {
+		if err := s.hydrateImportState(ctx, &jobs[i]); err != nil {
+			return nil, err
+		}
+	}
 	return jobs, nil
 }
 
@@ -120,6 +130,9 @@ func (s *ImportService) GetJob(ctx context.Context, id primitive.ObjectID) (*mod
 	var job models.ImportJob
 	if err := s.db.FindOne(ctx, "import_jobs", bson.M{"_id": id}, &job); err != nil {
 		return nil, fmt.Errorf("import job not found: %w", err)
+	}
+	if err := s.hydrateImportState(ctx, &job); err != nil {
+		return nil, err
 	}
 	return &job, nil
 }
@@ -186,6 +199,15 @@ func (s *ImportService) publish(jobID string, line string) {
 
 // writeLog inserts a log line into import_logs and broadcasts to SSE subscribers.
 func (s *ImportService) writeLog(ctx context.Context, jobID primitive.ObjectID, seq int, level models.ImportLogLevel, msg string, path string) {
+	if _, durable := ctx.Value(durableImportKey{}).(*durableImportState); durable {
+		var counter struct {
+			Seq int `bson:"log_sequence"`
+		}
+		if err := s.db.Collection("import_jobs").FindOneAndUpdate(ctx, bson.M{"_id": jobID}, bson.M{"$inc": bson.M{"log_sequence": 1}}, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&counter); err != nil {
+			return
+		}
+		seq = counter.Seq
+	}
 	log := models.ImportLog{
 		ID:        primitive.NewObjectID(),
 		JobID:     jobID,
@@ -195,7 +217,9 @@ func (s *ImportService) writeLog(ctx context.Context, jobID primitive.ObjectID, 
 		Path:      path,
 		CreatedAt: time.Now(),
 	}
-	s.db.Collection("import_logs").InsertOne(ctx, log) //nolint:errcheck
+	if _, err := s.db.Collection("import_logs").InsertOne(ctx, log); err != nil {
+		return
+	}
 	// SSE format: "data: {level}|{path}|{msg}\n\n"
 	line := fmt.Sprintf("data: %s|%s|%s\n\n", level, path, msg)
 	s.publish(jobID.Hex(), line)
@@ -204,6 +228,29 @@ func (s *ImportService) writeLog(ctx context.Context, jobID primitive.ObjectID, 
 // ---------------------------------------------------------------------------
 // RSS import
 // ---------------------------------------------------------------------------
+
+// autoPublish publishes one freshly created import page through
+// PublicationService under a stable per-job operation key (Task 16D:
+// import/<jobID>/<contentID>). A job resume replays the cached completion
+// instead of minting a duplicate Publication/outbox row; failures are logged
+// to the import job log.
+func (s *ImportService) autoPublish(ctx context.Context, job *models.ImportJob, content *models.Content, fullPath string, logLine func(models.ImportLogLevel, string, string)) {
+	if ctx.Value(durableImportKey{}) != nil {
+		return
+	} // durable executor resumes the frozen publish step
+	current, err := s.GetJob(ctx, job.ID)
+	if err != nil || current.Status != models.ImportStatusRunning {
+		logLine(models.ImportLogWarn, "Auto-publish skipped: import is no longer running or its state could not be verified", fullPath)
+		return
+	}
+	key := ImportOpKey(job.ID, content.ID)
+	if err := s.contentService.PublishInternal(ctx, content.ID,
+		"import", "/internal/imports/"+job.ID.Hex()+"/publish", key); err != nil {
+		logLine(models.ImportLogError, fmt.Sprintf("Auto-publish failed: %v", err), fullPath)
+		return
+	}
+	logLine(models.ImportLogInfo, "Auto-published", fullPath)
+}
 
 // RunRSSImport runs an RSS import for a configured source.
 // It creates a job record immediately and processes items asynchronously.
@@ -224,109 +271,126 @@ func (s *ImportService) RunRSSImport(ctx context.Context, sourceID primitive.Obj
 		StartedAt:  time.Now(),
 		CreatedBy:  triggeredBy,
 	}
-	s.db.Collection("import_jobs").InsertOne(ctx, job) //nolint:errcheck
+	if s.durable != nil {
+		return s.submitDurableImport(ctx, job, importPlan{Type: models.ImportTypeRSS, Source: src})
+	}
+	if _, err := s.db.Collection("import_jobs").InsertOne(ctx, job); err != nil {
+		return nil, err
+	}
 
 	// 3. Run async
-	go func() {
-		bgCtx := context.Background()
-		seq := 0
-		logLine := func(level models.ImportLogLevel, msg, path string) {
-			seq++
-			s.writeLog(bgCtx, job.ID, seq, level, msg, path)
-		}
+	go s.processRSS(context.Background(), job, src, sourceID)
+	return job, nil
+}
 
-		logLine(models.ImportLogInfo, fmt.Sprintf("Fetching feed: %s", src.URL), "")
+func (s *ImportService) processRSS(bgCtx context.Context, job *models.ImportJob, src *models.ImportSource, sourceID primitive.ObjectID) {
+	seq := 0
+	logLine := func(level models.ImportLogLevel, msg, path string) {
+		seq++
+		s.writeLog(bgCtx, job.ID, seq, level, msg, path)
+	}
 
-		items, err := importer.ParseFeed(bgCtx, src.URL)
-		if err != nil {
-			logLine(models.ImportLogError, fmt.Sprintf("Feed fetch failed: %v", err), "")
-			s.finalizeJob(bgCtx, job.ID, models.ImportStatusFailed, err.Error(), 0, 0, 0, 0)
+	logLine(models.ImportLogInfo, fmt.Sprintf("Fetching feed: %s", src.URL), "")
+
+	items, err := s.feedItems(bgCtx, src.URL)
+	if err != nil {
+		logLine(models.ImportLogError, fmt.Sprintf("Feed fetch failed: %v", err), "")
+		s.finalizeJob(bgCtx, job.ID, models.ImportStatusFailed, err.Error(), 0, 0, 0, 0)
+		return
+	}
+
+	logLine(models.ImportLogInfo, fmt.Sprintf("Found %d items", len(items)), "")
+
+	created, updated, failed, skipped := 0, 0, 0, 0
+	for _, item := range items {
+		if !s.continueImport(bgCtx, job.ID, len(items), created, updated, failed) {
 			return
 		}
+		if item.Title == "" || item.URL == "" {
+			skipped++
+			logLine(models.ImportLogWarn, "Skipped item with no title or URL", "")
+			continue
+		}
 
-		logLine(models.ImportLogInfo, fmt.Sprintf("Found %d items", len(items)), "")
+		// Dedup by source_url field
+		existing := s.findBySourceURL(bgCtx, item.URL)
 
-		created, updated, failed, skipped := 0, 0, 0, 0
-		for _, item := range items {
-			if item.Title == "" || item.URL == "" {
-				skipped++
-				logLine(models.ImportLogWarn, "Skipped item with no title or URL", "")
-				continue
-			}
+		// Build data fields
+		data := map[string]interface{}{
+			"title": item.Title,
+			"body":  item.Description,
+		}
+		if item.Author != "" {
+			data["author"] = item.Author
+		}
 
-			// Dedup by source_url field
-			existing := s.findBySourceURL(bgCtx, item.URL)
+		// Generate slug from title
+		slug := slugify(item.Title)
+		folderPath := src.FolderPath
+		if folderPath == "" {
+			folderPath = "/imports"
+		}
+		fullPath := strings.TrimSuffix(folderPath, "/") + "/" + slug
 
-			// Build data fields
-			data := map[string]interface{}{
-				"title": item.Title,
-				"body":  item.Description,
-			}
-			if item.Author != "" {
-				data["author"] = item.Author
-			}
-
-			// Generate slug from title
-			slug := slugify(item.Title)
-			folderPath := src.FolderPath
-			if folderPath == "" {
-				folderPath = "/imports"
-			}
-			fullPath := strings.TrimSuffix(folderPath, "/") + "/" + slug
-
-			if existing != nil {
-				// Update existing: set data fields on the content object
-				existing.Data = data
-				existing.UpdatedAt = time.Now()
-				err := s.contentService.UpdateContent(bgCtx, existing)
-				if err != nil {
-					failed++
-					logLine(models.ImportLogError, fmt.Sprintf("Update failed: %v", err), fullPath)
-				} else {
-					updated++
-					logLine(models.ImportLogInfo, "Updated", fullPath)
-				}
+		if existing != nil {
+			// Update existing: set data fields on the content object
+			existing.Data = data
+			existing.UpdatedAt = time.Now()
+			err := s.writeContent(bgCtx, job.ID, existing, false)
+			if err != nil {
+				failed++
+				logLine(models.ImportLogError, fmt.Sprintf("Update failed: %v", err), fullPath)
 			} else {
-				// Create new
-				content := &models.Content{
-					Title:      item.Title,
-					Slug:       slug,
-					FolderPath: folderPath,
-					FullPath:   fullPath,
-					TemplateID: src.TemplateID,
-					Data:       data,
-					SourceURL:  item.URL,
+				updated++
+				logLine(models.ImportLogInfo, "Updated", fullPath)
+				// Lane 2B: the update branch must honor auto-publish like
+				// the create branch — otherwise re-imported pages silently
+				// stay drafts while new pages go live.
+				if src.AutoPublish {
+					s.autoPublish(bgCtx, job, existing, fullPath, logLine)
 				}
-				err := s.contentService.CreateContent(bgCtx, content)
-				if err != nil {
-					failed++
-					logLine(models.ImportLogError, fmt.Sprintf("Create failed: %v", err), fullPath)
-				} else {
-					created++
-					logLine(models.ImportLogInfo, "Created", fullPath)
-					if src.AutoPublish {
-						s.contentService.PublishContent(bgCtx, content.ID) //nolint:errcheck
-					}
+			}
+		} else {
+			// Create new
+			content := &models.Content{
+				Title:      item.Title,
+				Slug:       slug,
+				FolderPath: folderPath,
+				FullPath:   fullPath,
+				TemplateID: src.TemplateID,
+				Data:       data,
+				SourceURL:  item.URL,
+			}
+			err := s.writeContent(bgCtx, job.ID, content, true)
+			if err != nil {
+				failed++
+				logLine(models.ImportLogError, fmt.Sprintf("Create failed: %v", err), fullPath)
+			} else {
+				created++
+				logLine(models.ImportLogInfo, "Created", fullPath)
+				if src.AutoPublish {
+					// Task 16D: stable per-page operation key within this
+					// import job — a job resume replays, never duplicates.
+					s.autoPublish(bgCtx, job, content, fullPath, logLine)
 				}
 			}
 		}
+	}
 
-		logLine(models.ImportLogInfo, fmt.Sprintf("Done: %d created, %d updated, %d failed, %d skipped", created, updated, failed, skipped), "")
-		s.finalizeJob(bgCtx, job.ID, models.ImportStatusDone, "", len(items), created, updated, failed)
+	logLine(models.ImportLogInfo, fmt.Sprintf("Done: %d created, %d updated, %d failed, %d skipped", created, updated, failed, skipped), "")
+	s.finalizeJob(bgCtx, job.ID, models.ImportStatusDone, "", len(items), created, updated, failed)
 
-		// Update source last_run fields
-		now := time.Now()
-		s.db.Collection("import_sources").UpdateOne(bgCtx,
-			bson.M{"_id": sourceID},
-			bson.M{"$set": bson.M{
-				"last_run_at":     now,
-				"last_run_status": "ok",
-				"last_job_id":     job.ID,
-			}},
-		) //nolint:errcheck
-	}()
+	// Update source last_run fields
+	now := time.Now()
+	s.db.Collection("import_sources").UpdateOne(bgCtx,
+		bson.M{"_id": sourceID},
+		bson.M{"$set": bson.M{
+			"last_run_at":     now,
+			"last_run_status": "ok",
+			"last_job_id":     job.ID,
+		}},
+	) //nolint:errcheck
 
-	return job, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -345,127 +409,143 @@ func (s *ImportService) RunMarkdownImport(ctx context.Context, pages []importer.
 		StartedAt:  time.Now(),
 		CreatedBy:  triggeredBy,
 	}
-	s.db.Collection("import_jobs").InsertOne(ctx, job) //nolint:errcheck
+	if s.durable != nil {
+		return s.submitDurableImport(ctx, job, importPlan{Type: models.ImportTypeMarkdown, Pages: pages, Template: defaultTemplate, Folder: defaultFolder, AutoPublish: autoPublish})
+	}
+	if _, err := s.db.Collection("import_jobs").InsertOne(ctx, job); err != nil {
+		return nil, err
+	}
 
-	go func() {
-		bgCtx := context.Background()
-		seq := 0
-		logLine := func(level models.ImportLogLevel, msg, path string) {
-			seq++
-			s.writeLog(bgCtx, job.ID, seq, level, msg, path)
-		}
-
-		created, updated, failed, skipped := 0, 0, 0, 0
-
-		for _, page := range pages {
-			title := importer.FrontmatterGet(page.Frontmatter, "title")
-			if title == "" {
-				// Derive from filename
-				base := strings.TrimSuffix(filepath.Base(page.Filename), filepath.Ext(page.Filename))
-				title = strings.ReplaceAll(base, "-", " ")
-				title = strings.ReplaceAll(title, "_", " ")
-			}
-			if title == "" {
-				skipped++
-				logLine(models.ImportLogWarn, fmt.Sprintf("Skipped %s: no title", page.Filename), "")
-				continue
-			}
-
-			slug := importer.FrontmatterGet(page.Frontmatter, "slug")
-			if slug == "" {
-				slug = slugify(title)
-			}
-
-			folder := importer.FrontmatterGet(page.Frontmatter, "folder")
-			if folder == "" {
-				folder = defaultFolder
-			}
-			if folder == "" {
-				folder = "/imports"
-			}
-			// Sanitize folder from frontmatter — reject path traversal
-			if !safeFolderPath(folder) {
-				failed++
-				logLine(models.ImportLogError, fmt.Sprintf("Skipped %s: invalid folder path %q", page.Filename, folder), "")
-				continue
-			}
-			fullPath := strings.TrimSuffix(folder, "/") + "/" + slug
-
-			templateName := importer.FrontmatterGet(page.Frontmatter, "template")
-			if templateName == "" {
-				templateName = defaultTemplate
-			}
-
-			data := map[string]interface{}{
-				"title": title,
-				"body":  page.Body,
-			}
-			// Map additional frontmatter keys to data fields
-			for k, v := range page.Frontmatter {
-				lower := strings.ToLower(k)
-				if lower != "title" && lower != "slug" && lower != "folder" && lower != "template" && lower != "published" && lower != "publish_at" {
-					data[k] = v
-				}
-			}
-
-			// Resolve template ID
-			var templateID primitive.ObjectID
-			if templateName != "" {
-				tmpl := s.findTemplateByName(bgCtx, templateName)
-				if tmpl != nil {
-					templateID = tmpl.ID
-				}
-			}
-
-			existing := s.findByPath(bgCtx, fullPath)
-
-			if existing != nil {
-				existing.Data = data
-				err := s.contentService.UpdateContent(bgCtx, existing)
-				if err != nil {
-					failed++
-					logLine(models.ImportLogError, fmt.Sprintf("Update failed: %v", err), fullPath)
-				} else {
-					updated++
-					logLine(models.ImportLogInfo, "Updated", fullPath)
-				}
-			} else {
-				content := &models.Content{
-					Title:      title,
-					Slug:       slug,
-					FolderPath: folder,
-					FullPath:   fullPath,
-					TemplateID: templateID,
-					Data:       data,
-				}
-
-				// Handle publish_at from frontmatter
-				if paStr := importer.FrontmatterGet(page.Frontmatter, "publish_at"); paStr != "" {
-					if t := importer.ParseTimeStr(paStr); t != nil {
-						content.PublishAt = t
-					}
-				}
-
-				err := s.contentService.CreateContent(bgCtx, content)
-				if err != nil {
-					failed++
-					logLine(models.ImportLogError, fmt.Sprintf("Create failed: %v", err), fullPath)
-				} else {
-					created++
-					logLine(models.ImportLogInfo, "Created", fullPath)
-					pubStr := importer.FrontmatterGet(page.Frontmatter, "published")
-					if autoPublish || pubStr == "true" {
-						s.contentService.PublishContent(bgCtx, content.ID) //nolint:errcheck
-					}
-				}
-			}
-		}
-
-		logLine(models.ImportLogInfo, fmt.Sprintf("Done: %d created, %d updated, %d failed, %d skipped", created, updated, failed, skipped), "")
-		s.finalizeJob(bgCtx, job.ID, models.ImportStatusDone, "", len(pages), created, updated, failed)
-	}()
-
+	go s.processMarkdown(context.Background(), job, pages, defaultTemplate, defaultFolder, autoPublish)
 	return job, nil
+}
+
+func (s *ImportService) processMarkdown(bgCtx context.Context, job *models.ImportJob, pages []importer.MarkdownPage, defaultTemplate, defaultFolder string, autoPublish bool) {
+	seq := 0
+	logLine := func(level models.ImportLogLevel, msg, path string) {
+		seq++
+		s.writeLog(bgCtx, job.ID, seq, level, msg, path)
+	}
+
+	created, updated, failed, skipped := 0, 0, 0, 0
+
+	for _, page := range pages {
+		if !s.continueImport(bgCtx, job.ID, len(pages), created, updated, failed) {
+			return
+		}
+		title := importer.FrontmatterGet(page.Frontmatter, "title")
+		if title == "" {
+			// Derive from filename
+			base := strings.TrimSuffix(filepath.Base(page.Filename), filepath.Ext(page.Filename))
+			title = strings.ReplaceAll(base, "-", " ")
+			title = strings.ReplaceAll(title, "_", " ")
+		}
+		if title == "" {
+			skipped++
+			logLine(models.ImportLogWarn, fmt.Sprintf("Skipped %s: no title", page.Filename), "")
+			continue
+		}
+
+		slug := importer.FrontmatterGet(page.Frontmatter, "slug")
+		if slug == "" {
+			slug = slugify(title)
+		}
+
+		folder := importer.FrontmatterGet(page.Frontmatter, "folder")
+		if folder == "" {
+			folder = defaultFolder
+		}
+		if folder == "" {
+			folder = "/imports"
+		}
+		// Sanitize folder from frontmatter — reject path traversal
+		if !safeFolderPath(folder) {
+			failed++
+			logLine(models.ImportLogError, fmt.Sprintf("Skipped %s: invalid folder path %q", page.Filename, folder), "")
+			continue
+		}
+		fullPath := strings.TrimSuffix(folder, "/") + "/" + slug
+
+		templateName := importer.FrontmatterGet(page.Frontmatter, "template")
+		if templateName == "" {
+			templateName = defaultTemplate
+		}
+
+		data := map[string]interface{}{
+			"title": title,
+			"body":  page.Body,
+		}
+		// Map additional frontmatter keys to data fields
+		for k, v := range page.Frontmatter {
+			lower := strings.ToLower(k)
+			if lower != "title" && lower != "slug" && lower != "folder" && lower != "template" && lower != "published" && lower != "publish_at" {
+				data[k] = v
+			}
+		}
+
+		// Resolve template ID
+		var templateID primitive.ObjectID
+		if state, ok := bgCtx.Value(durableImportKey{}).(*durableImportState); ok {
+			templateID = state.Plan.TemplateID
+		} else if templateName != "" {
+			tmpl := s.findTemplateByName(bgCtx, templateName)
+			if tmpl != nil {
+				templateID = tmpl.ID
+			}
+		}
+
+		existing := s.findByPath(bgCtx, fullPath)
+
+		// Lane 2B: publish intent applies to updates and creates alike.
+		wantPublish := autoPublish || importer.FrontmatterGet(page.Frontmatter, "published") == "true"
+
+		if existing != nil {
+			existing.Data = data
+			err := s.writeContent(bgCtx, job.ID, existing, false)
+			if err != nil {
+				failed++
+				logLine(models.ImportLogError, fmt.Sprintf("Update failed: %v", err), fullPath)
+			} else {
+				updated++
+				logLine(models.ImportLogInfo, "Updated", fullPath)
+				if wantPublish {
+					s.autoPublish(bgCtx, job, existing, fullPath, logLine)
+				}
+			}
+		} else {
+			content := &models.Content{
+				Title:      title,
+				Slug:       slug,
+				FolderPath: folder,
+				FullPath:   fullPath,
+				TemplateID: templateID,
+				Data:       data,
+			}
+
+			// Handle publish_at from frontmatter
+			if paStr := importer.FrontmatterGet(page.Frontmatter, "publish_at"); paStr != "" {
+				if t := importer.ParseTimeStr(paStr); t != nil {
+					content.PublishAt = t
+				}
+			}
+
+			err := s.writeContent(bgCtx, job.ID, content, true)
+			if err != nil {
+				failed++
+				logLine(models.ImportLogError, fmt.Sprintf("Create failed: %v", err), fullPath)
+			} else {
+				created++
+				logLine(models.ImportLogInfo, "Created", fullPath)
+				if wantPublish {
+					s.autoPublish(bgCtx, job, content, fullPath, logLine)
+				}
+			}
+		}
+	}
+
+	logLine(models.ImportLogInfo, fmt.Sprintf("Done: %d created, %d updated, %d failed, %d skipped", created, updated, failed, skipped), "")
+	s.finalizeJob(bgCtx, job.ID, models.ImportStatusDone, "", len(pages), created, updated, failed)
+
 }
 
 // ---------------------------------------------------------------------------
@@ -486,85 +566,100 @@ func (s *ImportService) RunCSVImport(ctx context.Context, records []importer.CSV
 		StartedAt:  time.Now(),
 		CreatedBy:  triggeredBy,
 	}
-	s.db.Collection("import_jobs").InsertOne(ctx, job) //nolint:errcheck
+	if s.durable != nil {
+		return s.submitDurableImport(ctx, job, importPlan{Type: models.ImportTypeCSV, Records: records, ColumnMap: columnMap, TitleColumn: titleColumn, SlugColumn: slugColumn, TemplateID: templateID, Folder: folderPath, AutoPublish: autoPublish})
+	}
+	if _, err := s.db.Collection("import_jobs").InsertOne(ctx, job); err != nil {
+		return nil, err
+	}
 
-	go func() {
-		bgCtx := context.Background()
-		seq := 0
-		logLine := func(level models.ImportLogLevel, msg, path string) {
-			seq++
-			s.writeLog(bgCtx, job.ID, seq, level, msg, path)
-		}
-
-		created, updated, failed, skipped := 0, 0, 0, 0
-		if folderPath == "" {
-			folderPath = "/imports"
-		}
-
-		for _, rec := range records {
-			title := rec.Fields[titleColumn]
-			if title == "" {
-				skipped++
-				logLine(models.ImportLogWarn, fmt.Sprintf("Row %d: empty title column %q", rec.Row, titleColumn), "")
-				continue
-			}
-
-			slug := ""
-			if slugColumn != "" {
-				slug = slugify(rec.Fields[slugColumn])
-			}
-			if slug == "" {
-				slug = slugify(title)
-			}
-			fullPath := strings.TrimSuffix(folderPath, "/") + "/" + slug
-
-			// Map columns to data fields
-			data := map[string]interface{}{"title": title}
-			for csvCol, fieldName := range columnMap {
-				if val, ok := rec.Fields[csvCol]; ok && val != "" {
-					data[fieldName] = val
-				}
-			}
-
-			existing := s.findByPath(bgCtx, fullPath)
-			if existing != nil {
-				existing.Data = data
-				err := s.contentService.UpdateContent(bgCtx, existing)
-				if err != nil {
-					failed++
-					logLine(models.ImportLogError, fmt.Sprintf("Row %d update failed: %v", rec.Row, err), fullPath)
-				} else {
-					updated++
-					logLine(models.ImportLogInfo, fmt.Sprintf("Row %d updated", rec.Row), fullPath)
-				}
-			} else {
-				content := &models.Content{
-					Title:      title,
-					Slug:       slug,
-					FolderPath: folderPath,
-					FullPath:   fullPath,
-					TemplateID: templateID,
-					Data:       data,
-				}
-				err := s.contentService.CreateContent(bgCtx, content)
-				if err != nil {
-					failed++
-					logLine(models.ImportLogError, fmt.Sprintf("Row %d create failed: %v", rec.Row, err), fullPath)
-				} else {
-					created++
-					logLine(models.ImportLogInfo, fmt.Sprintf("Row %d created", rec.Row), fullPath)
-					if autoPublish {
-						s.contentService.PublishContent(bgCtx, content.ID) //nolint:errcheck
-					}
-				}
-			}
-		}
-
-		logLine(models.ImportLogInfo, fmt.Sprintf("Done: %d created, %d updated, %d failed, %d skipped", created, updated, failed, skipped), "")
-		s.finalizeJob(bgCtx, job.ID, models.ImportStatusDone, "", len(records), created, updated, failed)
-	}()
-
+	go s.processCSV(context.Background(), job, records, columnMap, titleColumn, slugColumn, templateID, folderPath, autoPublish)
 	return job, nil
+}
+
+func (s *ImportService) processCSV(bgCtx context.Context, job *models.ImportJob, records []importer.CSVRecord, columnMap map[string]string, titleColumn, slugColumn string, templateID primitive.ObjectID, folderPath string, autoPublish bool) {
+	seq := 0
+	logLine := func(level models.ImportLogLevel, msg, path string) {
+		seq++
+		s.writeLog(bgCtx, job.ID, seq, level, msg, path)
+	}
+
+	created, updated, failed, skipped := 0, 0, 0, 0
+	if folderPath == "" {
+		folderPath = "/imports"
+	}
+
+	for _, rec := range records {
+		if !s.continueImport(bgCtx, job.ID, len(records), created, updated, failed) {
+			return
+		}
+		title := rec.Fields[titleColumn]
+		if title == "" {
+			skipped++
+			logLine(models.ImportLogWarn, fmt.Sprintf("Row %d: empty title column %q", rec.Row, titleColumn), "")
+			continue
+		}
+
+		slug := ""
+		if slugColumn != "" {
+			slug = slugify(rec.Fields[slugColumn])
+		}
+		if slug == "" {
+			slug = slugify(title)
+		}
+		fullPath := strings.TrimSuffix(folderPath, "/") + "/" + slug
+
+		// Map columns to data fields
+		data := map[string]interface{}{"title": title}
+		for csvCol, fieldName := range columnMap {
+			if val, ok := rec.Fields[csvCol]; ok && val != "" {
+				data[fieldName] = val
+			}
+		}
+
+		existing := s.findByPath(bgCtx, fullPath)
+		if existing != nil {
+			existing.Data = data
+			err := s.writeContent(bgCtx, job.ID, existing, false)
+			if err != nil {
+				failed++
+				logLine(models.ImportLogError, fmt.Sprintf("Row %d update failed: %v", rec.Row, err), fullPath)
+			} else {
+				updated++
+				logLine(models.ImportLogInfo, fmt.Sprintf("Row %d updated", rec.Row), fullPath)
+				// Lane 2B: the update branch must honor auto-publish like
+				// the create branch — otherwise re-imported rows silently
+				// stay drafts while new rows go live.
+				if autoPublish {
+					s.autoPublish(bgCtx, job, existing, fullPath, logLine)
+				}
+			}
+		} else {
+			content := &models.Content{
+				Title:      title,
+				Slug:       slug,
+				FolderPath: folderPath,
+				FullPath:   fullPath,
+				TemplateID: templateID,
+				Data:       data,
+			}
+			err := s.writeContent(bgCtx, job.ID, content, true)
+			if err != nil {
+				failed++
+				logLine(models.ImportLogError, fmt.Sprintf("Row %d create failed: %v", rec.Row, err), fullPath)
+			} else {
+				created++
+				logLine(models.ImportLogInfo, fmt.Sprintf("Row %d created", rec.Row), fullPath)
+				if autoPublish {
+					s.autoPublish(bgCtx, job, content, fullPath, logLine)
+				}
+			}
+		}
+	}
+
+	logLine(models.ImportLogInfo, fmt.Sprintf("Done: %d created, %d updated, %d failed, %d skipped", created, updated, failed, skipped), "")
+	s.finalizeJob(bgCtx, job.ID, models.ImportStatusDone, "", len(records), created, updated, failed)
+
 }
 
 // ---------------------------------------------------------------------------
@@ -572,9 +667,13 @@ func (s *ImportService) RunCSVImport(ctx context.Context, records []importer.CSV
 // ---------------------------------------------------------------------------
 
 func (s *ImportService) finalizeJob(ctx context.Context, jobID primitive.ObjectID, status models.ImportStatus, errMsg string, total, created, updated, failed int) {
+	if state, ok := ctx.Value(durableImportKey{}).(*durableImportState); ok {
+		state.Outcome = bson.M{"created": created, "updated": updated, "failed": failed, "error": errMsg}
+		return
+	}
 	now := time.Now()
-	s.db.Collection("import_jobs").UpdateOne(ctx,
-		bson.M{"_id": jobID},
+	result, err := s.db.Collection("import_jobs").UpdateOne(ctx,
+		bson.M{"_id": jobID, "status": models.ImportStatusRunning},
 		bson.M{"$set": bson.M{
 			"status":      status,
 			"error_msg":   errMsg,
@@ -584,10 +683,67 @@ func (s *ImportService) finalizeJob(ctx context.Context, jobID primitive.ObjectI
 			"failed":      failed,
 			"finished_at": now,
 		}},
-	) //nolint:errcheck
+	)
+	if err != nil {
+		log.Printf("import %s finalize failed: %v", jobID.Hex(), err)
+		return
+	}
+	if result.MatchedCount == 0 {
+		// Retain completed-item counts after cancellation without changing its
+		// terminal state or emitting a misleading done event.
+		_, err := s.db.Collection("import_jobs").UpdateOne(ctx, bson.M{"_id": jobID, "status": models.ImportStatusCancelled}, bson.M{"$set": bson.M{"total_pages": total, "created": created, "updated": updated, "failed": failed}})
+		if err != nil {
+			log.Printf("import %s cancellation progress failed: %v", jobID.Hex(), err)
+		}
+		return
+	}
 	// Send SSE "done" sentinel
 	doneMsg := fmt.Sprintf("data: done|%s|import finished\n\n", status)
 	s.publish(jobID.Hex(), doneMsg)
+}
+
+func (s *ImportService) continueImport(ctx context.Context, jobID primitive.ObjectID, total, created, updated, failed int) bool {
+	job, err := s.GetJob(ctx, jobID)
+	if err == nil && job.Status == models.ImportStatusRunning {
+		return true
+	}
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	s.finalizeJob(ctx, jobID, models.ImportStatusFailed, message, total, created, updated, failed)
+	return false
+}
+
+// Fence the job row and the draft write in the same transaction. Cancellation
+// can win before this item, or follow its commit, but cannot race a new write.
+func (s *ImportService) writeContent(ctx context.Context, jobID primitive.ObjectID, content *models.Content, create bool) error {
+	if state, ok := ctx.Value(durableImportKey{}).(*durableImportState); ok {
+		return s.durable.Repo.CommitStage(ctx, state.Job, state.Item.Key, false, func(sc mongo.SessionContext) (bson.M, error) {
+			if err := s.writeContentPlain(sc, jobID, content, create); err != nil {
+				return nil, err
+			}
+			state.Written = bson.M{"content_id": content.ID.Hex(), "content_version": content.CurrentVersion, "created": create, "path": content.FullPath}
+			return state.Written, nil
+		})
+	}
+	return s.writeContentPlain(ctx, jobID, content, create)
+}
+
+func (s *ImportService) writeContentPlain(ctx context.Context, jobID primitive.ObjectID, content *models.Content, create bool) error {
+	return s.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
+		matched, err := s.db.UpdateOneMatched(sc, "import_jobs", bson.M{"_id": jobID, "status": models.ImportStatusRunning}, bson.M{"$inc": bson.M{"write_generation": 1}})
+		if err != nil {
+			return err
+		}
+		if matched == 0 {
+			return fmt.Errorf("import is no longer running")
+		}
+		if create {
+			return s.contentService.CreateContent(sc, content)
+		}
+		return s.contentService.UpdateContent(sc, content)
+	})
 }
 
 // findByPath returns the live page at fullPath. A fork copy shares its live
@@ -624,19 +780,42 @@ func (s *ImportService) findTemplateByName(ctx context.Context, name string) *mo
 
 // CancelJob sets a running import job's status to cancelled.
 func (s *ImportService) CancelJob(ctx context.Context, id primitive.ObjectID) error {
+	return s.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
+		var job models.ImportJob
+		if err := s.db.FindOne(sc, "import_jobs", bson.M{"_id": id}, &job); err != nil {
+			if err == mongo.ErrNoDocuments {
+				return nil
+			}
+			return err
+		}
+		if s.durable != nil && job.WorkflowID != nil {
+			if err := s.durable.Repo.Cancel(sc, *job.WorkflowID); err != nil {
+				return err
+			}
+		}
+		return s.cancelImportRecord(sc, id)
+	})
+}
+
+func (s *ImportService) cancelImportRecord(ctx context.Context, id primitive.ObjectID) error {
 	now := time.Now()
-	if err := s.db.UpdateOne(ctx, "import_jobs",
+	matched, err := s.db.UpdateOneMatched(ctx, "import_jobs",
 		bson.M{"_id": id, "status": models.ImportStatusRunning},
 		bson.M{"$set": bson.M{
-			"status":      models.ImportStatusCancelled,
-			"finished_at": now,
+			"status":           models.ImportStatusCancelled,
+			"cancel_requested": true,
+			"finished_at":      now,
 		}},
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("cancel import job: %w", err)
+	}
+	if matched == 0 {
+		return nil
 	}
 	// Broadcast a done sentinel to any SSE subscribers
 	doneMsg := fmt.Sprintf("data: done|%s|import cancelled\n\n", models.ImportStatusCancelled)
-	s.publish(id.Hex(), doneMsg)
+	s.db.AfterCommit(ctx, func(context.Context) { s.publish(id.Hex(), doneMsg) })
 	return nil
 }
 

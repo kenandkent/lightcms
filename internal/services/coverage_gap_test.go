@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -439,7 +440,7 @@ func TestAnalytics_FlushBufferForTest_AndPrefField(t *testing.T) {
 }
 
 // TestBulkCreateContent_Branches covers the partial-failure (duplicate key),
-// published static-generation, webhook, and total-failure branches.
+// Lane 2B published:true rejection, webhook, and total-failure branches.
 func TestBulkCreateContent_Branches(t *testing.T) {
 	db, cleanup := testutil.MustConnectTestDB(t)
 	defer cleanup()
@@ -485,16 +486,25 @@ func TestBulkCreateContent_Branches(t *testing.T) {
 	if results[0].Success {
 		t.Error("expected duplicate-path item to fail")
 	}
-	if !results[1].Success || !results[2].Success {
+	// Lane 2B: Published:true items are rejected — a bulk write mints no
+	// Publication row, outbox event, or idempotency record, so persisting
+	// the live flag would diverge from control-plane truth.
+	if results[1].Success {
+		t.Error("expected published:true item to fail")
+	}
+	if !strings.Contains(strings.ToLower(results[1].Error), "publish") {
+		t.Errorf("published:true rejection must direct to publish endpoints, got %q", results[1].Error)
+	}
+	if !results[2].Success {
 		t.Errorf("expected non-duplicate items to succeed: %+v", results)
 	}
 	if results[2].FullPath != "/bulk-folder/leaf" {
 		t.Errorf("folder path: got %q", results[2].FullPath)
 	}
 
-	// Total-failure branch via injected InsertManyUnordered error.
-	db.SetFaultHook(func(op, _ string) error {
-		if op == "InsertManyUnordered" {
+	// Each bulk item now commits content and history in one transaction.
+	db.SetFaultHook(func(op, collection string) error {
+		if op == "InsertOne" && collection == "content" {
 			return errors.New("injected")
 		}
 		return nil
@@ -516,8 +526,9 @@ func TestCommentService_Create_WebhookBranch(t *testing.T) {
 	cms := NewCommentService(db)
 	cms.SetWebhookService(NewWebhookService(db))
 	ctx := context.Background()
+	contentID := seedCommentContent(t, db, ctx)
 
-	c, err := cms.Create(ctx, primitive.NewObjectID(), primitive.NewObjectID(),
+	c, err := cms.Create(ctx, contentID, primitive.NewObjectID(),
 		"a@x.com", "Author", "hello @b", []primitive.ObjectID{primitive.NewObjectID()})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -527,7 +538,7 @@ func TestCommentService_Create_WebhookBranch(t *testing.T) {
 	}
 
 	// Empty text branch.
-	if _, err := cms.Create(ctx, primitive.NewObjectID(), primitive.NewObjectID(),
+	if _, err := cms.Create(ctx, contentID, primitive.NewObjectID(),
 		"a@x.com", "Author", "", nil); err == nil {
 		t.Error("expected error for empty comment text")
 	}

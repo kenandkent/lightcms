@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,10 @@ import (
 	"github.com/metavert-io/lightcms/v7/internal/middleware"
 	"github.com/metavert-io/lightcms/v7/internal/models"
 	"github.com/metavert-io/lightcms/v7/internal/oauth"
+	"github.com/metavert-io/lightcms/v7/internal/product/generation"
+	"github.com/metavert-io/lightcms/v7/internal/product/jobs"
+	staticdelivery "github.com/metavert-io/lightcms/v7/internal/product/staticdelivery"
+	deliveryapi "github.com/metavert-io/lightcms/v7/internal/product/staticdelivery/httpapi"
 	"github.com/metavert-io/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
@@ -71,6 +76,25 @@ func main() {
 	defer db.Disconnect(context.Background())
 
 	log.Printf("Connected to MongoDB successfully (database %q)", cfg.DatabaseName)
+
+	// Task 16E: `lightcms migrate-publications --dry-run|--apply` (Task 14
+	// contract) runs inside this same binary — no second migration binary.
+	if len(os.Args) > 1 && os.Args[1] == "migrate-publications" {
+		runMigrationCommand(cfg, db)
+		return
+	}
+
+	// R10: multi-instance deployment is unsupported — fail fast when
+	// another live instance holds the liveness gate. gateCtx is fresh:
+	// the connect-scoped ctx above may already be past its deadline.
+	instanceID := newInstanceID()
+	gateCtx, gateCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stopGate, gateErr := enforceSingleInstance(gateCtx, db, instanceID, build.GetVersion())
+	gateCancel()
+	if gateErr != nil {
+		log.Fatalf("Single-instance gate: %v", gateErr)
+	}
+	defer stopGate()
 
 	// Initialize session store with secure settings
 	sessionStore := sessions.NewCookieStore([]byte(cfg.SessionSecret))
@@ -141,8 +165,19 @@ func main() {
 
 	// Initialize v4.5 services
 	webhookService := services.NewWebhookService(db)
+	workflowRepo := jobs.NewRepository(db, 256)
+	if err := workflowRepo.EnsureIndexes(context.Background()); err != nil {
+		log.Fatalf("Workflow indexes unavailable: %v", err)
+	}
+	workflowRunner := jobs.NewRunner(workflowRepo, 4)
+	webhookService.EnableDurable(workflowRunner)
 	lockService := services.NewLockService(db)
+	h.SetLockService(lockService)
 	importService := services.NewImportService(db, contentService)
+	importService.EnableDurable(workflowRunner, func(ctx context.Context, j jobs.Job) error { return authorizeWorkflowImport(ctx, db, j) })
+	if err := importService.ClassifyLegacyImports(context.Background()); err != nil {
+		log.Fatalf("Import recovery classification failed: %v", err)
+	}
 	cfService := services.NewCloudflareService(func() (zoneID, apiToken string, enabled bool) {
 		cfg, err := db.GetSiteConfig(context.Background())
 		if err != nil || cfg == nil {
@@ -168,6 +203,7 @@ func main() {
 	// Start background goroutines
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	defer bgCancel()
+	h.EnableDependencyIndex(bgCtx)
 	go schedulerService.Start(bgCtx)
 	go indexNowService.Start(bgCtx)
 	regenQueue.Start(bgCtx)
@@ -205,6 +241,20 @@ func main() {
 
 	// Initialize fork service
 	forkService := services.NewForkService(db, contentService)
+	forkService.EnableDurable(workflowRunner, func(ctx context.Context, j jobs.Job) error {
+		id, err := primitive.ObjectIDFromHex(j.Actor)
+		if err != nil {
+			return err
+		}
+		var user models.User
+		if err := db.FindOne(ctx, "users", bson.M{"_id": id, "disabled": bson.M{"$ne": true}}, &user); err != nil {
+			return err
+		}
+		if !auth.HasPermission(user.Role, auth.PermForkMerge) {
+			return fmt.Errorf("merge permission revoked")
+		}
+		return nil
+	})
 	h.SetForkService(forkService)
 
 	// Initialize comment and approval services (wired into handlers after apiHandler is created below)
@@ -247,6 +297,12 @@ func main() {
 
 	// REST API v1 routes (API key authenticated, JSON only)
 	apiKeyService := services.NewAPIKeyService(db)
+	// Seal API keys for the admin copy/reveal flow (AES-GCM over a
+	// session-secret-derived key). Without this, keys stay show-once-only
+	// and the copy button reports them as legacy.
+	keySeal := services.DeriveKeyEncryptionKey(cfg.SessionSecret)
+	apiKeyService.SetEncryptionKey(keySeal)
+	h.SetAPIKeyEncryptionKey(keySeal)
 	linkCheckerService := services.NewLinkCheckerService(db)
 	maintenanceService := services.NewMaintenanceService(db, linkCheckerService)
 	go maintenanceService.Start(bgCtx)
@@ -274,6 +330,67 @@ func main() {
 	apiHandler.SetSEOService(seoService)
 	apiHandler.SetAnalyticsService(analyticsService)
 	apiHandler.SetBaseURL(cfg.BaseURL)
+
+	// R12: validate the production public origin BEFORE building the
+	// runtime — an invalid prod URL fails fast without side effects
+	// (non-production keeps warn-only degradation inside the runtime).
+	if err := requireProductionBaseURL(cfg.Env, cfg.PublicBaseURL); err != nil {
+		log.Fatalf("Invalid production base URL: %v", err)
+	}
+	// Task 16E: ONE server construction function owns the entire V3
+	// publication runtime (saga, idempotency, URLs, generation, product
+	// HTTP handlers, scanner, outbox worker). Guards reject unsupported
+	// storage and production standalone Mongo before serving.
+	rt, err := buildPublicationRuntime(context.Background(), db, cfg, runtimeDeps{
+		Cloudflare: cfService, Audit: auditService, Webhooks: webhookService,
+		Content: contentService,
+	})
+	if err != nil {
+		log.Fatalf("Failed to build publication runtime: %v", err)
+	}
+	// Ensure the full product index set (idempotency unique key, active
+	// publication pointer, outbox, template versions). Lane 2B: legacy DBs
+	// with canonical collisions degrade instead of log.Fatalf — the server
+	// starts in a migration-required state (surfaced on /healthz) and
+	// `lightcms migrate-publications --dry-run` stays available as the
+	// diagnostic path. Non-collision failures still fatal.
+	if degraded, reason, ferr := ensureProductIndexesOrDegraded(context.Background(), db); ferr != nil {
+		log.Fatalf("Failed to ensure product indexes (run `lightcms migrate-publications --dry-run` for blockers): %v", ferr)
+	} else if degraded {
+		setMigrationRequired(reason)
+		h.SetMigrationRequired(reason)
+	}
+	// Legacy ContentService.PublishContent/UnpublishContent delegate to the
+	// saga; background jobs publish under stable operation keys (16D).
+	services.SetPublicationPublisher(rt.Pubs)
+	services.SetInternalIdempotency(rt.Idem)
+	rt.Gen.EnableDurableUpgrades(workflowRunner, func(ctx context.Context, actor generation.Actor) error {
+		return authorizeWorkflowUpgrade(ctx, db, actor)
+	})
+	go workflowRunner.Run(bgCtx)
+	apiHandler.SetPublicationRuntime(rt.Pubs, rt.Idem, rt.Gen)
+	h.SetPublicationRuntime(rt.Pubs, rt.Idem, rt.Gen)
+	// Cloudflare accounts and plaintext tokens are configured in the admin UI.
+	// No encryption key is required; artifact paths remain server configuration.
+	var deliveryAdmin *handlers.StaticDeliveryAdmin
+	if projectRoot, rootErr := os.Getwd(); rootErr == nil {
+		if deliveryCfg, configErr := staticdelivery.LoadConfig(projectRoot); configErr == nil {
+			deliveryCtx, deliveryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			deliveryAdmin = buildStaticDeliveryAdminRuntime(deliveryCtx, db, deliveryCfg)
+			if e := wireStaticDeliveryContent(deliveryCtx, bgCtx, deliveryAdmin, db, deliveryCfg, rt, cfg.PublicBaseURL, workflowRunner); e != nil {
+				log.Printf("Static content delivery unavailable: %v", e)
+			}
+			h.SetStaticDeliveryAdmin(deliveryAdmin)
+			deliveryCancel()
+		} else {
+			h.SetStaticDeliveryAdmin(&handlers.StaticDeliveryAdmin{Unavailable: staticdelivery.CodeModuleUnavailable})
+		}
+	}
+	productAPI := rt.ProductAPI
+	// Durable workers run in this same process and stop with bgCtx:
+	// outbox delivery (webhook retries) and the recovery/GC scanner.
+	go rt.Outbox.Run(bgCtx)
+	go rt.Scanner.Run(bgCtx)
 	apiAuthMiddleware := middleware.NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
 		apiKey, err := apiKeyService.ValidateAPIKey(ctx, rawKey)
 		if err != nil {
@@ -285,12 +402,13 @@ func main() {
 			if err == nil && user != nil {
 				go analyticsService.RecordActivity(context.Background(), user.ID.Hex())
 				return &auth.SessionUser{
-					ID:          user.ID.Hex(),
-					Email:       user.Email,
-					Role:        user.Role,
-					ViaAPIKey:   true,
-					Scopes:      apiKey.Scopes,
-					SandboxOnly: apiKey.SandboxOnly,
+					ID:              user.ID.Hex(),
+					CredentialOwner: "apikey:" + apiKey.ID.Hex(),
+					Email:           user.Email,
+					Role:            user.Role,
+					ViaAPIKey:       true,
+					Scopes:          apiKey.Scopes,
+					SandboxOnly:     apiKey.SandboxOnly,
 				}, nil
 			}
 		}
@@ -304,10 +422,11 @@ func main() {
 					log.Printf("[security] Auto-migrated legacy API key to admin user %s", u.Email)
 					go analyticsService.RecordActivity(context.Background(), u.ID.Hex())
 					return &auth.SessionUser{
-						ID:        u.ID.Hex(),
-						Email:     u.Email,
-						Role:      u.Role,
-						ViaAPIKey: true,
+						ID:              u.ID.Hex(),
+						CredentialOwner: "apikey:" + apiKey.ID.Hex(),
+						Email:           u.Email,
+						Role:            u.Role,
+						ViaAPIKey:       true,
 					}, nil
 				}
 			}
@@ -337,13 +456,21 @@ func main() {
 	resourceMetadataURL := cfg.BaseURL + "/.well-known/oauth-protected-resource"
 	apiAuthMiddleware.SetOAuth(
 		func(ctx context.Context, rawToken string) (interface{}, error) {
-			_, err := oauthService.ValidateAccessToken(ctx, rawToken)
+			token, err := oauthService.ValidateAccessToken(ctx, rawToken)
 			if err != nil {
 				return nil, err
 			}
-			// OAuth tokens go through the system API key path — no specific user context
-			// (the system key will be resolved on the subsequent internal request)
-			return nil, nil
+			// Legacy OAuth tokens have no stored subject; their resolved subject
+			// is the configured system user. Client identity must still survive
+			// REST and MCP calls rather than collapsing into the shared system key.
+			if systemKeyAdminID == nil {
+				return nil, fmt.Errorf("OAuth system user is unavailable")
+			}
+			user, err := userService.GetByID(ctx, *systemKeyAdminID)
+			if err != nil || user == nil {
+				return nil, fmt.Errorf("OAuth system user is unavailable")
+			}
+			return &auth.SessionUser{ID: user.ID.Hex(), Email: user.Email, Role: user.Role, ViaAPIKey: true, CredentialOwner: "oauth:" + token.ClientID + ":" + user.ID.Hex()}, nil
 		},
 		systemAPIKey,
 		resourceMetadataURL,
@@ -369,6 +496,13 @@ func main() {
 	apiv1.Use(middleware.APIBurstRateLimit) // per-token burst limit (20 req/s)
 	apiv1.Use(middleware.APIRateLimit)      // per-token sliding-window rate limit (300 req/min)
 	apiv1.Use(middleware.APIBodySizeLimit)  // cap request body at 10 MiB to prevent memory exhaustion
+	var contentDeliveryAPI deliveryapi.Handlers
+	if deliveryAdmin != nil && deliveryAdmin.ContentAPI != nil {
+		contentDeliveryAPI = *deliveryAdmin.ContentAPI
+	}
+	contentDeliveryAPI.ActorExtractor = func(r *http.Request) (*auth.SessionUser, bool) { return auth.UserFromAPIContext(r.Context()) }
+	deliveryapi.Register(apiv1, &contentDeliveryAPI)
+	h.RegisterStaticDeliveryAdminAPI(admin)
 	// Stamp change provenance (and version attribution) on every API request:
 	// agent sessions are identified by the X-Agent-Session header.
 	apiv1.Use(func(next http.Handler) http.Handler {
@@ -387,6 +521,16 @@ func main() {
 		})
 	})
 
+	// Task 16C: Task 12 product routes. Specific publication/schema paths
+	// MUST stay above the generic /content/{id} and /templates/{id}
+	// routes below so old publish URLs and new publication URLs share
+	// one auth/rate/body/provenance chain with V3 semantics.
+	apiv1.HandleFunc("/page-generation", productAPI.HandleGenerate).Methods("POST")
+	apiv1.HandleFunc("/content/{id}/publications", productAPI.HandleListPublications).Methods("GET")
+	apiv1.HandleFunc("/content/{id}/publications/{publication_id}/rollback", productAPI.HandleRollback).Methods("POST")
+	apiv1.HandleFunc("/content/{id}/publications/{publication_id}", productAPI.HandleGetPublication).Methods("GET")
+	apiv1.HandleFunc("/content/{id}/restore-and-publish", productAPI.HandleRestoreAndPublish).Methods("POST")
+	apiv1.HandleFunc("/content/{id}/revert-live", productAPI.HandleRevertLive).Methods("POST")
 	// Content
 	apiv1.HandleFunc("/content", apiHandler.APIListContent).Methods("GET")
 	apiv1.HandleFunc("/content", apiHandler.APICreateContent).Methods("POST")
@@ -410,6 +554,14 @@ func main() {
 	apiv1.HandleFunc("/content/{id}/versions/{version}/revert", apiHandler.APIRevertContentVersion).Methods("POST")
 
 	// Templates
+	// Task 16C: Task 12 template schema/upgrade routes before generic
+	// /templates/{id} so slug-scoped schema reads never collide with IDs.
+	apiv1.HandleFunc("/templates/upgrade-jobs/{job_id}/run", productAPI.HandleRunUpgradeJob).Methods("POST")
+	apiv1.HandleFunc("/templates/upgrade-jobs/{job_id}", productAPI.HandleGetUpgradeJob).Methods("GET")
+	apiv1.HandleFunc("/templates/{slug}/schema", productAPI.HandleTemplateSchema).Methods("GET")
+	apiv1.HandleFunc("/templates/{slug}/upgrade-preview", productAPI.HandleUpgradePreview).Methods("GET")
+	apiv1.HandleFunc("/templates/{slug}/upgrade-jobs", productAPI.HandleStartUpgradeJob).Methods("POST")
+	apiv1.HandleFunc("/templates/{id}/migrate-slug", productAPI.HandleMigrateSlug).Methods("POST")
 	apiv1.HandleFunc("/templates", apiHandler.APIListTemplates).Methods("GET")
 	apiv1.HandleFunc("/templates", apiHandler.APICreateTemplate).Methods("POST")
 	apiv1.HandleFunc("/templates/{id}", apiHandler.APIGetTemplate).Methods("GET")
@@ -636,6 +788,8 @@ func main() {
 
 	// Structured healthz endpoint (vibectl VibeCtl Health Check Protocol)
 	r.HandleFunc("/healthz", h.Healthz).Methods("GET")
+	r.HandleFunc("/livez", h.Livez).Methods("GET")
+	r.HandleFunc("/readyz", h.Readyz).Methods("GET")
 
 	// OAuth well-known metadata endpoints (RFC 9728 + RFC 8414)
 	r.HandleFunc("/.well-known/oauth-protected-resource", oauth.ProtectedResourceMetadataHandler(cfg.BaseURL)).Methods("GET", "OPTIONS")
@@ -709,6 +863,22 @@ func main() {
 	}
 
 	log.Println("Server stopped")
+}
+
+// publicationBuildSHA reports the build identifier stamped into Publication
+// records (spec §15 renderer/build provenance). Task 16E overrides it with
+// the git SHA via ldflags (-X main.ProductBuildSHA=...); until then it
+// defaults to the build version string (Task 7 contract).
+var ProductBuildSHA string
+
+func publicationBuildSHA() string {
+	if strings.TrimSpace(ProductBuildSHA) != "" {
+		return strings.TrimSpace(ProductBuildSHA)
+	}
+	if v := build.GetVersion(); v != "" {
+		return v
+	}
+	return "dev"
 }
 
 // checkVersionMigration checks if the software version has changed and performs migration tasks

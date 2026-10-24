@@ -1,0 +1,36 @@
+?   	github.com/jonradoff/lightcms/v7/cmd/addchat	[no test files]
+?   	github.com/jonradoff/lightcms/v7/cmd/addchat-spa	[no test files]
+?   	github.com/jonradoff/lightcms/v7/cmd/cli	[no test files]
+?   	github.com/jonradoff/lightcms/v7/cmd/mcp	[no test files]
+?   	github.com/jonradoff/lightcms/v7/cmd/migrate-hourly-bots	[no test files]
+?   	github.com/jonradoff/lightcms/v7/cmd/resetpw	[no test files]
+ok  	github.com/jonradoff/lightcms/v7/cmd/server	2.153s
+ok  	github.com/jonradoff/lightcms/v7/config	0.953s
+ok  	github.com/jonradoff/lightcms/v7/internal/apiclient	0.529s
+ok  	github.com/jonradoff/lightcms/v7/internal/auth	5.319s
+ok  	github.com/jonradoff/lightcms/v7/internal/build	0.430s
+ok  	github.com/jonradoff/lightcms/v7/internal/cli	0.485s
+ok  	github.com/jonradoff/lightcms/v7/internal/database	1.599s
+ok  	github.com/jonradoff/lightcms/v7/internal/dbutil	0.402s
+ok  	github.com/jonradoff/lightcms/v7/internal/errors	0.417s
+ok  	github.com/jonradoff/lightcms/v7/internal/handlers	184.613s
+ok  	github.com/jonradoff/lightcms/v7/internal/i18n	0.534s
+ok  	github.com/jonradoff/lightcms/v7/internal/jsonlog	0.400s
+ok  	github.com/jonradoff/lightcms/v7/internal/mcp	1.755s
+ok  	github.com/jonradoff/lightcms/v7/internal/middleware	0.423s
+ok  	github.com/jonradoff/lightcms/v7/internal/models	0.384s
+ok  	github.com/jonradoff/lightcms/v7/internal/oauth	12.519s
+ok  	github.com/jonradoff/lightcms/v7/internal/observe	0.401s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/e2e	24.048s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/generation	12.788s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/httpapi	4.226s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/idempotency	5.753s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/migration	16.191s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/pathkey	0.404s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/publication	17.743s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/publicurl	0.392s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/storage	1.453s
+ok  	github.com/jonradoff/lightcms/v7/internal/product/templatecontract	3.541s
+ok  	github.com/jonradoff/lightcms/v7/internal/services	21.071s
+ok  	github.com/jonradoff/lightcms/v7/internal/services/importer	0.482s
+?   	github.com/jonradoff/lightcms/v7/internal/testutil	[no test files]

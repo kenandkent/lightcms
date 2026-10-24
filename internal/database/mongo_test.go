@@ -2,6 +2,8 @@ package database
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +27,11 @@ func testDB(t *testing.T) *DB {
 		dbName := lookupEnv("DATABASE_NAME")
 		if dbName == "" {
 			dbName = "lightcms-test"
+		}
+		if !strings.Contains(strings.ToLower(dbName), "test") {
+			sharedTestErr = fmt.Errorf("REFUSING to run tests — database name %q does not contain 'test'. "+
+				"This safety guard prevents accidental use of production databases.", dbName)
+			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()

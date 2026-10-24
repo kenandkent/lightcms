@@ -268,7 +268,7 @@ func (a *APIHandler) APITriggerImportSource(w http.ResponseWriter, r *http.Reque
 		triggeredBy = user.Email
 	}
 
-	job, err := a.importService.RunRSSImport(r.Context(), id, triggeredBy)
+	job, err := a.importService.RunRSSImport(importAuthorityContext(r.Context(), a.getAPIUser(r)), id, triggeredBy)
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -334,7 +334,7 @@ func (a *APIHandler) APIImportMarkdown(w http.ResponseWriter, r *http.Request) {
 		triggeredBy = user.Email
 	}
 
-	job, err := a.importService.RunMarkdownImport(r.Context(), pages, body.DefaultTemplate, defaultFolder, body.AutoPublish, triggeredBy)
+	job, err := a.importService.RunMarkdownImport(importAuthorityContext(r.Context(), a.getAPIUser(r)), pages, body.DefaultTemplate, defaultFolder, body.AutoPublish, triggeredBy)
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -420,7 +420,7 @@ func (a *APIHandler) APIImportCSV(w http.ResponseWriter, r *http.Request) {
 		triggeredBy = user.Email
 	}
 
-	job, err := a.importService.RunCSVImport(r.Context(), records, columnMap, body.TitleColumn, body.SlugColumn, templateID, folderPath, body.AutoPublish, triggeredBy)
+	job, err := a.importService.RunCSVImport(importAuthorityContext(r.Context(), a.getAPIUser(r)), records, columnMap, body.TitleColumn, body.SlugColumn, templateID, folderPath, body.AutoPublish, triggeredBy)
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return

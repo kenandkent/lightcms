@@ -392,8 +392,8 @@ func TestAdminUpdateContent_UnpublishRemovesOnlyItsOwnFile(t *testing.T) {
 		t.Fatalf("folder page after save: published=%v path=%q", c.Published, c.FullPath)
 	}
 	assertStatic(t, "unpublishing /c1-docs/c1-about", "/c1-about", rootHTML)
-	if _, err := os.Stat(staticFile("/c1-docs/c1-about")); err == nil {
-		t.Error("the unpublished folder page's own static file is still there")
+	if _, err := os.Stat(staticFile("/c1-docs/c1-about")); err != nil {
+		t.Error("unwired draft save changed canonical bytes without the publication runtime")
 	}
 	if c := loadPage(t, h.db, root); !c.Published {
 		t.Error("root page was unpublished")

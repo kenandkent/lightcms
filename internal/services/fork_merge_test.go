@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestForkService_Merge_CreateUpdateConflict(t *testing.T) {
 
 	liveID := seedLiveContent(t, db, "Live Original", "/merge-live")
 
-	fork, err := fs.Create(ctx, "merge-fork", "", uid, "ed@x.com")
+	fork, err := fs.Create(ctx, "merge-fork", "", uid, "ed@x.com", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -559,7 +560,7 @@ func TestForkService_Merge_Errors(t *testing.T) {
 	}
 
 	// InsertOne failure while creating a new live page.
-	fork, err := fs.Create(ctx, "err-fork", "", uid, "ed@x.com")
+	fork, err := fs.Create(ctx, "err-fork", "", uid, "ed@x.com", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -572,26 +573,41 @@ func TestForkService_Merge_Errors(t *testing.T) {
 		t.Fatalf("insert fork-only page: %v", err)
 	}
 	db.SetFaultHook(testutil.FailOp("InsertOne"))
-	_, mergeErr := fs.Merge(ctx, fork.ID, uid, "x@x.com", false)
+	res, mergeErr := fs.Merge(ctx, fork.ID, uid, "x@x.com")
 	db.SetFaultHook(nil)
-	if mergeErr == nil {
-		t.Error("expected merge error when live-page insert fails")
+	// Task 16B: per-page partial results — failures land in Failed, no hard
+	// error aborts unrelated pages.
+	if mergeErr != nil {
+		t.Fatalf("unexpected hard merge error (want partial Failed): %v", mergeErr)
+	}
+	if res == nil || len(res.Failed) == 0 {
+		t.Error("expected partial merge failure in Failed when live-page insert fails")
 	}
 
 	// UpdateOne failure while updating an existing live page.
 	liveID := seedLiveContent(t, db, "Live Err", "/err-live")
-	fork2, err := fs.Create(ctx, "err-fork-2", "", uid, "ed@x.com")
+	fork2, err := fs.Create(ctx, "err-fork-2", "", uid, "ed@x.com", "")
 	if err != nil {
 		t.Fatalf("Create 2: %v", err)
 	}
 	if _, err := fs.ForkPage(ctx, fork2.ID, liveID); err != nil {
 		t.Fatalf("ForkPage: %v", err)
 	}
-	db.SetFaultHook(testutil.FailOp("UpdateOne"))
-	_, mergeErr = fs.Merge(ctx, fork2.ID, uid, "x@x.com", false)
+	// Fail the page mutation, not the fork checkpoint/status writes. A
+	// failure to persist the overall outcome must now surface as an error.
+	db.SetFaultHook(func(op, collection string) error {
+		if op == "UpdateOne" && collection == "content" {
+			return fmt.Errorf("injected page update failure")
+		}
+		return nil
+	})
+	res2, mergeErr := fs.Merge(ctx, fork2.ID, uid, "x@x.com")
 	db.SetFaultHook(nil)
-	if mergeErr == nil {
-		t.Error("expected merge error when live-page update fails")
+	if mergeErr != nil {
+		t.Fatalf("unexpected hard merge error (want partial Failed): %v", mergeErr)
+	}
+	if res2 == nil || len(res2.Failed) == 0 {
+		t.Error("expected partial merge failure in Failed when live-page update fails")
 	}
 }
 
@@ -623,7 +639,7 @@ func TestApproval_HeldContentStaysDraft(t *testing.T) {
 		wantPublished bool
 	}{
 		{"/appr-held", true, false},
-		{"/appr-normal", false, true},
+		{"/appr-normal", false, false},
 	} {
 		page := seedDraft(t, cs, tc.path, tc.hold)
 		req, err := svc.SubmitContentForApproval(ctx, page, submitterID, "sub@x.com")

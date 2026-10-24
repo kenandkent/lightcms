@@ -2,3 +2,4 @@
 bin/
 *.test
 internal/services/static/
+**/node_modules/

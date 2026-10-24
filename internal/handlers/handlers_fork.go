@@ -102,7 +102,7 @@ func (h *Handler) CreateFork(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	userID, _ := primitive.ObjectIDFromHex(user.ID)
-	fork, err := h.forkService.Create(ctx, name, description, userID, user.Email)
+	fork, err := h.forkService.Create(ctx, name, description, userID, user.Email, r.Header.Get("X-Agent-Session"))
 	if err != nil {
 		h.renderAdmin(w, r, "fork_form", map[string]interface{}{
 			"Error": fmt.Sprintf("Failed to create fork: %v", err),
@@ -327,6 +327,7 @@ func (h *Handler) MergeFork(w http.ResponseWriter, r *http.Request) {
 	// Publishing new pages writes versions; stamp who did it.
 	ctx := services.WithEditorEmail(r.Context(), user.Email)
 	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
+	ctx = services.WithAuthorIsAdmin(ctx, user.Role == models.RoleAdmin)
 	userID, _ := primitive.ObjectIDFromHex(user.ID)
 	result, err := h.forkService.Merge(ctx, forkID, userID, user.Email, publishNew)
 	if err != nil {

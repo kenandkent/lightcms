@@ -11,7 +11,7 @@ LightCMS ships with a dual-transport MCP server:
 - **Stdio** — for local tools like Claude Desktop and Claude Code running on the same machine
 - **Streamable HTTP** — for remote or sandboxed clients (Claude's Cowork, API agents, any MCP-compatible app)
 
-Both transports expose the same 92 tools and 3 prompt resources. Authentication is enforced on all operations — API keys for direct access, OAuth 2.1 for remote clients.
+Both transports expose the same 122 tools and 3 prompt resources (verified 2026-10-01 via live `tools/list`). Authentication is enforced on all operations — API keys for direct access, OAuth 2.1 for remote clients.
 
 This document is primarily aimed at developers building agentic workflows on top of LightCMS: bulk content pipelines, automated ingestion, site migrations, and AI-generated content publishing.
 
@@ -69,22 +69,25 @@ All `id` parameters in LightCMS MCP tools are **MongoDB ObjectIDs** — 24-chara
 
 ## 4. Available Tools
 
-92 tools total across 12 categories, plus 3 prompt resources.
+122 tools total across 15 categories, plus 3 prompt resources (counts verified 2026-10-01 against live `tools/list`).
 
 | Category | Count | Examples |
 |----------|-------|---------|
-| **Content** | 22 | create, read, update, delete, publish, unpublish, restore, versioning, bulk update, bulk field operation, export, backlinks |
-| **Templates** | 5 | list, get, create, update, delete |
+| **Content** | 19 | create, read, update, delete, publish, unpublish, restore, versioning, bulk update, bulk field operation, export, backlinks |
+| **Templates** | 6 | list, get, create, update, delete, get_template_schema |
 | **Snippets** | 5 | list, get, create, update, delete |
 | **Assets** | 6 | upload, upload from URL, get, delete, list files, list folders |
 | **Search** | 7 | full-text search, end-user search, search-replace (global + scoped, preview + execute), reindex embeddings |
 | **Settings** | 23 | theme CRUD + versioning + pinning, site config, redirects, folders, collections, regenerate all |
 | **Forks** | 8 | list, create, get, fork page, remove page, merge, archive, delete |
 | **Import** | 10 | list/create/update/delete/trigger import sources, import markdown, import CSV, list/get/cancel import jobs |
-| **Webhooks** | 6 | list, create, get, update, delete webhooks; regenerate secret |
+| **Webhooks** | 6 | list, create, get, update, delete webhooks; list deliveries; regenerate secret |
 | **Content Locking** | 4 | get lock, acquire lock, release lock, force-unlock |
 | **Scheduled Publishing** | 3 | schedule publish, list scheduled, cancel scheduled |
 | **Audit & Link Check** | 3 | get audit log, check links, list broken links |
+| **Approvals** | 11 | submit/approve/reject requests, workflow CRUD, list/get |
+| **Comments** | 3 | list, create, delete comments |
+| **Agent Sandbox & Governance** | 8 | sandbox sessions, session changes/rollback, fork diff, maintenance reports/scans |
 | **Prompt Resources** | 3 | `lightcms://site/structure`, `lightcms://content/recent`, `lightcms://theme/config` |
 
 ---

@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -71,26 +72,28 @@ func (db *DB) createIndexes(ctx context.Context) error {
 	// Drop the old unpartitioned index first (ignore error if it doesn't exist).
 	// Drop both the old single-field index and any previous partial-index attempts.
 	db.database.Collection("content").Indexes().DropOne(ctx, "full_path_1")
-	// Compound unique index on (full_path, fork_id).
-	// Live pages have no fork_id (stored as null); fork copies have an ObjectID.
-	// The compound key ensures live pages can't duplicate full_path, while a live
-	// page and its fork copy can share the same full_path without conflicting.
-	_, err := db.database.Collection("content").Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{
-			{Key: "full_path", Value: 1},
-			{Key: "fork_id", Value: 1},
-		},
-		Options: options.Index().SetUnique(true).SetSparse(true),
-	})
-	if err != nil {
-		return err
+	// Lane 2B: ensure the canonical uniqueness guard BEFORE dropping the
+	// legacy UNIQUE (full_path, fork_id) SPARSE guard. On legacy DBs with
+	// canonical collisions (case-variant paths sharing one canonical key)
+	// the canonical build fails with a duplicate-key error: keep serving
+	// degraded (legacy guard retained) so `migrate-publications --dry-run`
+	// can report the blockers instead of Connect failing the whole boot.
+	// The migration drops the legacy index after the canonical one is
+	// verified (Run step 8); the drop below is that same idempotent step
+	// for the healthy path. Task 16E (Task 14 migration contract): Connect
+	// must NOT recreate the legacy index on restart, or the migration's
+	// post-condition breaks.
+	if err := db.ensureCanonicalContentIndex(ctx); err != nil {
+		log.Printf("WARNING: canonical content index unavailable — serving degraded without canonical uniqueness (run `lightcms migrate-publications --dry-run` for blockers): %v", err)
+	} else {
+		db.database.Collection("content").Indexes().DropOne(ctx, "full_path_1_fork_id_1")
 	}
 
 	// Drop old unique slug index if it exists (we're changing it to non-unique)
 	db.database.Collection("content").Indexes().DropOne(ctx, "slug_1")
 
 	// Content slug index (non-unique now, since same slug can be in different folders)
-	_, err = db.database.Collection("content").Indexes().CreateOne(ctx, mongo.IndexModel{
+	_, err := db.database.Collection("content").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "slug", Value: 1}},
 	})
 	if err != nil {
@@ -463,6 +466,237 @@ func (db *DB) Disconnect(ctx context.Context) error {
 	return db.client.Disconnect(ctx)
 }
 
+// DatabaseName returns the underlying Mongo database name. Used by test
+// guards to refuse destructive cleanup against non-test databases.
+func (db *DB) DatabaseName() string {
+	return db.database.Name()
+}
+
+// WithTransaction executes fn inside a Mongo multi-document transaction.
+// Callers must run against a replica set (standalone mongod cannot run
+// transactions). Repository methods called inside fn accept the
+// mongo.SessionContext as a context.Context and must not open nested
+// transactions.
+type transactionContextKey struct{}
+type transactionEffects struct {
+	db        *DB
+	callbacks []func(context.Context)
+}
+
+// AfterCommit defers non-transactional effects until the outer transaction commits.
+// Callbacks from aborted or retried attempts are discarded.
+func (db *DB) AfterCommit(ctx context.Context, fn func(context.Context)) {
+	if effects, ok := ctx.Value(transactionContextKey{}).(*transactionEffects); ok && effects.db == db {
+		effects.callbacks = append(effects.callbacks, fn)
+		return
+	}
+	fn(ctx)
+}
+
+func (db *DB) WithTransaction(ctx context.Context, fn func(mongo.SessionContext) error) error {
+	if effects, ok := ctx.Value(transactionContextKey{}).(*transactionEffects); ok && effects.db == db {
+		return fn(mongo.NewSessionContext(ctx, mongo.SessionFromContext(ctx)))
+	}
+	// An unmanaged session cannot provide an after-commit boundary. Refuse to
+	// silently start another transaction or emit effects before its commit.
+	if mongo.SessionFromContext(ctx) != nil {
+		return fmt.Errorf("transaction composition requires DB.WithTransaction")
+	}
+	sess, err := db.client.StartSession()
+	if err != nil {
+		return err
+	}
+	defer sess.EndSession(ctx)
+	var effects *transactionEffects
+	_, err = sess.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+		effects = &transactionEffects{db: db}
+		return nil, fn(mongo.NewSessionContext(context.WithValue(sc, transactionContextKey{}, effects), sess))
+	})
+	if err == nil && effects != nil {
+		for _, callback := range effects.callbacks {
+			callback(ctx)
+		}
+	}
+	return err
+}
+
+// EnsureProductIndexes creates the V3 product indexes as an explicit
+// post-migration step. It is NOT called from Connect: Task 14 remediates
+// legacy collisions (canonical case variants, duplicate slugs/versions,
+// missing files) before invoking it. It does NOT drop the legacy
+// UNIQUE(full_path, fork_id) index; Task 14 drops that only after the new
+// canonical index is verified.
+// ensureCanonicalContentIndex creates the Task 2 canonical uniqueness
+// index — UNIQUE(canonical_full_path, path_scope) with partial filter
+// {path_active: true} — when missing. Same model as EnsureProductIndexes
+// item 1 (same name: CreateOne is idempotent). Called by createIndexes so
+// every boot enforces canonical uniqueness even before the full product
+// index set is ensured; legacy rows without canonical fields are excluded
+// by the partial filter and never conflict.
+func (db *DB) ensureCanonicalContentIndex(ctx context.Context) error {
+	_, err := db.database.Collection("content").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "canonical_full_path", Value: 1}, {Key: "path_scope", Value: 1}},
+		Options: options.Index().
+			SetName("content_canonical_path_scope_unique").
+			SetUnique(true).
+			SetPartialFilterExpression(bson.M{"path_active": true}),
+	})
+	return err
+}
+
+// IsReplicaSet reports whether the connected MongoDB topology supports
+// multi-document transactions (spec: production AND test must run replica
+// set mode). It runs the hello command and requires a replica set name.
+func (db *DB) IsReplicaSet(ctx context.Context) (bool, error) {
+	var hello struct {
+		SetName string `bson:"setName"`
+		Msg     string `bson:"msg"`
+	}
+	if err := db.database.RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello); err != nil {
+		return false, err
+	}
+	return hello.SetName != "", nil
+}
+
+func (db *DB) EnsureProductIndexes(ctx context.Context) error {
+	create := func(collection string, model mongo.IndexModel) error {
+		_, err := db.database.Collection(collection).Indexes().CreateOne(ctx, model)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// 1. Content canonical path: UNIQUE(canonical_full_path, path_scope)
+	// with partialFilter {path_active: true}. Live rows use path_scope
+	// "live"; fork copies use their fork ObjectID hex so a fork can share
+	// the live key while the same fork cannot duplicate it.
+	if err := create("content", mongo.IndexModel{
+		Keys: bson.D{{Key: "canonical_full_path", Value: 1}, {Key: "path_scope", Value: 1}},
+		Options: options.Index().
+			SetName("content_canonical_path_scope_unique").
+			SetUnique(true).
+			SetPartialFilterExpression(bson.M{"path_active": true}),
+	}); err != nil {
+		return err
+	}
+
+	// 2. Content versions: UNIQUE(content_id, version) for CAS allocation.
+	if err := create("content_versions", mongo.IndexModel{
+		Keys:    bson.D{{Key: "content_id", Value: 1}, {Key: "version", Value: 1}},
+		Options: options.Index().SetName("content_versions_content_id_version_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+
+	// 3. Templates: unique slug (migration remediates empty/duplicate/
+	// illegal/case-conflicting slugs first; see spec §34.1/§35.1).
+	if err := create("templates", mongo.IndexModel{
+		Keys:    bson.D{{Key: "slug", Value: 1}},
+		Options: options.Index().SetName("templates_slug_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+
+	// 4. Template versions: UNIQUE(template_id, version) plus query indexes.
+	if err := create("template_versions", mongo.IndexModel{
+		Keys:    bson.D{{Key: "template_id", Value: 1}, {Key: "version", Value: 1}},
+		Options: options.Index().SetName("template_versions_template_id_version_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+	if err := create("template_versions", mongo.IndexModel{
+		Keys:    bson.D{{Key: "template_id", Value: 1}, {Key: "created_at", Value: -1}},
+		Options: options.Index().SetName("template_versions_template_id_created_at"),
+	}); err != nil {
+		return err
+	}
+	if err := create("template_versions", mongo.IndexModel{
+		Keys:    bson.D{{Key: "slug", Value: 1}, {Key: "version", Value: -1}},
+		Options: options.Index().SetName("template_versions_slug_version"),
+	}); err != nil {
+		return err
+	}
+
+	// 5. Publications: partial unique active pointer + query indexes
+	// (spec §15.5/§15.8). The {content_id, status} partial unique IS the
+	// content_id+status index: exactly one active per content.
+	if err := create("content_publications", mongo.IndexModel{
+		Keys: bson.D{{Key: "content_id", Value: 1}, {Key: "status", Value: 1}},
+		Options: options.Index().
+			SetName("content_publications_active_unique").
+			SetUnique(true).
+			SetPartialFilterExpression(bson.M{"status": "active"}),
+	}); err != nil {
+		return err
+	}
+	if err := create("content_publications", mongo.IndexModel{
+		Keys:    bson.D{{Key: "content_id", Value: 1}, {Key: "activated_at", Value: -1}},
+		Options: options.Index().SetName("content_publications_content_activated"),
+	}); err != nil {
+		return err
+	}
+	if err := create("content_publications", mongo.IndexModel{
+		Keys:    bson.D{{Key: "template_version_id", Value: 1}},
+		Options: options.Index().SetName("content_publications_template_version"),
+	}); err != nil {
+		return err
+	}
+	if err := create("content_publications", mongo.IndexModel{
+		Keys:    bson.D{{Key: "content_hash", Value: 1}},
+		Options: options.Index().SetName("content_publications_hash"),
+	}); err != nil {
+		return err
+	}
+	if err := create("content_publications", mongo.IndexModel{
+		Keys:    bson.D{{Key: "created_at", Value: 1}},
+		Options: options.Index().SetName("content_publications_created"),
+	}); err != nil {
+		return err
+	}
+
+	// 6. Idempotency: UNIQUE(owner, method, path, key) + TTL(expires_at).
+	if err := create("idempotency_records", mongo.IndexModel{
+		Keys:    bson.D{{Key: "owner", Value: 1}, {Key: "method", Value: 1}, {Key: "path", Value: 1}, {Key: "key", Value: 1}},
+		Options: options.Index().SetName("idempotency_owner_method_path_key_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+	if err := create("idempotency_records", mongo.IndexModel{
+		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Options: options.Index().SetName("idempotency_expires_ttl").SetExpireAfterSeconds(0),
+	}); err != nil {
+		return err
+	}
+
+	// 7. Outbox: UNIQUE(event_type, aggregate_id) where aggregate_id is the
+	// publication ID (spec §28.1), plus a worker polling index.
+	if err := create("webhook_outbox", mongo.IndexModel{
+		Keys:    bson.D{{Key: "event_type", Value: 1}, {Key: "aggregate_id", Value: 1}},
+		Options: options.Index().SetName("webhook_outbox_event_aggregate_unique").SetUnique(true),
+	}); err != nil {
+		return err
+	}
+	if err := create("webhook_outbox", mongo.IndexModel{
+		Keys:    bson.D{{Key: "state", Value: 1}, {Key: "next_attempt_at", Value: 1}},
+		Options: options.Index().SetName("webhook_outbox_state_next"),
+	}); err != nil {
+		return err
+	}
+
+	// 8. Forks: sandbox resolver lookup {created_by, agent_session, status}
+	// runs per mode=sandbox request — index it (R09). Small collection;
+	// safe to build inline.
+	if err := create("content_forks", mongo.IndexModel{
+		Keys:    bson.D{{Key: "created_by", Value: 1}, {Key: "agent_session", Value: 1}, {Key: "status", Value: 1}},
+		Options: options.Index().SetName("content_forks_owner_session_status"),
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Template operations
 func (db *DB) Templates() *mongo.Collection {
 	return db.database.Collection("templates")
@@ -520,11 +754,11 @@ func (db *DB) InsertManyUnordered(ctx context.Context, collection string, docs [
 	return db.database.Collection(collection).InsertMany(ctx, docs, opts)
 }
 
-func (db *DB) FindOne(ctx context.Context, collection string, filter interface{}, result interface{}) error {
+func (db *DB) FindOne(ctx context.Context, collection string, filter interface{}, result interface{}, opts ...*options.FindOneOptions) error {
 	if err := db.fault("FindOne", collection); err != nil {
 		return err
 	}
-	return db.database.Collection(collection).FindOne(ctx, filter).Decode(result)
+	return db.database.Collection(collection).FindOne(ctx, filter, opts...).Decode(result)
 }
 
 func (db *DB) FindMany(ctx context.Context, collection string, filter interface{}, opts ...*options.FindOptions) (*mongo.Cursor, error) {
@@ -562,6 +796,21 @@ func (db *DB) UpdateOne(ctx context.Context, collection string, filter, update i
 	}
 	_, err := db.database.Collection(collection).UpdateOne(ctx, filter, update)
 	return err
+}
+
+// UpdateOneMatched performs an UpdateOne and reports the matched count so
+// callers can implement compare-and-swap (0 matches = lost race). It
+// consults the same "UpdateOne" fault hook as UpdateOne, so fault-injection
+// tests keep exercising the write-failure branches.
+func (db *DB) UpdateOneMatched(ctx context.Context, collection string, filter, update interface{}) (int64, error) {
+	if err := db.fault("UpdateOne", collection); err != nil {
+		return 0, err
+	}
+	res, err := db.database.Collection(collection).UpdateOne(ctx, filter, update)
+	if err != nil {
+		return 0, err
+	}
+	return res.MatchedCount, nil
 }
 
 func (db *DB) DeleteOne(ctx context.Context, collection string, filter interface{}) error {
@@ -712,6 +961,54 @@ func (db *DB) GetThemeVersion(ctx context.Context, version int) (*ThemeVersion, 
 		return nil, err
 	}
 	return &v, nil
+}
+
+// NextThemeVersion atomically allocates the next theme version number
+// (Lane 2C fix 4). Count-based allocation (read count, insert count+1) lets
+// concurrent writers read the same count and insert duplicate version
+// numbers, forking the version chain. The counters collection serializes
+// allocation in a single atomic update: $max seeds the counter from
+// pre-existing rows (legacy count-based versions, EnsureThemeVersion1)
+// so the chain stays strictly increasing across the migration, then $inc
+// hands out a unique number. Concurrent callers serialize in Mongo and
+// always receive distinct, increasing values.
+func (db *DB) NextThemeVersion(ctx context.Context) (int, error) {
+	maxV := 0
+	var top struct {
+		Version int `bson:"version"`
+	}
+	err := db.ThemeVersions().FindOne(ctx, bson.M{},
+		options.FindOne().SetSort(bson.D{{Key: "version", Value: -1}}).SetProjection(bson.M{"version": 1}),
+	).Decode(&top)
+	if err != nil && err != mongo.ErrNoDocuments {
+		return 0, err
+	}
+	if err == nil {
+		maxV = top.Version
+	}
+	var c struct {
+		Seq int `bson:"seq"`
+	}
+	// NOTE: $max and $inc cannot share one update (ConflictingUpdateOperators),
+	// so seeding and allocation are two atomic ops. Both converge under
+	// concurrency: $max only ever raises the counter toward the observed
+	// row max (idempotent), and $inc hands out distinct values.
+	counters := db.Collection("counters")
+	if _, err := counters.UpdateOne(ctx,
+		bson.M{"_id": "theme_version"},
+		bson.M{"$max": bson.M{"seq": maxV}},
+		options.Update().SetUpsert(true),
+	); err != nil {
+		return 0, err
+	}
+	if err := counters.FindOneAndUpdate(ctx,
+		bson.M{"_id": "theme_version"},
+		bson.M{"$inc": bson.M{"seq": 1}},
+		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
+	).Decode(&c); err != nil {
+		return 0, err
+	}
+	return c.Seq, nil
 }
 
 // GetThemeVersionCount returns the number of theme versions

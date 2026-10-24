@@ -1406,6 +1406,7 @@ func TestAPISearchReplaceExecute_EmptySearch(t *testing.T) {
 	req := authReq(http.MethodPost, "/api/v1/content/search-replace/execute",
 		strings.NewReader(`{"search":"","replace":"bar"}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "k-sre-empty")
 	ah.APISearchReplaceExecute(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
@@ -1423,6 +1424,7 @@ func TestAPISearchReplaceExecute_ValidSearch(t *testing.T) {
 	req := authReq(http.MethodPost, "/api/v1/content/search-replace/execute",
 		strings.NewReader(`{"search":"Execute Replace","replace":"Done Replace","dry_run":true}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "k-sre-valid")
 	ah.APISearchReplaceExecute(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d; body: %s", rr.Code, rr.Body.String())
@@ -1437,6 +1439,7 @@ func TestAPISearchReplaceExecute_InvalidBody(t *testing.T) {
 	req := authReq(http.MethodPost, "/api/v1/content/search-replace/execute",
 		strings.NewReader(`not-json`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "k-sre-badbody")
 	ah.APISearchReplaceExecute(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
@@ -1592,6 +1595,7 @@ func TestAPIScopedSearchReplaceExecute_EmptySearch(t *testing.T) {
 	req := authReq(http.MethodPost, "/api/v1/content/scoped-search-replace/execute",
 		strings.NewReader(`{"search":"","replace":"bar","content_ids":["`+primitive.NewObjectID().Hex()+`"]}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "k-ssre-empty")
 	ah.APIScopedSearchReplaceExecute(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
@@ -1610,6 +1614,7 @@ func TestAPIScopedSearchReplaceExecute_ValidRequest(t *testing.T) {
 	req := authReq(http.MethodPost, "/api/v1/content/scoped-search-replace/execute",
 		strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "k-ssre-valid")
 	ah.APIScopedSearchReplaceExecute(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d; body: %s", rr.Code, rr.Body.String())

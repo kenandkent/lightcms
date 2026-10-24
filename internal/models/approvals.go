@@ -18,6 +18,12 @@ type ContentComment struct {
 	Text            string               `bson:"text" json:"text"`
 	Mentions        []primitive.ObjectID `bson:"mentions,omitempty" json:"mentions,omitempty"`
 	CreatedAt       time.Time            `bson:"created_at" json:"created_at"`
+	// Provenance: who or what authored this comment ( Lane 2C fix 2).
+	// Stamped from the request context following the content version-row
+	// pattern; Actor defaults to "human" for legacy paths.
+	Actor        string `bson:"actor,omitempty" json:"actor,omitempty"`                 // "human" | "agent"
+	Via          string `bson:"via,omitempty" json:"via,omitempty"`                     // "ui" | "api" | "copilot"
+	AgentSession string `bson:"agent_session,omitempty" json:"agent_session,omitempty"` // agent session ID when Actor == "agent"
 }
 
 // ApprovalWorkflow configures an approval chain for matching content.
@@ -62,6 +68,9 @@ type ApprovalDecision struct {
 // Collection: "approval_requests"
 // Indexes: {content_id}, {status,created_at desc}, {"approvers.user_id",status}, {workflow_id}
 type ApprovalRequest struct {
+	SnapshotVersion  int                 `bson:"snapshot_version,omitempty" json:"snapshot_version,omitempty"`
+	ContentVersion   int64               `bson:"content_version,omitempty" json:"content_version,omitempty"`
+	WorkflowMode     string              `bson:"workflow_mode,omitempty" json:"workflow_mode,omitempty"`
 	ID               primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
 	ContentID        primitive.ObjectID  `bson:"content_id" json:"content_id"`
 	ContentTitle     string              `bson:"content_title" json:"content_title"`

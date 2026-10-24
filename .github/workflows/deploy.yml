@@ -1,0 +1,387 @@
+# Build → test → deploy to 167.114.210.84.
+#
+# Triggers:
+#   - push to main ............ quick gate (build+vet) then tests+image in
+#                               PARALLEL, then deploy when both are green
+#   - workflow_dispatch ....... manual redeploy / rollback to any image tag
+#     (set image_tag, e.g. a previous git SHA; build+test are skipped)
+#
+# Required GitHub Secrets (repo Settings → Secrets and variables → Actions):
+#   SSH_PRIVATE_KEY .... deploy ed25519 private key (pub installed in
+#                        root@167.114.210.84:~/.ssh/authorized_keys)
+#   PROD_BASE_URL ...... public origin, MUST be https (R12 fail-fasts
+#                        otherwise), e.g. https://news.example.com
+#   PROD_SESSION_SECRET  32+ chars server secret (rotation orphans sealed
+#                        API keys — they must then be recreated)
+# Optional (empty = feature disabled, deploy still proceeds):
+#   ANTHROPIC_API_KEY .. admin copilot + chat answer synthesis
+#   RESEND_API_KEY ..... CMS Agent digest email (needs EMAIL_FROM too)
+#   EMAIL_FROM ......... sender address for digests
+#
+# No other setup is needed on first run: the deploy step creates
+# /opt/lightcms, writes docker-compose.prod.yml + .env from this repo and
+# the secrets above, pulls, migrates (boot-time guards), and switches.
+
+name: build-test-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Redeploy an existing image tag (rollback); empty = build from this commit"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+  # Required by docker/build-push-action cache-to/from type=gha: without it
+  # the cache backend 403s and fails the whole image build.
+  actions: write
+
+# A newer push cancels the in-flight run and only the latest proceeds:
+# stale code must never deploy after fresh code. (A deploy step killed
+# mid-switch is safe — `compose up` is idempotent and the winner's health
+# gate re-verifies before the job can go green.)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/kenandkent/lightcms
+  GO_VERSION: "1.25"
+
+jobs:
+  # Fast gate (~1-2 min): compile errors fail here instead of burning the
+  # 5-8 min image build or the 4-5 min test suite.
+  quick:
+    if: inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build all binaries
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  # Long poles run in PARALLEL behind the gate; deploy needs both green.
+  # A failure in either blocks deploy (the sibling runs to completion but
+  # deploys nothing — GitHub has no cross-job kill).
+  tests:
+    if: inputs.image_tag == ''
+    needs: quick
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Unit tests need a replica-set Mongo (transactions). Single-node
+      # rs0 mirrors docker-compose.test.yml.
+      - name: Start MongoDB replica set
+        run: |
+          docker run -d --name mongo-ci -p 27017:27017 mongo:7.0.14 \
+            --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            if docker exec mongo-ci mongosh --quiet --eval 'try { rs.status().ok } catch(e) { rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]}); 1 }' 2>/dev/null | grep -q 1; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec mongo-ci mongosh --quiet --eval 'rs.status().ok'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: workers/report-static/package-lock.json
+
+      - name: Native static assets compatibility gate
+        run: |
+          npm --prefix workers/report-static ci
+          npm --prefix workers/report-static test
+          mkdir -p .native-fixtures
+          STATIC_DELIVERY_NATIVE_FIXTURE="$PWD/.native-fixtures/legacy.json" STATIC_DELIVERY_ASSETS_ONLY_FIXTURE="$PWD/.native-fixtures/assets-only.json" go test ./internal/product/staticdelivery -run '^TestAssetsFirstReleaseCarriesNativeRoutingConfig$' -count=1
+          STATIC_DELIVERY_MINIFLARE_ROOT="$PWD/workers/report-static" STATIC_DELIVERY_NATIVE_FIXTURE="$PWD/.native-fixtures/legacy.json" npm --prefix workers/report-static run test:native
+          STATIC_DELIVERY_MINIFLARE_ROOT="$PWD/workers/report-static" STATIC_DELIVERY_NATIVE_FIXTURE="$PWD/.native-fixtures/assets-only.json" npm --prefix workers/report-static run test:native
+
+      - name: Unit tests (full suite, single package at a time)
+        env:
+          MONGODB_URI: mongodb://127.0.0.1:27017/lightcms-test?replicaSet=rs0&directConnection=true
+          STATIC_DELIVERY_TEST_MONGODB_URI: mongodb://127.0.0.1:27017/lightcms-delivery-test?replicaSet=rs0&directConnection=true
+          STATIC_DELIVERY_REQUIRE_MONGO: "1"
+        run: |
+          # Stream to the step log AND keep a copy: on failure the culprits
+          # print at the tail (no scrolling) and as ::error:: annotations,
+          # which is what populates this step's "Error" section (annotations
+          # emitted by any other step show up under that step instead).
+          go test -p 1 ./... -count=1 2>&1 | tee unit-tests.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo "---- failing tests/packages (full log: unit-tests.log artifact) ----"
+            grep -E '^(--- FAIL|FAIL[[:space:]]|panic:)' unit-tests.log | head -40 || true
+            python3 - <<'EOF'
+          import re
+          seen = set()
+          with open("unit-tests.log", errors="replace") as f:
+              for line in f:
+                  m = re.match(r'^(FAIL|panic:)\s*(\S+)?', line)
+                  if m and line not in seen:
+                      seen.add(line)
+                      print(f"::error::{line.strip()}")
+                      continue
+                  m = re.match(r'^\s*--- FAIL: (\S+)', line)
+                  if m and m.group(1) not in seen:
+                      seen.add(m.group(1))
+                      print(f"::error::test FAILED: {m.group(1)}")
+          EOF
+          fi
+          exit "$status"
+
+      - name: Upload full test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-tests-log
+          path: unit-tests.log
+          retention-days: 7
+
+  image:
+    if: inputs.image_tag == ''
+    needs: quick
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Default runner builder uses the docker driver, which cannot export
+      # cache (cache-to type=gha fails fast). docker-container driver fixes it.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }},${{ env.IMAGE_NAME }}:latest
+          build-args: GIT_SHA=${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # build-push-action failures surface only inside its own step log;
+      # this companion pins the cause next to it and in this job's Error box.
+      - name: Diagnose image build failure
+        if: failure()
+        run: |
+          echo "::error::image build failed for tag ${{ steps.meta.outputs.tag }} — full error is in the 'build-push-action' step log above; runner diagnostics follow"
+          echo "---- builder ----"
+          docker buildx ls 2>&1 | head -10 || true
+          echo "---- disk ----"
+          df -h / /tmp 2>/dev/null || true
+          {
+            echo "## image job: FAILED"
+            echo "tag: ${{ steps.meta.outputs.tag }}"
+            echo "See the build-push-action step log for the buildx error."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: [tests, image]
+    if: always() && (needs.tests.result == 'success' && needs.image.result == 'success' || inputs.image_tag != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || needs.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate release inputs
+        env:
+          PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
+        run: |
+          if [ -z "$PROD_BASE_URL" ]; then
+            echo "::error::PROD_BASE_URL secret is empty — set the public https origin first."
+            exit 1
+          fi
+          case "$PROD_BASE_URL" in
+            https://*) ;;
+            *) echo "::error::PROD_BASE_URL must be https (got $PROD_BASE_URL) — the server fail-fasts otherwise (R12)."; exit 1 ;;
+          esac
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "::error::SSH_PRIVATE_KEY secret is empty."
+            exit 1
+          fi
+          if [ -z "${{ secrets.PROD_SESSION_SECRET }}" ]; then
+            echo "::error::PROD_SESSION_SECRET secret is empty (32+ chars)."
+            exit 1
+          fi
+
+      - name: Sync compose file to server
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lightcms_deploy
+          chmod 600 ~/.ssh/lightcms_deploy
+          ssh -i ~/.ssh/lightcms_deploy -o StrictHostKeyChecking=accept-new \
+            root@167.114.210.84 'mkdir -p /opt/lightcms/backups'
+          scp -i ~/.ssh/lightcms_deploy -o StrictHostKeyChecking=accept-new \
+            docker-compose.prod.yml root@167.114.210.84:/opt/lightcms/docker-compose.prod.yml
+          rm -f ~/.ssh/lightcms_deploy
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
+          PROD_SESSION_SECRET: ${{ secrets.PROD_SESSION_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          GH_IMAGE: ${{ env.IMAGE_NAME }}
+          GH_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: 167.114.210.84
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 15m
+          envs: IMAGE_TAG,PROD_BASE_URL,PROD_SESSION_SECRET,ANTHROPIC_API_KEY,RESEND_API_KEY,EMAIL_FROM,GH_IMAGE,GH_USER,GH_TOKEN
+          script: |
+            set -euo pipefail
+            mkdir -p /opt/lightcms/backups
+            cd /opt/lightcms
+            # --- .env from secrets (server holds no bespoke files; the
+            # compose file itself was synced by the previous step) ---
+            cat > .env <<ENV_EOF
+            MONGO_URI=mongodb://mongo:27017/lightcms?replicaSet=rs0
+            SESSION_SECRET=${PROD_SESSION_SECRET}
+            BASE_URL=${PROD_BASE_URL}
+            PUBLIC_BASE_URL=${PROD_BASE_URL}
+            ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+            RESEND_API_KEY=${RESEND_API_KEY:-}
+            EMAIL_FROM=${EMAIL_FROM:-}
+            ENV_EOF
+            chmod 600 .env
+            # --- safety backup (best effort, never blocks the deploy) ---
+            if docker compose -f docker-compose.prod.yml ps --status running 2>/dev/null | grep -q lightcms-mongo; then
+              TS=$(date +%Y%m%d-%H%M%S)
+              docker compose -f docker-compose.prod.yml exec -T mongo \
+                mongodump --out /dump/"$TS" >/dev/null 2>&1 || echo "backup skipped/failed (continuing)"
+              ls -dt /opt/lightcms/backups/*/ 2>/dev/null | tail -n +8 | xargs -r rm -rf
+              echo "backup step done"
+            else
+              echo "no running mongo yet — first boot, skipping backup"
+            fi
+            # --- switch ---
+            # GHCR login uses the job's short-lived GITHUB_TOKEN (no extra
+            # secret needed); always logout afterwards so no credential
+            # lingers on the box. Required when the image is private;
+            # harmless when it is public.
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin
+            echo "$GH_IMAGE:$IMAGE_TAG" > .image_tag
+            IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.prod.yml pull app
+            docker logout ghcr.io >/dev/null 2>&1 || true
+            # Immutable publication objects used to live in the app writable
+            # layer. Copy them once before replacing that container; otherwise
+            # recovery/rollback loses the objects even though Mongo is intact.
+            docker volume create lightcms-publications-data >/dev/null
+            if docker container inspect lightcms-app >/dev/null 2>&1; then
+              PUB_MOUNT=$(docker inspect lightcms-app --format '{{range .Mounts}}{{if eq .Destination "/app/content/publications"}}{{.Name}}{{end}}{{end}}')
+              if [ -z "$PUB_MOUNT" ]; then
+                # Freeze writers before the final archive. docker cp also
+                # reads stopped containers; an unexpected/missing source is
+                # a hard failure, never permission to replace it empty.
+                PUB_WAS_RUNNING=$(docker inspect lightcms-app --format '{{.State.Running}}')
+                if [ "$PUB_WAS_RUNNING" = "true" ]; then
+                  docker stop --time 30 lightcms-app >/dev/null
+                  trap 'docker start lightcms-app >/dev/null 2>&1 || true' EXIT
+                fi
+                CONTENT_DIRS=$(docker cp lightcms-app:/app/content - | tar -tf -)
+                if printf '%s\n' "$CONTENT_DIRS" | grep -Eq '^content/publications(/|$)'; then
+                  docker cp lightcms-app:/app/content/publications - | \
+                  docker run --rm -i --network none --entrypoint tar \
+                    --mount type=volume,src=lightcms-publications-data,dst=/publications \
+                    mongo:7.0.14 -xf - --strip-components=1 -C /publications
+                else
+                  # Legacy installations may have no Publication records or
+                  # directory yet. Verify this explicitly, not via a failed
+                  # docker exec test. Any archive/database read error aborts.
+                  PUB_COUNT=$(docker exec lightcms-mongo mongosh --quiet --eval 'print(db.getSiblingDB("lightcms").content_publications.countDocuments({}))')
+                  if [ "$PUB_COUNT" != "0" ]; then
+                    echo "publication directory missing with retained records; refusing switch"
+                    exit 1
+                  fi
+                fi
+              elif [ -n "$PUB_MOUNT" ] && [ "$PUB_MOUNT" != "lightcms-publications-data" ]; then
+                echo "unexpected publication volume: $PUB_MOUNT; refusing data switch"
+                exit 1
+              fi
+            fi
+            IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            trap - EXIT
+            # --- health gate (fail the job if the app never becomes healthy) ---
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8082/health >/dev/null 2>&1; then
+                echo "health OK"
+                break
+              fi
+              if [ "$i" = "30" ]; then
+                echo "health check failed; recent logs:"
+                docker compose -f docker-compose.prod.yml logs --tail=50 app || true
+                exit 1
+              fi
+              sleep 5
+            done
+            # --- smoke test ---
+            curl -fsS http://127.0.0.1:8082/ -o /dev/null
+            curl -s -o /dev/null -w "cm=%{http_code}\n" http://127.0.0.1:8082/cm
+            echo "deployed $GH_IMAGE:$IMAGE_TAG"
+
+      # Deploy-step failures hide server-side causes; pull them here so the
+      # Error box and the log name the culprit (stale containers keep
+      # serving — a failed deploy never takes the site down by itself).
+      - name: Dump server diagnostics on failure
+        if: failure()
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lightcms_diag
+          chmod 600 ~/.ssh/lightcms_diag
+          echo "::error::deploy failed for image tag ${{ env.IMAGE_TAG }} — server state follows"
+          ssh -i ~/.ssh/lightcms_diag -o StrictHostKeyChecking=accept-new \
+            root@167.114.210.84 \
+            'cd /opt/lightcms 2>/dev/null && docker compose -f docker-compose.prod.yml ps; echo "---- app logs (tail) ----"; docker compose -f docker-compose.prod.yml logs --tail=80 app 2>&1; echo "---- disk ----"; df -h / | tail -1' || \
+            echo "::error::diagnostics SSH itself failed — check SSH_PRIVATE_KEY / server reachability"
+          rm -f ~/.ssh/lightcms_diag
+          {
+            echo "## deploy job: FAILED"
+            echo "image tag: ${{ env.IMAGE_TAG }}"
+            echo "Server compose state + app log tail are in this step's log."
+          } >> "$GITHUB_STEP_SUMMARY"

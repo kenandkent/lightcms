@@ -1,0 +1,39 @@
+# Example nginx front for LightCMS on 167.114.210.84.
+# The box already runs its own nginx (currently on 19443, NOT 80/443 — both
+# 80 and 443 are free as of 2026-10-08). Integrate ONE of the options below
+# into the existing nginx setup; do not fight it for ports.
+#
+# Install: cp to /etc/nginx/sites-enabled/lightcms.conf (adjust to the
+# box's layout), replace YOUR_DOMAIN, reload nginx, then get TLS, e.g.:
+#   certbot --nginx -d YOUR_DOMAIN
+#
+# The app listens on 127.0.0.1:8082 (docker-compose.prod.yml). Social
+# cards (og:image etc.) REQUIRE the public origin to be absolute https —
+# that is what PROD_BASE_URL must match, or the app refuses to boot (R12).
+
+upstream lightcms {
+    server 127.0.0.1:8082;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name YOUR_DOMAIN;
+
+    # ACME challenge for certbot (keep reachable on plain http).
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        proxy_pass http://lightcms;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+    }
+}
+# After certbot: it will add the 443 block itself. Nothing else needed —
+# the app serves everything (site, /cm admin, /api/v1, /health) on 8082.

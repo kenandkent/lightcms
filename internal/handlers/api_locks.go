@@ -75,12 +75,12 @@ func (a *APIHandler) APIAcquireContentLock(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	existing, err := a.lockService.AcquireLock(r.Context(), contentID, userID, user.Email)
+	existing, acquired, err := a.lockService.AcquireLease(r.Context(), contentID, userID, user.Email)
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if existing != nil {
+	if !acquired {
 		// Another user holds the lock
 		a.jsonResponse(w, http.StatusConflict, map[string]interface{}{
 			"locked":      true,
@@ -92,8 +92,9 @@ func (a *APIHandler) APIAcquireContentLock(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	a.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"locked":  true,
-		"message": "lock acquired",
+		"locked":      true,
+		"lease_token": existing.Token,
+		"message":     "lock acquired",
 	})
 }
 
@@ -124,7 +125,12 @@ func (a *APIHandler) APIReleaseContentLock(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := a.lockService.ReleaseLock(r.Context(), contentID, userID); err != nil {
+	if token := r.Header.Get("X-Content-Lock-Token"); token != "" {
+		err = a.lockService.ReleaseLease(r.Context(), contentID, userID, token)
+	} else {
+		err = a.lockService.ReleaseLock(r.Context(), contentID, userID)
+	}
+	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

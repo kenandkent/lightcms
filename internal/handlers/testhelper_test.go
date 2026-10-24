@@ -95,7 +95,10 @@ func loadTestEnv(t *testing.T) {
 					continue
 				}
 				if idx := strings.IndexByte(line, '='); idx > 0 {
-					os.Setenv(strings.TrimSpace(line[:idx]), strings.TrimSpace(line[idx+1:]))
+					key := strings.TrimSpace(line[:idx])
+					if _, explicit := os.LookupEnv(key); !explicit {
+						os.Setenv(key, strings.TrimSpace(line[idx+1:]))
+					}
 				}
 			}
 			return

@@ -1,4 +1,4 @@
-Read VIBECTL.md for current project status, deployment details, and issue context before starting work.
+Read docs/API.md, docs/STATIC-DELIVERY.md and .github/workflows/deploy.yml for the current API, independent static publishing and production deployment workflow. VIBECTL.md is not part of this repository.
 
 # LightCMS - Claude Code Memory
 
@@ -91,11 +91,11 @@ Once connected, you can ask Claude to manage your content naturally:
 Binary: `bin/lightcms-mcp`
 Config: Uses same `config.dev.json` or environment variables as main server
 
-### Available MCP Tools (130 total):
+### Available MCP Tools (131 total; verify against tools/list when adding tools):
 
-**Content (23 tools):** list_content, get_content, create_content, update_content, update_content_by_path, publish_content, publish_multiple, unpublish_content, delete_content, restore_content, preview_content, get_content_versions, get_content_version, revert_to_version, bulk_create_content, bulk_update_content, bulk_field_operation, export_content, get_backlinks
+**Content (19 tools):** list_content, get_content, create_content, update_content, update_content_by_path, publish_content, publish_multiple, unpublish_content, delete_content, restore_content, preview_content, get_content_versions, get_content_version, revert_to_version, bulk_create_content, bulk_update_content, bulk_field_operation, export_content, get_backlinks
 
-**Templates (5 tools):** list_templates, get_template, create_template, update_template, delete_template
+**Templates (6 tools):** list_templates, get_template, create_template, update_template, delete_template, get_template_schema
 
 **Snippets (5 tools):** list_snippets, get_snippet, create_snippet, update_snippet, delete_snippet
 
@@ -103,9 +103,19 @@ Config: Uses same `config.dev.json` or environment variables as main server
 
 **Search (7 tools):** search_content, search_replace_preview, search_replace_execute, scoped_search_replace_preview, scoped_search_replace_execute, end_user_search, reindex_embeddings
 
-**Settings (18 tools):** get_theme, update_theme, get_theme_versions, get_theme_version, revert_theme_to_version, pin_theme_version, unpin_theme_version, get_site_config, update_site_config, list_redirects, create_redirect, update_redirect, delete_redirect, list_folders, create_folder, get_folder, delete_folder, list_collections, create_collection, get_collection, update_collection, delete_collection, regenerate_all_content
+**Settings (23 tools):** get_theme, update_theme, get_theme_versions, get_theme_version, revert_theme_to_version, pin_theme_version, unpin_theme_version, get_site_config, update_site_config, list_redirects, create_redirect, update_redirect, delete_redirect, list_folders, create_folder, get_folder, delete_folder, list_collections, create_collection, get_collection, update_collection, delete_collection, regenerate_all_content
+
+**Import (10 tools):** list_import_sources, create_import_source, update_import_source, delete_import_source, trigger_import_source, import_markdown, import_csv, list_import_jobs, get_import_job, cancel_import_job
+
+**Webhooks (6 tools):** list_webhooks, create_webhook, get_webhook, update_webhook, delete_webhook, list_webhook_deliveries, regenerate_webhook_secret
 
 **Forks (9 tools):** list_forks, create_fork, get_fork, fork_page, remove_fork_page, merge_fork, archive_fork, delete_fork, purge_fork_copies
+
+**Content Locking (4 tools):** get_content_lock, acquire_content_lock, release_content_lock, force_unlock_content
+
+**Scheduled Publishing (3 tools):** schedule_content_publish, list_scheduled_content, cancel_scheduled_publish
+
+**Audit & Link Check (3 tools):** list_audit_logs, start_link_check, get_link_check_results
 
 **Comments (3 tools, v6.0+):** list_comments, create_comment, delete_comment
 
@@ -258,9 +268,9 @@ Hard-won rules from building v7. Violating these has bitten us before:
 - `/llms.txt`, `/llms-full.txt` — AI-crawler site index (generated on the fly, projected queries)
 - `/mcp-public` — read-only MCP server for visitors' agents (search_site, get_page, list_pages, get_site_info); drafts/forks structurally excluded
 
-### Deploy quirks
-- The `fly deploy --detach` step inside `./deploy.sh` (never run `fly deploy` yourself) uploads a ~185MB build context (content/ + static/) with no visible progress — deploys take ~8 minutes and are NOT hung.
-- `fly secrets set` does NOT restart the legacy machine (it is outside Fly release management, same reason deploy.sh exists). Secrets stay staged until `fly machines update d890122a371528 -a metavert-cms --yes` or the next `./deploy.sh` — a plain `fly machines restart` reuses the old machine config and does NOT inject new secrets (verify with `fly ssh console -C 'sh -c env'`).
+### Current deployment boundary
+- The CMS runs in Docker Compose on the existing server. The main-branch GitHub workflow builds, tests, publishes the image and deploys it. Do not use the upstream Fly.io procedure for this installation.
+- Cloudflare publishes independent, frozen HTML/resource copies. Deploying CMS code does not republish articles, replace homepage HTML, change domain bindings or migrate a Worker automatically.
 
 ## Script Policy
 
@@ -290,7 +300,7 @@ go build -o bin/lightcms-mcp ./cmd/mcp
 ## Project Structure
 
 ```
-lightcms/
+./                          # repository root (formerly nested lightcms/)
 ├── cmd/
 │   ├── server/main.go      # Main HTTP server entry point
 │   └── mcp/main.go         # MCP server entry point
@@ -299,12 +309,14 @@ lightcms/
 │   ├── auth/               # Session-based authentication
 │   ├── database/mongo.go   # MongoDB connection & helpers
 │   ├── errors/             # Environment-aware error handling
-│   ├── handlers/           # HTTP request handlers (~5000 lines)
+│   ├── handlers/           # HTTP handlers and Go-embedded admin templates
 │   ├── mcp/                # MCP tool implementations
 │   ├── middleware/         # Security headers, file validation
 │   ├── models/models.go    # Data models & default templates
-│   └── services/           # Business logic layer
-├── templates/              # Admin UI HTML templates
+│   ├── product/            # Template contracts, publication saga, export/delivery
+│   └── services/           # Business logic and legacy adapters
+├── examples/templates/     # Reusable report HTML templates
+├── docs/                   # API, designs, plans and operations guides
 ├── static/                 # CSS, JS, images
 └── content/generated/      # Static HTML output
 ```
@@ -314,7 +326,7 @@ lightcms/
 ### Service Layer
 All business logic goes through services in `internal/services/`:
 - **ContentService**: CRUD with automatic versioning, static page generation
-- **TemplateService**: Template management with content regeneration
+- **TemplateService / templatecontract**: Versioned template management; editing does not silently republish existing pages
 - **AssetService**: File uploads with validation
 - **SettingsService**: Theme, config, redirects, folders, collections
 - **UserService**: User CRUD, password management, credential validation
@@ -334,10 +346,9 @@ Examples:
 - "Replaced hero image"
 
 ### Static Page Generation
-Published content is rendered to `content/generated/{path}.html` using template HTML + theme header/footer. Regeneration happens automatically on:
-- Content publish/update
-- Template layout change
-- Theme header/footer change
+Explicit publication freezes a content/template/dependency snapshot and activates it through `internal/product/publication`; generated files live under `content/generated`. Saving a template or snippet does not overwrite existing published pages. Use an explicit publish or template-upgrade preview/job to apply changes. Draft edits are not the same as publication.
+
+Cloudflare delivery independently exports the current active Publication, builds an immutable release and confirms it before activation. New releases are assets-only: no JavaScript 404 fallback. Historical snapshots remain readable. A confirmed activation rejection fails and releases its target; uncertain activation must be reconciled before ownership is released. Verification checkpoints let large releases resume without repeating all prior checks.
 
 ### Database Collections
 - `content` - Content items with full_path (unique index)
@@ -495,7 +506,7 @@ LightCMS supports large-scale content operations (2,000+ pages) via optimized bu
 
 ### Conditional Republish
 - Static HTML generation uses content hashing (SHA-256) — unchanged pages are skipped automatically
-- `RegenerateAllContent` (triggered by theme/template changes) clears all hashes first to force full regen
+- Do not restore implicit template-change regeneration. Explicit regenerate/publish operations must preserve version and active-publication guards.
 - For search/replace with `auto_republish: true`, only modified pages get republished
 
 ### Content List Pagination
@@ -522,16 +533,9 @@ LightCMS supports large-scale content operations (2,000+ pages) via optimized bu
 
 ## Deployment
 
-Deployed to Fly.io (`metavert-cms` app, machine `d890122a371528`). Uses environment variables for configuration. Health check at `/health`.
+Production is managed by `.github/workflows/deploy.yml` and `docker-compose.prod.yml`. Work on `main` as requested for this project; commit/push only when authorized. A push is not proof of deployment: confirm CI success, the running image revision and `/health`. Never print environment secrets or Cloudflare tokens in diagnostics.
 
-> **⚠️ NEVER run plain `fly deploy` — it creates orphan machines and does not update the live one. The only deploy command is `./deploy.sh`.**
-
-**Deploy procedure — always use the deploy script:**
-```bash
-./deploy.sh
-```
-
-The script builds the image via `fly deploy --detach`, extracts the image ref, destroys any stuck new machines, then updates the actual running machine directly via `fly machines update`. This is necessary because the running machine (`d890122a371528`) is a legacy non-Launch machine — `fly deploy` doesn't see it as a managed machine and creates new stuck orphan machines instead of updating it. The machine ID is hardcoded in `deploy.sh`.
+The independent Worker workflow is documented in `docs/STATIC-DELIVERY.md`. Its production content and domain bindings are separate from a CMS code deployment.
 
 ## Testing Locally
 
@@ -539,3 +543,9 @@ The script builds the image via `fly deploy --detach`, extracts the image ref, d
 2. `go build -o bin/lightcms ./cmd/server`
 3. `./bin/lightcms`
 4. Access admin at http://localhost:8082/cm (default: admin@localhost / admin123)
+
+### Verification gates
+
+- Use a local MongoDB replica set and a dedicated test database. Explicit `MONGODB_URI` / `DATABASE_NAME` override `.env.test`; use a distinct name containing `test` for concurrent runs.
+- Set `STATIC_DELIVERY_TEST_MONGODB_URI` and `STATIC_DELIVERY_REQUIRE_MONGO=1` to make delivery integration tests mandatory. Run `go test -p 1 ./... -count=1`, `go build ./...` and `go vet ./...`.
+- `workers/report-static` has a locked development-only Miniflare dependency. CI verifies both historical assets-first and current assets-only configurations against its native asset router. Node/Miniflare are not CMS runtime dependencies.

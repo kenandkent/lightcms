@@ -18,6 +18,8 @@ import (
 
 	"github.com/metavert-io/lightcms/v7/internal/database"
 	"github.com/metavert-io/lightcms/v7/internal/models"
+	"github.com/metavert-io/lightcms/v7/internal/product/pathkey"
+	"github.com/metavert-io/lightcms/v7/internal/product/publication"
 
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
@@ -65,6 +67,22 @@ func ProvenanceFromContext(ctx context.Context) (Provenance, bool) {
 	return p, ok
 }
 
+type authorIsAdminContextKey struct{}
+
+// WithAuthorIsAdmin carries the publishing principal's admin flag for
+// script-policy resolution (R02: policy admin_only renders raw only for
+// admins). Fail-closed default: unstamped contexts render strict.
+func WithAuthorIsAdmin(ctx context.Context, isAdmin bool) context.Context {
+	return context.WithValue(ctx, authorIsAdminContextKey{}, isAdmin)
+}
+
+// AuthorIsAdminFromContext extracts the admin flag stored by
+// WithAuthorIsAdmin (false when unstamped).
+func AuthorIsAdminFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(authorIsAdminContextKey{}).(bool)
+	return v
+}
+
 // ContentService centralizes all content operations with automatic versioning
 type ContentService struct {
 	db               *database.DB
@@ -74,6 +92,15 @@ type ContentService struct {
 	indexNow         *IndexNowService
 	indexRegenCh     chan struct{} // coalescing trigger for RegenerateIndexPages
 	keywordRebuildCh chan struct{} // coalescing trigger for RebuildKeywords
+
+	// embedSem bounds concurrent async embedding generations (provider HTTP
+	// calls + Mongo writes). Capacity is embeddingMaxInFlight; excess
+	// triggers wait on the semaphore as cheap goroutines — provider load
+	// stays flat no matter the bulk size. Lazily initialized (zero-value
+	// safe via embedMu) so tests and forgotten constructors can't deadlock
+	// on a nil channel.
+	embedMu  sync.Mutex
+	embedSem chan struct{}
 
 	// Cached wikilink index (title→path / path→title).
 	// Rebuilt at most once per wikilinkCacheTTL to avoid a full collection scan
@@ -141,6 +168,11 @@ func (s *ContentService) notifyIndexNow(ctx context.Context, paths ...string) {
 		return
 	}
 	s.indexNow.Notify(paths...)
+}
+
+// NotifyPublishedPaths is called only after a publication cutover commits.
+func (s *ContentService) NotifyPublishedPaths(ctx context.Context, paths ...string) {
+	s.notifyIndexNow(ctx, paths...)
 }
 
 // NotifyLiveChange tells IndexNow which public URLs a change affected:
@@ -269,15 +301,45 @@ func (s *ContentService) keywordRebuildWorker() {
 	}
 }
 
-// triggerEmbedding asynchronously generates an embedding for the given content
-func (s *ContentService) triggerEmbedding(contentID primitive.ObjectID) {
+// embeddingMaxInFlight caps concurrent async embedding generations per
+// ContentService. Rationale: each generation is one provider HTTP call
+// (Voyage/Ollama, seconds of latency) plus a Mongo write. Unbounded, a
+// 2000-page bulk import would fire 2000 concurrent provider calls —
+// rate-limit/blacklist territory and file-descriptor exhaustion. 8 keeps a
+// steady pipeline (provider p99 ~2s ⇒ ~4 pages/s drain) without hammering a
+// local Ollama or the Voyage quota, while bulk-callers never block: excess
+// triggers queue on embedSem. Stale queued jobs self-skip via their version
+// pin (UpdateContentEmbeddingForVersion), so a bulk storm converges instead
+// of stampeding.
+const embeddingMaxInFlight = 8
+
+// embedSlot returns the service's embedding semaphore, initializing it once.
+func (s *ContentService) embedSlot() chan struct{} {
+	s.embedMu.Lock()
+	defer s.embedMu.Unlock()
+	if s.embedSem == nil {
+		s.embedSem = make(chan struct{}, embeddingMaxInFlight)
+	}
+	return s.embedSem
+}
+
+// triggerEmbedding asynchronously generates an embedding for the given content,
+// pinned to the caller's mutation-time content version. The pin travels with
+// the job so a slow job carrying older text can never overwrite a newer
+// version's index (see UpdateContentEmbeddingForVersion). Concurrency is
+// bounded by embeddingMaxInFlight; stale queued jobs skip before consuming a
+// slot whenever the skip is already visible.
+func (s *ContentService) triggerEmbedding(contentID primitive.ObjectID, version int64) {
 	if s.searchService == nil || !s.searchService.EmbeddingsEnabled() {
 		return
 	}
+	sem := s.embedSlot()
 	go func() {
+		sem <- struct{}{}
+		defer func() { <-sem }()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := s.searchService.UpdateContentEmbedding(ctx, contentID); err != nil {
+		if _, err := s.searchService.UpdateContentEmbeddingForVersion(ctx, contentID, version); err != nil {
 			fmt.Printf("Warning: failed to update embedding for %s: %v\n", contentID.Hex(), err)
 		}
 	}()
@@ -306,13 +368,70 @@ func (s *ContentService) TriggerIndexRegen() {
 	s.triggerIndexRegen()
 }
 
+// pathScopeFor returns the V3 path scope for a content row: "live" for main
+// content, the fork ObjectID hex for fork copies (spec §12.8).
+func pathScopeFor(c *models.Content) string {
+	if c.ForkID != nil && !c.ForkID.IsZero() {
+		return c.ForkID.Hex()
+	}
+	return "live"
+}
+
+// refreshRequiresPublish recomputes the transient RequiresPublish projection
+// (spec §12.7): main rows need an explicit Publish when they are unpublished
+// drafts or live rows with unpublished changes; fork copies never publish
+// directly (they merge first).
+func refreshRequiresPublish(c *models.Content) {
+	if c.ForkID != nil {
+		c.RequiresPublish = false
+		return
+	}
+	c.RequiresPublish = !c.Published || c.HasUnpublishedChanges
+}
+
+// setCanonicalFields stamps canonical path + scope + active + version defaults
+// for a new content row. Canonical errors leave fields empty; the DB unique
+// index plus findPathCaseConflict remain the final arbiters.
+func setCanonicalFields(c *models.Content) {
+	if canon, err := pathkey.Canonical(c.FullPath); err == nil {
+		c.CanonicalFullPath = canon
+	} else {
+		c.CanonicalFullPath = ""
+	}
+	c.PathScope = pathScopeFor(c)
+	c.PathActive = !c.Deleted
+	if c.CurrentVersion <= 0 {
+		c.CurrentVersion = 1
+	}
+	if c.ForkID != nil {
+		c.HasUnpublishedChanges = false
+	} else {
+		c.HasUnpublishedChanges = false
+	}
+}
+
 // CreateContent creates new content and saves the initial version
+// Task 16A (spec §12.5, §12.7): draft-only data/version operation. It never
+// writes or deletes live static files and never fires a live publish webhook.
+// Only PublicationService may change live output, Published projection and
+// active Publication state. Compatibility fields Published/PublishedAt are
+// stored as projections; HasUnpublishedChanges/RequiresPublish signal that an
+// explicit Publish is required.
 func (s *ContentService) CreateContent(ctx context.Context, content *models.Content, versionComment ...string) error {
 	// A held page cannot be created already-published.
 	if content.Hold && content.Published {
 		return ErrContentHeld
 	}
 
+	if content.ID.IsZero() {
+		content.ID = primitive.NewObjectID()
+	}
+	return s.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
+		return s.createContentAtomic(sc, content, versionComment...)
+	})
+}
+
+func (s *ContentService) createContentAtomic(ctx context.Context, content *models.Content, versionComment ...string) error {
 	now := time.Now()
 	content.CreatedAt = now
 	content.UpdatedAt = now
@@ -338,6 +457,10 @@ func (s *ContentService) CreateContent(ctx context.Context, content *models.Cont
 	// Extract internal links
 	content.InternalLinks = s.extractInternalLinks(content)
 
+	// V3 canonical path bookkeeping (spec §12.8).
+	setCanonicalFields(content)
+	refreshRequiresPublish(content)
+
 	// Insert content
 	id, err := s.db.InsertOne(ctx, "content", content)
 	if err != nil {
@@ -353,27 +476,19 @@ func (s *ContentService) CreateContent(ctx context.Context, content *models.Cont
 	if err := s.saveVersion(ctx, content, nil, comment); err != nil {
 		return fmt.Errorf("failed to save initial version: %w", err)
 	}
+	if err := s.recordAuthoringEvent(ctx, "content.create", content); err != nil {
+		return err
+	}
 
-	// Generate static page if published (fork copies never touch static
-	// files or the embedding index — they go live only on merge)
-	if content.Published && content.ForkID == nil {
-		if err := s.GenerateStaticPage(ctx, content); err != nil {
-			// Log but don't fail
-			fmt.Printf("Warning: failed to generate static page: %v\n", err)
+	// Task 16A: draft-only — never GenerateStaticPage/removeStaticPage here.
+	// Embedding/keyword/index work is search-index maintenance, not live files.
+	snapshot := *content
+	s.db.AfterCommit(ctx, func(ctx context.Context) {
+		content := &snapshot
+		if content.ForkID == nil {
+			s.triggerEmbedding(content.ID, content.CurrentVersion)
 		}
-		s.triggerEmbedding(content.ID)
-	}
-
-	// Fire webhook event. A fork copy is not a page on the site: creating
-	// one announces nothing (the merge that brings it live does).
-	if s.webhookService != nil && content.ForkID == nil {
-		s.webhookService.FireEvent(ctx, "content.create", map[string]interface{}{
-			"id":    content.ID.Hex(),
-			"title": content.Title,
-			"path":  content.FullPath,
-		})
-	}
-
+	})
 	return nil
 }
 
@@ -438,137 +553,73 @@ type BulkCreateResult struct {
 }
 
 // BulkCreateContent creates multiple content items in a single batch.
-// Uses unordered InsertMany so one failure doesn't abort the rest.
-// HTML generation for published items runs in parallel (bounded to 10 goroutines).
+// Each item commits content and complete history atomically; a failed item
+// does not abort successful peers.
+// Task 16A: draft-only — no static HTML generation for published items.
+// Only data/version rows plus search-index maintenance.
+// Lane 2B: Published:true items are rejected per-item (never persisted).
+// A bulk write mints no Publication row, no outbox event, and no idempotency
+// record, so persisting content.Published=true would leave a live flag with
+// no control-plane truth. The HTTP layer rejects the whole batch with 400;
+// this per-item backstop protects direct service callers with the same
+// directing error.
 func (s *ContentService) BulkCreateContent(ctx context.Context, items []*models.Content, versionComment string) []BulkCreateResult {
 	results := make([]BulkCreateResult, len(items))
-	now := time.Now()
-
-	// Pre-process all items: build paths, merge tags, extract links, assign IDs
-	docs := make([]interface{}, 0, len(items))
-	validIndices := make([]int, 0, len(items))
-	for i, c := range items {
-		c.CreatedAt = now
-		c.UpdatedAt = now
-		stampPublishedAt(c)
-		c.ID = primitive.NewObjectID()
-
-		if c.FolderPath != "" && c.FolderPath != "/" {
-			c.FullPath = c.FolderPath + "/" + c.Slug
-		} else if c.Slug != "" {
-			c.FullPath = "/" + c.Slug
-		} else {
-			c.FullPath = "/"
-		}
-
-		mergeInlineTags(c)
-		c.InternalLinks = s.extractInternalLinks(c)
-
-		docs = append(docs, c)
-		validIndices = append(validIndices, i)
-		results[i] = BulkCreateResult{Index: i, ID: c.ID.Hex(), FullPath: c.FullPath, Success: true}
-	}
-
-	// Insert all at once (unordered — partial success is OK)
-	_, err := s.db.InsertManyUnordered(ctx, "content", docs)
-	if err != nil {
-		// Check for bulk write errors (partial failures)
-		if bwe, ok := err.(mongo.BulkWriteException); ok {
-			failedIndices := make(map[int]string)
-			for _, we := range bwe.WriteErrors {
-				failedIndices[we.Index] = we.Message
-			}
-			for docIdx, origIdx := range validIndices {
-				if msg, failed := failedIndices[docIdx]; failed {
-					results[origIdx].Success = false
-					results[origIdx].Error = msg
-					results[origIdx].ID = ""
-				}
-			}
-		} else {
-			// Total failure
-			for i := range results {
-				results[i].Success = false
-				results[i].Error = err.Error()
-				results[i].ID = ""
-			}
-			return results
-		}
-	}
-
-	// Batch-insert initial versions for successful items
-	var versionDocs []interface{}
-	for i, c := range items {
-		if !results[i].Success {
+	for i, content := range items {
+		results[i].Index = i
+		if content == nil {
+			results[i].Error = "content is required"
 			continue
 		}
-		editorEmail := EditorEmailFromContext(ctx)
-		v := models.ContentVersion{
-			ContentID:       c.ID,
-			Version:         1,
-			Title:           c.Title,
-			Slug:            c.Slug,
-			Data:            c.Data,
-			ModifiedByEmail: editorEmail,
-			Comment:         versionComment,
-			CreatedAt:       now,
-		}
-		versionDocs = append(versionDocs, v)
-	}
-	if len(versionDocs) > 0 {
-		s.db.InsertMany(ctx, "content_versions", versionDocs)
-	}
-
-	// Parallel HTML generation for published items (bounded concurrency)
-	sem := make(chan struct{}, 10)
-	var wg sync.WaitGroup
-	for i, c := range items {
-		if !results[i].Success || !c.Published || c.ForkID != nil {
+		if content.Published && content.ForkID == nil {
+			results[i].Error = "published:true is not accepted on bulk-create — create as a draft, then publish explicitly"
 			continue
 		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(content *models.Content) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := s.GenerateStaticPage(ctx, content); err != nil {
-				fmt.Printf("Warning: bulk create static page gen failed for %s: %v\n", content.FullPath, err)
-			}
-			s.triggerEmbedding(content.ID)
-		}(c)
-	}
-	wg.Wait()
-
-	// Fire webhook events and trigger index rebuild once
-	if s.webhookService != nil {
-		for i, c := range items {
-			if results[i].Success && c.ForkID == nil {
-				s.webhookService.FireEvent(ctx, "content.create", map[string]interface{}{
-					"id": c.ID.Hex(), "title": c.Title, "path": c.FullPath,
-				})
-			}
+		content.ID = primitive.NewObjectID()
+		if err := s.CreateContent(ctx, content, versionComment); err != nil {
+			results[i].Error = err.Error()
+			continue
 		}
+		results[i] = BulkCreateResult{Index: i, ID: content.ID.Hex(), FullPath: content.FullPath, Success: true}
 	}
-	s.triggerIndexRegen()
-	s.triggerKeywordRebuild()
-
+	s.db.AfterCommit(ctx, func(context.Context) {
+		s.triggerIndexRegen()
+		s.triggerKeywordRebuild()
+	})
 	return results
 }
 
+// ErrVersionConflict reports a lost CAS race: the content row moved between
+// the caller's read and write. Callers must re-read, re-apply, and retry.
+// (Lane 2B: returned by UpdateContent's current_version compare-and-swap;
+// errors.Is-compatible so HTTP layers can map it to 409.)
+var ErrVersionConflict = errors.New("content changed concurrently — re-read and retry the update")
+
 // UpdateContent updates content and saves a new version with an optional comment
+// Task 16A (spec §12.5, §12.7): draft-only data/version operation. It updates
+// the Content row, creates a ContentVersion, refreshes canonical bookkeeping
+// and marks HasUnpublishedChanges when a live page exists. It never writes or
+// deletes live static files and never fires live publish/unpublish webhooks or
+// Cloudflare purges — only PublicationService does that.
 func (s *ContentService) UpdateContent(ctx context.Context, content *models.Content, versionComment ...string) error {
-	// Get the original content for versioning
+	// Pin the comparison version across transaction retries. Retrying a write
+	// conflict must not silently rebase a stale edit onto a newer document.
 	var original models.Content
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": content.ID}, &original); err != nil {
 		return fmt.Errorf("failed to get original content: %w", err)
 	}
+	return s.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
+		return s.updateContentAtomic(sc, content, original, versionComment...)
+	})
+}
 
-	// A held draft cannot go live through an update either. Holding a page
-	// that is already published is allowed and does not unpublish it.
+func (s *ContentService) updateContentAtomic(ctx context.Context, content *models.Content, original models.Content, versionComment ...string) error {
+	if original.ForkID != nil {
+		content.ForkID = original.ForkID
+	}
 	if content.Hold && content.Published && !original.Published {
 		return ErrContentHeld
 	}
-
 	content.UpdatedAt = time.Now()
 	stampPublishedAt(content)
 
@@ -594,39 +645,93 @@ func (s *ContentService) UpdateContent(ctx context.Context, content *models.Cont
 	// Extract internal links
 	content.InternalLinks = s.extractInternalLinks(content)
 
-	// Update content
+	// V3 canonical bookkeeping + CAS version allocation (spec §12.8, §13).
+	if canon, err := pathkey.Canonical(content.FullPath); err == nil {
+		content.CanonicalFullPath = canon
+	}
+	content.PathScope = pathScopeFor(content)
+	content.PathActive = !content.Deleted
+	newVersion := original.CurrentVersion + 1
+	if newVersion < 1 {
+		if n, cerr := s.db.Count(ctx, "content_versions", bson.M{"content_id": content.ID}); cerr == nil {
+			newVersion = n + 1
+			if n == 0 {
+				// saveVersion will persist original as v1; new write is v2.
+				newVersion = 2
+			}
+		} else {
+			newVersion = 1
+		}
+		if newVersion < 1 {
+			newVersion = 1
+		}
+	}
+	content.CurrentVersion = newVersion
+	// Any edit through this path leaves live bytes untouched, so a live page
+	// now has unpublished changes awaiting an explicit Publish. Fork copies
+	// are never live.
+	if content.ForkID == nil && (original.Published || content.Published) {
+		content.HasUnpublishedChanges = true
+	} else {
+		content.HasUnpublishedChanges = false
+	}
+	refreshRequiresPublish(content)
+
+	// Update content.
+	// Lane 2B: compare-and-swap on current_version. Two concurrent writers
+	// that read the same CurrentVersion must not both stamp the same next
+	// version (duplicate-key 500s) or silently overwrite each other: the
+	// loser gets ErrVersionConflict and retries from a fresh read — the same
+	// contract generation.replaceLiveForPublish already enforces. Legacy rows
+	// without a current_version (<= 0) keep the plain _id filter with the
+	// Count()+1 fallback below; saveVersion's persist-back converges them to
+	// CAS-eligible versions on the next write.
 	update := bson.M{
 		"$set": bson.M{
-			"template_id":      content.TemplateID,
-			"template_name":    content.TemplateName,
-			"title":            content.Title,
-			"slug":             content.Slug,
-			"folder_id":        content.FolderID,
-			"folder_path":      content.FolderPath,
-			"full_path":        content.FullPath,
-			"category":         content.Category,
-			"tags":             content.Tags,
-			"meta_description": content.MetaDescription,
-			"og_image":         content.OGImage,
-			"data":             content.Data,
-			"published":        content.Published,
-			"published_at":     content.PublishedAt,
-			"publish_at":       content.PublishAt,
-			"use_header":       content.UseHeader,
-			"use_footer":       content.UseFooter,
-			"use_theme":        content.UseTheme,
-			"raw_mode":         content.RawMode,
-			"noindex":          content.NoIndex,
-			"hold":             content.Hold,
-			"author_name":      content.AuthorName,
-			"author_url":       content.AuthorURL,
-			"internal_links":   content.InternalLinks,
-			"updated_at":       content.UpdatedAt,
+			"template_id":             content.TemplateID,
+			"template_name":           content.TemplateName,
+			"title":                   content.Title,
+			"slug":                    content.Slug,
+			"folder_id":               content.FolderID,
+			"folder_path":             content.FolderPath,
+			"full_path":               content.FullPath,
+			"canonical_full_path":     content.CanonicalFullPath,
+			"path_scope":              content.PathScope,
+			"path_active":             content.PathActive,
+			"current_version":         content.CurrentVersion,
+			"has_unpublished_changes": content.HasUnpublishedChanges,
+			"category":                content.Category,
+			"tags":                    content.Tags,
+			"meta_description":        content.MetaDescription,
+			"og_image":                content.OGImage,
+			"data":                    content.Data,
+			"published":               content.Published,
+			"published_at":            content.PublishedAt,
+			"publish_at":              content.PublishAt,
+			"use_header":              content.UseHeader,
+			"use_footer":              content.UseFooter,
+			"use_theme":               content.UseTheme,
+			"raw_mode":                content.RawMode,
+			"internal_links":          content.InternalLinks,
+			"updated_at":              content.UpdatedAt,
+			"noindex":                 content.NoIndex, "hold": content.Hold, "author_name": content.AuthorName, "author_url": content.AuthorURL,
 		},
 	}
 
-	if err := s.db.UpdateOne(ctx, "content", bson.M{"_id": content.ID}, update); err != nil {
+	writeFilter := bson.M{"_id": content.ID}
+	if original.CurrentVersion > 0 {
+		writeFilter["current_version"] = original.CurrentVersion
+	}
+	matched, err := s.db.UpdateOneMatched(ctx, "content", writeFilter, update)
+	if err != nil {
 		return fmt.Errorf("failed to update content: %w", err)
+	}
+	if matched == 0 {
+		if original.CurrentVersion > 0 {
+			return fmt.Errorf("update content %s (want version %d): %w",
+				content.ID.Hex(), content.CurrentVersion, ErrVersionConflict)
+		}
+		return fmt.Errorf("failed to update content: no matching document")
 	}
 
 	// Save version with original for first-time versioning
@@ -637,66 +742,98 @@ func (s *ContentService) UpdateContent(ctx context.Context, content *models.Cont
 	if err := s.saveVersion(ctx, content, &original, comment); err != nil {
 		return fmt.Errorf("failed to save version: %w", err)
 	}
-
-	// Invalidate wikilink cache: title/path/publish-status changes all affect the index.
-	if original.Title != content.Title || original.FullPath != content.FullPath || original.Published != content.Published {
-		s.invalidateWikilinkCache()
+	if err := s.recordAuthoringEvent(ctx, "content.update", content); err != nil {
+		return err
 	}
-
-	// A fork copy shares its full_path with the live page and exists only
-	// inside its fork. Saving one has no effect outside the fork: no static
-	// file, embedding, IndexNow ping, keyword rebuild, wikilink rewrite of
-	// other pages, index-page regeneration or content.update webhook. The
-	// decision is made on the stored row as well as on what the caller
-	// passed, so a caller that dropped ForkID cannot turn a copy live.
-	if original.ForkID != nil || content.ForkID != nil {
+	if content.ForkID != nil || original.ForkID != nil {
 		return nil
 	}
 
-	// Generate or remove static page based on publish status.
-	if content.Published {
-		if err := s.GenerateStaticPage(ctx, content); err != nil {
-			fmt.Printf("Warning: failed to generate static page: %v\n", err)
+	snapshot := *content
+	s.db.AfterCommit(ctx, func(ctx context.Context) {
+		content := &snapshot
+		// Invalidate wikilink cache: title/path/publish-status changes all affect the index.
+		if original.Title != content.Title || original.FullPath != content.FullPath || original.Published != content.Published {
+			s.invalidateWikilinkCache()
 		}
-		s.triggerEmbedding(content.ID)
-	} else {
-		// Remove static page if unpublished
-		s.removeStaticPage(content.FullPath)
-	}
 
-	// Tell search engines about live-URL transitions. Edits to published
-	// pages are notified from static generation, only when the HTML changed.
-	s.NotifyLiveChange(ctx, &original, content)
+		// Generate or remove static page based on publish status.
+		// Task 16A: draft-only — never touch live static files here. Fork copies
+		// never had side effects; now live rows don't either. Search-index
+		// maintenance (embedding/keywords) is not a live-file write.
+		if content.ForkID == nil {
+			s.triggerEmbedding(content.ID, content.CurrentVersion)
+		}
 
-	// Rebuild search keyword cache when content changes
-	s.triggerKeywordRebuild()
+		// Rebuild search keyword cache when content changes
+		s.triggerKeywordRebuild()
 
-	// Rewrite [[wikilinks]] across all content if title or path changed
-	if original.Title != content.Title || original.FullPath != content.FullPath {
-		go func(oldTitle, newTitle, oldPath, newPath string) {
-			wCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			defer cancel()
-			s.UpdateWikilinksOnRename(wCtx, oldTitle, newTitle, oldPath, newPath)
-		}(original.Title, content.Title, original.FullPath, content.FullPath)
-	}
+		// Rewrite [[wikilinks]] across all content if title or path changed
+		if original.Title != content.Title || original.FullPath != content.FullPath {
+			go func(oldTitle, newTitle, oldPath, newPath string) {
+				wCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+				defer cancel()
+				s.UpdateWikilinksOnRename(wCtx, oldTitle, newTitle, oldPath, newPath)
+			}(original.Title, content.Title, original.FullPath, content.FullPath)
+		}
 
-	// Regenerate index pages that may reference this content via lc:query
-	s.triggerIndexRegen()
-
-	// Fire webhook event
-	if s.webhookService != nil {
-		s.webhookService.FireEvent(ctx, "content.update", map[string]interface{}{
-			"id":    content.ID.Hex(),
-			"title": content.Title,
-			"path":  content.FullPath,
-		})
-	}
-
+		// Regenerate index pages that may reference this content via lc:query
+		s.triggerIndexRegen()
+	})
 	return nil
+}
+
+// PublicationPublisher is the Task 8 publication saga seam for the legacy
+// publish/unpublish entry points (spec §16.6: PublicationService is the only
+// live-mutation service). Task 16 wires the constructed saga via
+// SetPublicationPublisher and owns cmd/server/main.go; until then the seam is
+// nil and the legacy behavior below is preserved byte-for-byte.
+type PublicationPublisher interface {
+	Publish(ctx context.Context, req publication.PublishRequest) (publication.PublicationResult, error)
+	Unpublish(ctx context.Context, req publication.UnpublishRequest) error
+}
+
+func (s *ContentService) recordAuthoringEvent(ctx context.Context, event string, content *models.Content) error {
+	if s.webhookService == nil || content.ForkID != nil {
+		return nil
+	}
+	key := fmt.Sprintf("%s:%d", content.ID.Hex(), content.CurrentVersion)
+	return s.webhookService.RecordEvent(ctx, event, key, map[string]interface{}{"id": content.ID.Hex(), "title": content.Title, "path": content.FullPath})
+}
+
+// legacyPublicationSaga holds the Task 16 wiring. Package-level (not a
+// ContentService field) so Task 7's parallel edits to this file's struct and
+// rendering-entry region stay untouched.
+var legacyPublicationSaga PublicationPublisher
+
+// SetPublicationPublisher wires the Task 8 saga for legacy delegation.
+func SetPublicationPublisher(p PublicationPublisher) {
+	legacyPublicationSaga = p
+}
+
+// publishAttributionFromContext reads the caller provenance the API/UI
+// middleware stamped on ctx for the saga request. Empty when the caller set
+// none (background jobs on a bare context): the saga omits empty attribution
+// (omitempty), minting records exactly as before.
+func publishAttributionFromContext(ctx context.Context) (actor, via, session string) {
+	prov, _ := ProvenanceFromContext(ctx)
+	return prov.Actor, prov.Via, prov.AgentSession
 }
 
 // PublishContent publishes content and generates static page
 func (s *ContentService) PublishContent(ctx context.Context, id primitive.ObjectID) error {
+	if legacyPublicationSaga != nil {
+		// Delegate: latest content version + current template version are
+		// frozen under the saga page lock; the result (publication ID/URL)
+		// is intentionally not mapped onto the legacy error-only signature.
+		// Lane 2B: thread caller attribution into the minted record.
+		actor, via, session := publishAttributionFromContext(ctx)
+		_, err := legacyPublicationSaga.Publish(ctx, publication.PublishRequest{
+			ContentID: id, Actor: actor, Via: via, AgentSession: session,
+			AuthorIsAdmin: AuthorIsAdminFromContext(ctx),
+		})
+		return err
+	}
 	var content models.Content
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &content); err != nil {
 		return fmt.Errorf("content not found: %w", err)
@@ -714,6 +851,11 @@ func (s *ContentService) PublishContent(ctx context.Context, id primitive.Object
 
 	if err := s.UpdateContent(ctx, &content); err != nil {
 		return err
+	}
+	// Unwired callers retain the legacy explicit-publish behavior. Production
+	// returns through PublicationService above, which owns the atomic cutover.
+	if err := s.GenerateStaticPage(ctx, &content); err != nil {
+		log.Printf("legacy explicit publication render failed: %v", err)
 	}
 
 	// Fire webhook event
@@ -733,6 +875,12 @@ func (s *ContentService) PublishContent(ctx context.Context, id primitive.Object
 
 // UnpublishContent unpublishes content and removes static page
 func (s *ContentService) UnpublishContent(ctx context.Context, id primitive.ObjectID) error {
+	if legacyPublicationSaga != nil {
+		prov, _ := ProvenanceFromContext(ctx)
+		return legacyPublicationSaga.Unpublish(ctx, publication.UnpublishRequest{
+			ContentID: id, Actor: prov.Actor, Via: prov.Via, AgentSession: prov.AgentSession,
+		})
+	}
 	var content models.Content
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &content); err != nil {
 		return fmt.Errorf("content not found: %w", err)
@@ -750,6 +898,8 @@ func (s *ContentService) UnpublishContent(ctx context.Context, id primitive.Obje
 	if content.ForkID != nil {
 		return nil
 	}
+	s.removeStaticPage(content.FullPath)
+	s.notifyIndexNow(ctx, content.FullPath)
 
 	// Fire webhook event
 	if s.webhookService != nil {
@@ -767,6 +917,9 @@ func (s *ContentService) UnpublishContent(ctx context.Context, id primitive.Obje
 }
 
 // DeleteContent soft-deletes content
+// Task 16A: draft-only — releases the canonical path (path_active=false) but
+// never deletes live static files directly. Live removal happens only through
+// PublicationService.Unpublish; the recovery scanner converges any leftover.
 func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectID) error {
 	var content models.Content
 	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &content); err != nil {
@@ -781,7 +934,7 @@ func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectI
 			"deleted":                 true,
 			"deleted_at":              now,
 			"updated_at":              now,
-			"published":               false,
+			"path_active":             false,
 			"published_before_delete": content.Published,
 		},
 	}
@@ -789,18 +942,11 @@ func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectI
 	if err := s.db.UpdateOne(ctx, "content", bson.M{"_id": id}, update); err != nil {
 		return fmt.Errorf("failed to delete content: %w", err)
 	}
-
-	// A fork copy shares its full_path with the live page. Deleting the copy
-	// changes nothing on the live site: the live page's static file stays,
-	// and no content.delete webhook, Cloudflare purge, IndexNow ping, keyword
-	// rebuild or index regeneration is issued for the live path.
 	if content.ForkID != nil {
 		return nil
 	}
 
-	// Remove static page
-	s.removeStaticPage(content.FullPath)
-	s.NotifyLiveChange(ctx, &content, nil)
+	// Task 16A: no removeStaticPage here — live bytes stay until Unpublish.
 
 	// Rebuild search keyword cache
 	s.triggerKeywordRebuild()
@@ -817,28 +963,45 @@ func (s *ContentService) DeleteContent(ctx context.Context, id primitive.ObjectI
 		})
 	}
 	// Purge Cloudflare cache
-	if s.cfService != nil {
-		go s.cfService.PurgeByURLs(context.Background(), []string{content.FullPath})
-	}
+	// Task 16A: no live purge on draft delete — PublicationService owns
+	// post-activation purge. Legacy direct purge removed.
+	_ = content
 
 	return nil
 }
 
+// RecordVersion persists a version snapshot for a row the caller already
+// mutated through a bespoke path (e.g. the admin soft-delete, which bypasses
+// UpdateContent but must still leave an attributed version for history and
+// session rollback). content is the post-mutation row, original the
+// pre-mutation row, comment the version comment. Actor/provenance come from
+// ctx (WithEditorEmail / WithProvenance); without them the version is
+// unattributed.
+func (s *ContentService) RecordVersion(ctx context.Context, content *models.Content, original *models.Content, comment string) error {
+	return s.saveVersion(ctx, content, original, comment)
+}
+
 // RestoreContent restores soft-deleted content
+// Task 16A: draft-only — re-claims the path (path_active=true) with a
+// PATH_CONFLICT check, but never regenerates live files. Publish is explicit.
 func (s *ContentService) RestoreContent(ctx context.Context, id primitive.ObjectID) error {
-	set := bson.M{
-		"deleted":    false,
-		"updated_at": time.Now(),
+	var probe models.Content
+	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &probe); err != nil {
+		// Legacy parity: restoring a nonexistent ID matched 0 docs and
+		// returned success (UpdateOne no-op + FindOne early-nil). Preserve
+		// that contract; explicit 404s belong to the HTTP layer.
+		return nil
 	}
-	// A page DeleteContent unpublished comes back published, unless it is a
-	// fork copy or was put on hold in the meantime.
-	var deleted models.Content
-	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &deleted); err == nil &&
-		deleted.PublishedBeforeDelete && deleted.ForkID == nil && !deleted.Hold {
-		set["published"] = true
+	if conflict := s.findPathCaseConflict(ctx, probe.FullPath, id); conflict != nil {
+		return fmt.Errorf("path %s conflicts with existing page %s — paths are case-insensitive", probe.FullPath, conflict.FullPath)
 	}
 	update := bson.M{
-		"$set": set,
+		"$set": bson.M{
+			"deleted":                 false,
+			"path_active":             true,
+			"has_unpublished_changes": probe.Published,
+			"updated_at":              time.Now(),
+		},
 		"$unset": bson.M{
 			"deleted_at":              "",
 			"published_before_delete": "",
@@ -849,18 +1012,7 @@ func (s *ContentService) RestoreContent(ctx context.Context, id primitive.Object
 		return fmt.Errorf("failed to restore content: %w", err)
 	}
 
-	// Regenerate static page if published
-	var content models.Content
-	if err := s.db.FindOne(ctx, "content", bson.M{"_id": id}, &content); err != nil {
-		return nil // Content restored, just can't regenerate
-	}
-
-	if content.Published {
-		s.GenerateStaticPage(ctx, &content)
-		if content.ForkID == nil {
-			s.notifyIndexNow(ctx, content.FullPath)
-		}
-	}
+	// Task 16A: no GenerateStaticPage here.
 
 	// Rebuild search keyword cache
 	s.triggerKeywordRebuild()
@@ -880,13 +1032,10 @@ func (s *ContentService) GetContent(ctx context.Context, id primitive.ObjectID) 
 // GetContentByPath retrieves content by full path
 func (s *ContentService) GetContentByPath(ctx context.Context, path string) (*models.Content, error) {
 	var content models.Content
-	// Live pages only: a fork copy shares its full_path with the live page
-	// (or, for a page created inside a fork, has no live page at all) and
-	// must never be what a path resolves to. Fork-aware callers use
-	// ForkService.GetForkPageByPath.
-	exact := bson.M{"full_path": path, "deleted": bson.M{"$ne": true}}
-	liveOnly(exact)
-	if err := s.db.FindOne(ctx, "content", exact, &content); err == nil {
+	// Lane 1B: the exact lookup must exclude fork rows (they share
+	// full_path with the live page); otherwise UpsertContent may update
+	// the sandbox copy thinking it is live.
+	if err := s.db.FindOne(ctx, "content", bson.M{"full_path": path, "deleted": bson.M{"$ne": true}, "fork_id": bson.M{"$exists": false}}, &content); err == nil {
 		return &content, nil
 	}
 	// Paths are case-insensitive: fall back to a case-insensitive exact
@@ -1215,6 +1364,10 @@ func (s *ContentService) GetVersion(ctx context.Context, contentID primitive.Obj
 }
 
 // RevertToVersion reverts content to a previous version with an optional comment
+// Task 16A (spec §13): restore-as-draft only. It recovers edit state via
+// UpdateContent (draft-only, live unchanged) and never touches the active
+// Publication. Restore-and-publish / revert-live are separate explicit actions
+// owned by Generation/PublicationService.
 func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitive.ObjectID, version int, versionComment ...string) error {
 	// Get the version to revert to
 	v, err := s.GetVersion(ctx, contentID, version)
@@ -1228,7 +1381,8 @@ func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitiv
 		return fmt.Errorf("content not found: %w", err)
 	}
 
-	// Update content with version data
+	// Update content with version data (draft only: preserve live projection;
+	// Published/PublishedAt change only through PublicationService).
 	content.TemplateID = v.TemplateID
 	content.TemplateName = v.TemplateName
 	content.Title = v.Title
@@ -1241,8 +1395,6 @@ func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitiv
 	content.MetaDescription = v.MetaDescription
 	content.OGImage = v.OGImage
 	content.Data = v.Data
-	content.Published = v.Published
-	content.PublishedAt = v.PublishedAt
 	content.UseHeader = v.UseHeader
 	content.UseFooter = v.UseFooter
 	content.UseTheme = v.UseTheme
@@ -1253,82 +1405,205 @@ func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitiv
 }
 
 // saveVersion saves a new version of the content with an optional comment
+// Task 16A: honors content.CurrentVersion allocated by the caller (CAS-style)
+// and falls back to max(history)+1 for legacy callers. Provenance stamping is
+// preserved (spec §12.5 audit/provenance).
+// Lane 2B: the old Count()+1 fallback collided under concurrency (two
+// writers counting the same N, or count lagging a racing insert when history
+// has gaps). Allocation is now max(history)+1 with a bounded duplicate-key
+// retry, and any correction is persisted back to the content row so the row
+// and the history converge instead of diverging permanently.
 func (s *ContentService) saveVersion(ctx context.Context, content *models.Content, original *models.Content, comment string) error {
-	// Get the current version count
-	count, err := s.db.Count(ctx, "content_versions", bson.M{"content_id": content.ID})
-	if err != nil {
-		return err
-	}
-
-	// If no versions exist and we have the original content, save it as v1 first
-	if count == 0 && original != nil {
-		v1 := models.ContentVersion{
-			ContentID:       original.ID,
-			Version:         1,
-			TemplateID:      original.TemplateID,
-			TemplateName:    original.TemplateName,
-			Title:           original.Title,
-			Slug:            original.Slug,
-			FolderID:        original.FolderID,
-			FolderPath:      original.FolderPath,
-			FullPath:        original.FullPath,
-			Category:        original.Category,
-			Tags:            original.Tags,
-			MetaDescription: original.MetaDescription,
-			OGImage:         original.OGImage,
-			Data:            original.Data,
-			Published:       original.Published,
-			PublishedAt:     original.PublishedAt,
-			UseHeader:       original.UseHeader,
-			UseFooter:       original.UseFooter,
-			UseTheme:        original.UseTheme,
-			RawMode:         original.RawMode,
-			CreatedAt:       original.CreatedAt,
-		}
-		if _, err := s.db.InsertOne(ctx, "content_versions", v1); err != nil {
+	for attempt := 0; attempt < 4; attempt++ {
+		maxV, err := s.maxContentVersion(ctx, content.ID)
+		if err != nil {
 			return err
 		}
-		count = 1
-	}
 
-	version := int(count) + 1
+		// If no versions exist and we have the original content, save it as v1 first
+		if maxV == 0 && original != nil {
+			v1 := models.ContentVersion{
+				ContentID:       original.ID,
+				Version:         1,
+				TemplateID:      original.TemplateID,
+				TemplateName:    original.TemplateName,
+				Title:           original.Title,
+				Slug:            original.Slug,
+				FolderID:        original.FolderID,
+				FolderPath:      original.FolderPath,
+				FullPath:        original.FullPath,
+				Category:        original.Category,
+				Tags:            original.Tags,
+				MetaDescription: original.MetaDescription,
+				OGImage:         original.OGImage,
+				Data:            original.Data,
+				Published:       original.Published,
+				PublishedAt:     original.PublishedAt,
+				UseHeader:       original.UseHeader,
+				UseFooter:       original.UseFooter,
+				UseTheme:        original.UseTheme,
+				RawMode:         original.RawMode,
+				CreatedAt:       original.CreatedAt,
+			}
+			if _, err := s.db.InsertOne(ctx, "content_versions", v1); err != nil {
+				if !isDupKeyError(err) {
+					return err
+				}
+				// Lost the backfill race — someone else saved v1; recount.
+				continue
+			}
+			maxV = 1
+		}
 
-	modifiedByEmail := EditorEmailFromContext(ctx)
-	prov, _ := ProvenanceFromContext(ctx)
-	if prov.Actor == "" {
-		prov.Actor = "human" // default for legacy paths that set no provenance
-	}
-	contentVersion := models.ContentVersion{
-		ContentID:       content.ID,
-		Version:         version,
-		Comment:         comment,
-		ModifiedByEmail: modifiedByEmail,
-		Actor:           prov.Actor,
-		Via:             prov.Via,
-		AgentSession:    prov.AgentSession,
-		TemplateID:      content.TemplateID,
-		TemplateName:    content.TemplateName,
-		Title:           content.Title,
-		Slug:            content.Slug,
-		FolderID:        content.FolderID,
-		FolderPath:      content.FolderPath,
-		FullPath:        content.FullPath,
-		Category:        content.Category,
-		Tags:            content.Tags,
-		MetaDescription: content.MetaDescription,
-		OGImage:         content.OGImage,
-		Data:            content.Data,
-		Published:       content.Published,
-		PublishedAt:     content.PublishedAt,
-		UseHeader:       content.UseHeader,
-		UseFooter:       content.UseFooter,
-		UseTheme:        content.UseTheme,
-		RawMode:         content.RawMode,
-		CreatedAt:       time.Now(),
-	}
+		// Lane W3 (concurrency gap fix): prefer the caller-allocated CAS
+		// version. Deriving max(history)+1 here let a slower writer jump
+		// history forward and permanently skip its own allocated number
+		// whenever a successor completed saveVersion between its CAS and
+		// its insert (gap + row divergence under concurrency). The
+		// allocated number is uniquely ours (CAS on current_version), so
+		// inserting it fills the gap instead of opening one. Legacy
+		// callers without an allocation (CurrentVersion <= 0) keep the
+		// history-derived fallback.
+		version := content.CurrentVersion
+		if version <= 0 {
+			version = maxV + 1
+		} else if version <= maxV {
+			// History is at or above our CAS-allocated number. Two cases:
+			// the number already exists (legacy divergence — heal forward
+			// past the max so row and history converge), or a faster
+			// successor advanced the max while our number is still an open
+			// gap (insert it directly so the chain stays contiguous).
+			// Checking existence explicitly keeps this correct even where
+			// the UNIQUE(content_id, version) backstop index is absent.
+			exists, err := s.versionExists(ctx, content.ID, version)
+			if err != nil {
+				return err
+			}
+			if exists {
+				version = maxV + 1
+			}
+		}
+		// Persist the corrected version back to the content row. When
+		// history runs ahead of the row (legacy divergence, or a concurrent
+		// CAS bump that landed between our read and write), the row must
+		// converge to the version we actually persist — otherwise the row
+		// and the history diverge permanently and the next writer
+		// re-derives a stale (duplicate) version.
+		if version != content.CurrentVersion {
+			if err := s.db.UpdateOne(ctx, "content",
+				bson.M{"_id": content.ID},
+				bson.M{"$set": bson.M{"current_version": version}}); err != nil {
+				return err
+			}
+		}
+		// Keep the row's CurrentVersion convergent with the version we persist.
+		content.CurrentVersion = version
 
-	_, err = s.db.InsertOne(ctx, "content_versions", contentVersion)
-	return err
+		modifiedByEmail := EditorEmailFromContext(ctx)
+		prov, _ := ProvenanceFromContext(ctx)
+		if prov.Actor == "" {
+			prov.Actor = "human" // default for legacy paths that set no provenance
+		}
+		contentVersion := models.ContentVersion{
+			ContentID:       content.ID,
+			Version:         version,
+			Comment:         comment,
+			ModifiedByEmail: modifiedByEmail,
+			Actor:           prov.Actor,
+			Via:             prov.Via,
+			AgentSession:    prov.AgentSession,
+			TemplateID:      content.TemplateID,
+			TemplateName:    content.TemplateName,
+			Title:           content.Title,
+			Slug:            content.Slug,
+			FolderID:        content.FolderID,
+			FolderPath:      content.FolderPath,
+			FullPath:        content.FullPath,
+			Category:        content.Category,
+			Tags:            content.Tags,
+			MetaDescription: content.MetaDescription,
+			OGImage:         content.OGImage,
+			Data:            content.Data,
+			Published:       content.Published,
+			PublishedAt:     content.PublishedAt,
+			UseHeader:       content.UseHeader,
+			UseFooter:       content.UseFooter,
+			UseTheme:        content.UseTheme,
+			RawMode:         content.RawMode,
+			CreatedAt:       time.Now(),
+		}
+
+		if _, err := s.db.InsertOne(ctx, "content_versions", contentVersion); err != nil {
+			if !isDupKeyError(err) {
+				return err
+			}
+			// The number we tried to insert already exists in history:
+			// either history ran ahead of the row (legacy divergence —
+			// heal forward past the max so row and history converge) or a
+			// concurrent writer won a rare allocation race (recount from
+			// the fresh max). Persist any correction back to the row so
+			// the next CAS read starts from the healed value.
+			freshMax, merr := s.maxContentVersion(ctx, content.ID)
+			if merr != nil {
+				return merr
+			}
+			healed := freshMax + 1
+			if healed != content.CurrentVersion {
+				if err := s.db.UpdateOne(ctx, "content",
+					bson.M{"_id": content.ID},
+					bson.M{"$set": bson.M{"current_version": healed}}); err != nil {
+					return err
+				}
+				content.CurrentVersion = healed
+			}
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("save version for content %s: version allocation did not converge", content.ID.Hex())
+}
+
+// versionExists reports whether a (content_id, version) doc is already
+// persisted — saveVersion's heal-vs-gap-fill decision when history runs
+// ahead of the row.
+func (s *ContentService) versionExists(ctx context.Context, id primitive.ObjectID, version int64) (bool, error) {
+	n, err := s.db.Count(ctx, "content_versions", bson.M{"content_id": id, "version": version})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// maxContentVersion returns the highest persisted version number for content,
+// or 0 when no history exists.
+func (s *ContentService) maxContentVersion(ctx context.Context, id primitive.ObjectID) (int64, error) {
+	var top struct {
+		Version int64 `bson:"version"`
+	}
+	err := s.db.Collection("content_versions").FindOne(ctx,
+		bson.M{"content_id": id},
+		options.FindOne().SetSort(bson.D{{Key: "version", Value: -1}}),
+	).Decode(&top)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return top.Version, nil
+}
+
+// isDupKeyError reports Mongo duplicate-key errors (code 11000) without
+// depending on exact driver error wrapping.
+func isDupKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if mongo.IsDuplicateKeyError(err) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "duplicate key") || strings.Contains(msg, "E11000")
 }
 
 // getAuthorRole looks up the role of a user by ID.
@@ -1483,14 +1758,15 @@ func (s *ContentService) generateStaticPageWithWikilinkIndex(ctx context.Context
 	return nil
 }
 
-// RemoveStaticPage removes a live page's generated HTML by its full path. It
-// is for callers that write content to MongoDB directly (the admin editor);
-// the caller is responsible for never passing a fork copy's path.
-func (s *ContentService) RemoveStaticPage(fullPath string) {
-	s.removeStaticPage(fullPath)
+// RenderSnapshotHTML renders a frozen publication snapshot in memory without
+// writing a canonical file (Task 7 render snapshot; file cutover is Task 8 saga).
+func (s *ContentService) RenderSnapshotHTML(ctx context.Context, snap publication.RenderSnapshot) (publication.RenderResult, error) {
+	return publication.RenderDetailed(ctx, snap)
 }
 
 // removeStaticPage removes the static HTML file for content
+func (s *ContentService) RemoveStaticPage(fullPath string) { s.removeStaticPage(fullPath) }
+
 func (s *ContentService) removeStaticPage(fullPath string) {
 	if fullPath == "" {
 		// Legacy rows can have an empty full_path. Mapping that to /index
@@ -1529,6 +1805,20 @@ func (s *ContentService) renderContentFromLayout(content *models.Content, layout
 
 // renderContentFromLayoutWithData renders a layout using a pre-built data map.
 func (s *ContentService) renderContentFromLayoutWithData(data map[string]interface{}, layout string) (string, error) {
+	var includeErr error
+	layout, includeErr = publication.ExpandLayoutSnippets(layout, func(name string) (string, error) {
+		if s.db == nil {
+			return "", fmt.Errorf("snippet store unavailable")
+		}
+		var snippet models.Snippet
+		if e := s.db.FindOne(context.Background(), "snippets", bson.M{"name": name}, &snippet); e != nil {
+			return "", e
+		}
+		return snippet.HTML, nil
+	})
+	if includeErr != nil {
+		return "", includeErr
+	}
 	// Parse and execute template
 	t, err := template.New("content").Parse(layout)
 	if err != nil {
@@ -2186,94 +2476,19 @@ func renderSnippet(snippetHTML string, item models.Content) (string, error) {
 
 // RegenerateIndexPages regenerates all published pages whose templates contain lc:query directives.
 // Called after any content mutation so index pages stay in sync.
+// Task 16B: disabled for live writes — V3 index pages update only through
+// explicit Publish (PublicationService). Retained as a no-op so legacy
+// trigger sites keep compiling; the trigger itself is now a no-op for files.
 func (s *ContentService) RegenerateIndexPages(ctx context.Context) {
-	// Find all templates with lc:query directives
-	var templates []models.Template
-	if err := s.db.FindAll(ctx, "templates", bson.M{}, &templates); err != nil {
-		return
-	}
-
-	var indexTemplateIDs []primitive.ObjectID
-	for _, tmpl := range templates {
-		if strings.Contains(tmpl.HTMLLayout, "lc:query") {
-			indexTemplateIDs = append(indexTemplateIDs, tmpl.ID)
-		}
-	}
-	if len(indexTemplateIDs) == 0 {
-		return
-	}
-
-	// Find all published pages using index templates
-	var pages []models.Content
-	if err := s.db.FindAll(ctx, "content", bson.M{
-		"template_id": bson.M{"$in": indexTemplateIDs},
-		"published":   true,
-		"deleted":     bson.M{"$ne": true},
-		"fork_id":     nil,
-	}, &pages); err != nil {
-		return
-	}
-
-	var purgedPaths []string
-	for i := range pages {
-		if err := s.GenerateStaticPage(ctx, &pages[i]); err != nil {
-			fmt.Printf("Warning: failed to regenerate index page %s: %v\n", pages[i].FullPath, err)
-		} else {
-			purgedPaths = append(purgedPaths, pages[i].FullPath)
-		}
-	}
-	if s.cfService != nil && len(purgedPaths) > 0 {
-		go s.cfService.PurgeByURLs(context.Background(), purgedPaths)
-	}
+	return
 }
 
 // RegenerateAllContent regenerates all published content.
 // Clears all content hashes first so every page is regenerated (needed when
 // theme/template/snippet changes affect rendered output globally).
+// Task 16B: disabled for live writes — explicit per-page Publish via
+// PublicationService is required. Retained as a no-op returning nil so
+// legacy admin/API entry points fail safe until Task 16C routes them.
 func (s *ContentService) RegenerateAllContent(ctx context.Context) error {
-	ctx = WithoutIndexNow(ctx) // site-wide re-render, not a content change
-	// Clear all content hashes to force full regeneration
-	s.db.Collection("content").UpdateMany(ctx,
-		bson.M{"content_hash": bson.M{"$exists": true}},
-		bson.M{"$unset": bson.M{"content_hash": ""}},
-	)
-
-	cursor, err := s.db.FindMany(ctx, "content",
-		bson.M{"published": true, "deleted": bson.M{"$ne": true}, "fork_id": nil}, nil)
-	if err != nil {
-		return fmt.Errorf("failed to list content: %w", err)
-	}
-
-	var contents []models.Content
-	if err := cursor.All(ctx, &contents); err != nil {
-		return fmt.Errorf("failed to decode content: %w", err)
-	}
-
-	// Build the wikilink index once for all pages rather than once per page.
-	wikilinkIdx := s.buildWikilinkIndex(ctx)
-
-	// Parallel regeneration with a bounded worker pool.
-	const maxWorkers = 6
-	sem := make(chan struct{}, maxWorkers)
-	var wg sync.WaitGroup
-
-	for i := range contents {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(c models.Content) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := s.generateStaticPageWithWikilinkIndex(ctx, &c, wikilinkIdx); err != nil {
-				fmt.Printf("Warning: failed to generate page %s: %v\n", c.FullPath, err)
-			}
-		}(contents[i])
-	}
-	wg.Wait()
-
-	// Purge entire Cloudflare cache — every page was just regenerated.
-	if s.cfService != nil {
-		go s.cfService.PurgeEverything(context.Background())
-	}
-
 	return nil
 }

@@ -1,12 +1,34 @@
 package handlers
 
 import (
+	"net/http"
 	"net/url"
+	"strings"
 	"testing"
+
+	"github.com/metavert-io/lightcms/v7/internal/services"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+func TestForkPartialMergeResultShowsFailure(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+	rr := getPage(t, func(w http.ResponseWriter, r *http.Request) {
+		h.renderAdmin(w, r, "fork_merge_result", map[string]interface{}{
+			"ForkID": primitive.NewObjectID().Hex(),
+			"Result": &services.MergeResult{Created: 1, Failed: []services.MergeFailure{{FullPath: "/failed", Error: "<script>unsafe</script>"}}},
+		})
+	}, nil)
+	body := rr.Body.String()
+	if rr.Code != 200 || !strings.Contains(body, "/failed") || !strings.Contains(body, "alert-warning") {
+		t.Fatalf("missing partial result: %d %s", rr.Code, body)
+	}
+	if strings.Contains(body, "<script>unsafe</script>") {
+		t.Fatal("failure text was not escaped")
+	}
+}
 
 func mustObjID(t *testing.T, hex string) primitive.ObjectID {
 	t.Helper()

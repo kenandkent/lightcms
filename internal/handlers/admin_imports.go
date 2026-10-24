@@ -407,7 +407,7 @@ func (h *Handler) TriggerRSSSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, err := h.importService.RunRSSImport(r.Context(), id, user.Email)
+	job, err := h.importService.RunRSSImport(importAuthorityContext(r.Context(), user), id, user.Email)
 	if err != nil {
 		http.Error(w, "Failed to start import: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -483,7 +483,7 @@ func (h *Handler) DoImportMarkdown(w http.ResponseWriter, r *http.Request) {
 		pages = []importer.MarkdownPage{importer.ParseMarkdownFile(header.Filename, string(data))}
 	}
 
-	job, err := h.importService.RunMarkdownImport(r.Context(), pages, defaultTemplate, defaultFolder, autoPublish, user.Email)
+	job, err := h.importService.RunMarkdownImport(importAuthorityContext(r.Context(), user), pages, defaultTemplate, defaultFolder, autoPublish, user.Email)
 	if err != nil {
 		http.Error(w, "Failed to start import: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -570,7 +570,7 @@ func (h *Handler) DoImportCSV(w http.ResponseWriter, r *http.Request) {
 		columnMap[h] = h
 	}
 
-	job, err := h.importService.RunCSVImport(r.Context(), records, columnMap, titleColumn, "", templateID, folderPath, autoPublish, user.Email)
+	job, err := h.importService.RunCSVImport(importAuthorityContext(r.Context(), user), records, columnMap, titleColumn, "", templateID, folderPath, autoPublish, user.Email)
 	if err != nil {
 		http.Error(w, "Failed to start import: "+err.Error(), http.StatusInternalServerError)
 		return

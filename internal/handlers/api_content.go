@@ -3,6 +3,8 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,11 +19,24 @@ import (
 
 	"github.com/metavert-io/lightcms/v7/internal/auth"
 	"github.com/metavert-io/lightcms/v7/internal/models"
+	"github.com/metavert-io/lightcms/v7/internal/observe"
 	"github.com/metavert-io/lightcms/v7/internal/services"
 
 	"github.com/gorilla/mux"
+	"github.com/metavert-io/lightcms/v7/internal/product/idempotency"
+	"github.com/metavert-io/lightcms/v7/internal/product/publication"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+// Legacy single/batch endpoints share the same crash-takeover protocol as
+// generation. Always carry the returned generation into the saga and completion.
+func (a *APIHandler) beginLegacyPublication(ctx context.Context, owner, method, path, key string) (idempotency.Operation, error) {
+	op, err := a.idempotencyService.Begin(ctx, owner, method, path, key, nil)
+	if idempotency.CodeOf(err) == idempotency.CodeLeaseExpired {
+		return a.idempotencyService.TakeOverByKey(ctx, owner, method, path, key)
+	}
+	return op, err
+}
 
 // API Content endpoints
 
@@ -37,6 +52,7 @@ type contentListItem struct {
 	Deleted         bool                   `json:"deleted"`
 	UpdatedAt       string                 `json:"updated_at"`
 	MetaDescription string                 `json:"meta_description,omitempty"`
+	Remark          string                 `json:"remark,omitempty"`
 	TemplateID      string                 `json:"template_id,omitempty"`
 	TemplateName    string                 `json:"template_name,omitempty"`
 	ForkID          string                 `json:"fork_id,omitempty"` // set on fork copies (only listed with include_forks)
@@ -73,6 +89,7 @@ func (a *APIHandler) formatContentList(contents []models.Content, includeData bo
 				Published: c.Published, Hold: c.Hold, Deleted: c.Deleted,
 				UpdatedAt:       c.UpdatedAt.Format("2006-01-02T15:04:05Z"),
 				MetaDescription: c.MetaDescription,
+				Remark:          c.Remark,
 				TemplateID:      c.TemplateID.Hex(), TemplateName: c.TemplateName,
 				ForkID: forkIDHex(c.ForkID),
 			}
@@ -99,6 +116,7 @@ func (a *APIHandler) formatContentList(contents []models.Content, includeData bo
 			Published: c.Published, Hold: c.Hold, Deleted: c.Deleted,
 			UpdatedAt:       c.UpdatedAt.Format("2006-01-02T15:04:05Z"),
 			MetaDescription: c.MetaDescription,
+			Remark:          c.Remark,
 			TemplateID:      c.TemplateID.Hex(), TemplateName: c.TemplateName,
 			ForkID: forkIDHex(c.ForkID),
 		}
@@ -204,7 +222,7 @@ func (a *APIHandler) APIGetContent(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -308,6 +326,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		Category        string                 `json:"category"`
 		Tags            []string               `json:"tags"`
 		MetaDescription string                 `json:"meta_description"`
+		Remark          string                 `json:"remark"`
 		OGImage         string                 `json:"og_image"`
 		NoIndex         bool                   `json:"noindex"`
 		Hold            bool                   `json:"hold"`
@@ -324,7 +343,30 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		ForkID          string                 `json:"fork_id"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
+		return
+	}
+	if req.Hold && req.Published {
+		a.jsonError(w, http.StatusConflict, services.ErrContentHeld.Error())
+		return
+	}
+	// Draft-only single-write rule (bulk parity): published:true would
+	// persist a live flag with no Publication record/outbox/idempotency.
+	// Fork-scoped creates are exempt: the flag is inert on fork rows
+	// (never served, never generated; merge clears it). Upsert restating
+	// an already-live flag is allowed (no state change, update parity) —
+	// the path math mirrors ContentService.UpsertContent exactly.
+	if req.ForkID == "" && req.Published && req.Upsert {
+		upsertPath := "/" + req.Slug
+		if req.FolderPath != "" && req.FolderPath != "/" {
+			upsertPath = req.FolderPath + "/" + req.Slug
+		}
+		if existing, uerr := a.contentService.GetContentByPath(r.Context(), upsertPath); uerr != nil || !existing.Published {
+			if a.rejectPublishedDirectWrite(w, false, true) {
+				return
+			}
+		}
+	} else if req.ForkID == "" && a.rejectPublishedDirectWrite(w, false, req.Published) {
 		return
 	}
 
@@ -361,7 +403,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 
 	// Sandbox-only keys must create inside a fork.
 	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && req.ForkID == "" {
-		a.jsonError(w, http.StatusForbidden, "this API key is sandbox-only: new content must be created inside a fork (set fork_id)")
+		a.jsonErrorCode(w, http.StatusForbidden, "PERMISSION_DENIED", "this API key is sandbox-only: new content must be created inside a fork (set fork_id)")
 		return
 	}
 
@@ -400,6 +442,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		Category:        req.Category,
 		Tags:            req.Tags,
 		MetaDescription: req.MetaDescription,
+		Remark:          req.Remark,
 		OGImage:         req.OGImage,
 		NoIndex:         req.NoIndex,
 		Hold:            req.Hold,
@@ -419,7 +462,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 	if req.Upsert {
 		created, err := a.contentService.UpsertContent(r.Context(), content, comment)
 		if err != nil {
-			a.jsonError(w, contentErrorStatus(err), err.Error())
+			a.contentWriteError(w, err)
 			return
 		}
 		action := "updated"
@@ -445,7 +488,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		args = append(args, comment)
 	}
 	if err := a.contentService.CreateContent(r.Context(), content, args...); err != nil {
-		a.jsonError(w, contentErrorStatus(err), err.Error())
+		a.contentWriteError(w, err)
 		return
 	}
 
@@ -460,7 +503,7 @@ func (a *APIHandler) APIUpdateContent(w http.ResponseWriter, r *http.Request) {
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -470,17 +513,18 @@ func (a *APIHandler) APIUpdateContent(w http.ResponseWriter, r *http.Request) {
 		a.jsonError(w, http.StatusNotFound, "content not found")
 		return
 	}
+	wasPublished := content.Published
 
 	// Sandbox-only keys may write to fork copies only, never live pages.
 	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && content.ForkID == nil {
-		a.jsonError(w, http.StatusForbidden, "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
+		a.jsonErrorCode(w, http.StatusForbidden, "PERMISSION_DENIED", "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
 		return
 	}
 
 	// Decode partial update from request body
 	var raw map[string]json.RawMessage
 	if err := a.decodeJSON(r, &raw); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -578,8 +622,15 @@ func (a *APIHandler) APIUpdateContent(w http.ResponseWriter, r *http.Request) {
 	if versionComment != "" {
 		args = append(args, versionComment)
 	}
+	if content.Hold && content.Published && !wasPublished {
+		a.jsonError(w, http.StatusConflict, services.ErrContentHeld.Error())
+		return
+	}
+	if content.ForkID == nil && a.rejectPublishedDirectWrite(w, wasPublished, content.Published) {
+		return
+	}
 	if err := a.contentService.UpdateContent(r.Context(), content, args...); err != nil {
-		a.jsonError(w, contentErrorStatus(err), err.Error())
+		a.contentWriteError(w, err)
 		return
 	}
 
@@ -594,7 +645,7 @@ func (a *APIHandler) APIDeleteContent(w http.ResponseWriter, r *http.Request) {
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -614,7 +665,7 @@ func (a *APIHandler) APIRestoreContent(w http.ResponseWriter, r *http.Request) {
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -627,14 +678,189 @@ func (a *APIHandler) APIRestoreContent(w http.ResponseWriter, r *http.Request) {
 	a.jsonResponse(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
+// contentWriteError maps content-service write failures to HTTP: a lost CAS
+// race (services.ErrVersionConflict) is a 409 CONFLICT for reload + retry —
+// never a 500. All other errors keep the legacy 500 with the raw message.
+func (a *APIHandler) contentWriteError(w http.ResponseWriter, err error) {
+	if errors.Is(err, services.ErrContentHeld) || errors.Is(err, services.ErrPublishForkCopy) {
+		a.jsonError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, services.ErrVersionConflict) {
+		a.jsonErrorCode(w, http.StatusConflict, "CONFLICT", "content changed concurrently; reload and retry")
+		return
+	}
+	a.jsonError(w, http.StatusInternalServerError, err.Error())
+}
+
+// withBulkFailCode adds a machine-readable code to a batch-publish failure
+// entry (omitted when the error carries none).
+func withBulkFailCode(m map[string]string, code string) map[string]string {
+	if code != "" {
+		m["code"] = code
+	}
+	return m
+}
+
+// bulkItemCode attaches a machine-readable code to bulk per-item failures:
+// CAS losers map to CONFLICT (M11 parity with single writes); anything
+// else omits the code (the human message stays authoritative).
+func bulkItemCode(err error) string {
+	if errors.Is(err, services.ErrVersionConflict) {
+		return "CONFLICT"
+	}
+	return ""
+}
+
+// rejectPublishedDirectWrite enforces the draft-only single-write rule (Wave
+// 2B bulk parity): flipping published false→true outside the publish
+// endpoints would persist a live flag with no Publication record, no outbox
+// event, and no idempotency. Round-trips that restate an already-live flag
+// are allowed (no state change); everything else must go through
+// POST /api/v1/content/{id}/publish or batch-publish.
+func (a *APIHandler) rejectPublishedDirectWrite(w http.ResponseWriter, wasPublished, wantPublished bool) bool {
+	if !wasPublished && wantPublished {
+		a.jsonError(w, http.StatusBadRequest, "published:true is not accepted on content write (it would bypass publication records, outbox delivery, and idempotency) — save as a draft, then publish via POST /api/v1/content/{id}/publish or POST /api/v1/content/batch-publish")
+		return true
+	}
+	return false
+}
+
+// publishAttribution resolves saga attribution for the legacy REST publish
+// paths (single + batch): actor human|agent from the agent-session header,
+// via "api", session passthrough. Without this the minted Publication
+// records carry no attribution and session rollback (which selects targets
+// by provenance) is blind to REST-driven publishes.
+func publishAttribution(r *http.Request) (actor, via, session string) {
+	session = r.Header.Get("X-Agent-Session")
+	actor, via = "human", "api"
+	if session != "" {
+		actor = "agent"
+	}
+	return actor, via, session
+}
+
+// publicationReqFields builds the Task 16F structured log fields for a
+// legacy publish/unpublish request: actor from the API user + agent
+// session header, request ID passthrough, stage and duration.
+func (a *APIHandler) publicationReqFields(r *http.Request, stage string, t0 time.Time) observe.Fields {
+	f := observe.Fields{
+		RequestID:    r.Header.Get("X-Request-ID"),
+		AgentSession: r.Header.Get("X-Agent-Session"),
+		Actor:        "human",
+		Stage:        stage,
+		DurationMS:   time.Since(t0).Milliseconds(),
+	}
+	if f.AgentSession != "" {
+		f.Actor = "agent"
+	}
+	if u := a.getAPIUser(r); u != nil {
+		f.UserID = u.Email
+		if u.ID != "" {
+			f.UserID = u.ID
+		}
+	}
+	return f
+}
+
 func (a *APIHandler) APIPublishContent(w http.ResponseWriter, r *http.Request) {
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Lane 2A: publish-by-ID targets always exist, and the generation scope
+	// matrix requires edit+publish for existing targets — a publish-only
+	// scoped key gets 403 here with zero mutation (before ID parsing,
+	// idempotency Begin, and any saga call).
+	if !a.requirePermission(w, r, auth.PermContentEdit) {
+		return
+	}
+	// Task 16F: request duration for the structured publish log.
+	t0 := time.Now()
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
+		return
+	}
+
+	// Task 16C: route through PublicationService when wired. External
+	// single publish requires Idempotency-Key (428 when absent); the saga
+	// freezes versions under lock, cuts over atomically and returns the
+	// Publication ID + Public URL. Legacy path preserved when unwired.
+	if a.publicationService != nil {
+		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if key == "" {
+			f := a.publicationReqFields(r, "publish", t0)
+			f.StatusCode, f.ErrorCode = 428, "IDEMPOTENCY_KEY_REQUIRED"
+			observe.LogPublication("publish_rejected", f)
+			a.jsonErrorCode(w, 428, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required for publish")
+			return
+		}
+		var opID *primitive.ObjectID
+		var opAttempt int64
+		if a.idempotencyService != nil {
+			owner := ""
+			if u := a.getAPIUser(r); u != nil {
+				owner = u.OperationOwner()
+			}
+			op, berr := a.beginLegacyPublication(r.Context(), owner, r.Method, r.URL.Path, key)
+			if berr != nil {
+				f := a.publicationReqFields(r, "publish", t0)
+				f.ContentID = id.Hex()
+				f.StatusCode, f.ErrorCode = idemHTTPStatus(berr), "IDEMPOTENCY_CONFLICT"
+				observe.LogPublication("publish_rejected", f)
+				a.jsonError(w, idemHTTPStatus(berr), sanitizeAPIError(berr))
+				return
+			}
+			if op.Replay && op.Response != nil {
+				f := a.publicationReqFields(r, "publish", t0)
+				f.ContentID = id.Hex()
+				if pid, ok := op.Response["publication_id"].(string); ok {
+					f.PublicationID = pid
+				}
+				f.StatusCode = 200
+				observe.LogPublication("publish_replay", f)
+				a.jsonResponse(w, http.StatusOK, op.Response)
+				return
+			}
+			opID = &op.ID
+			opAttempt = op.Attempt
+			r = r.WithContext(idempotency.WithLeaseGeneration(r.Context(), op.LeaseGeneration))
+		}
+		pubActor, pubVia, pubSession := publishAttribution(r)
+		pubAdmin := false
+		if u := a.getAPIUser(r); u != nil && u.Role == "admin" {
+			pubAdmin = true
+		}
+		res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID, Actor: pubActor, Via: pubVia, AgentSession: pubSession, AuthorIsAdmin: pubAdmin})
+		if perr != nil {
+			f := a.publicationReqFields(r, "publish", t0)
+			f.ContentID = id.Hex()
+			f.StatusCode, f.ErrorCode = publicationHTTPStatus(perr), publication.CodeOf(perr)
+			observe.LogPublication("publish_failed", f)
+			a.jsonError(w, publicationHTTPStatus(perr), sanitizeAPIError(perr))
+			return
+		}
+		if opID != nil && a.idempotencyService != nil {
+			_, _ = a.idempotencyService.Complete(r.Context(), *opID, opAttempt, 200, map[string]any{
+				"success":        true,
+				"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
+				"content_id": res.ContentID.Hex(), "full_path": res.FullPath,
+			}, false)
+		}
+		a.auditLog(r, "content.publish", "content", id.Hex(), map[string]interface{}{
+			"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
+		})
+		f := a.publicationReqFields(r, "publish", t0)
+		f.ContentID, f.ContentVersion = id.Hex(), res.ContentVersion
+		f.PublicationID, f.FullPath = res.PublicationID.Hex(), res.FullPath
+		f.StatusCode = 200
+		observe.LogPublication("publish", f)
+		a.jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"success": true, "publication_id": res.PublicationID.Hex(),
+			"public_url": res.PublicURL, "full_path": res.FullPath,
+			"content_version": res.ContentVersion,
+		})
 		return
 	}
 
@@ -651,10 +877,33 @@ func (a *APIHandler) APIUnpublishContent(w http.ResponseWriter, r *http.Request)
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Task 16F: request duration for the structured unpublish log.
+	t0 := time.Now()
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
+		return
+	}
+
+	// Task 16C: Unpublish is naturally idempotent — no Idempotency-Key.
+	if a.publicationService != nil {
+		pubActor, pubVia, pubSession := publishAttribution(r)
+		if err := a.publicationService.Unpublish(r.Context(), publication.UnpublishRequest{
+			ContentID: id, Actor: pubActor, Via: pubVia, AgentSession: pubSession,
+		}); err != nil {
+			f := a.publicationReqFields(r, "unpublish", t0)
+			f.ContentID = id.Hex()
+			f.StatusCode, f.ErrorCode = publicationHTTPStatus(err), publication.CodeOf(err)
+			observe.LogPublication("unpublish_failed", f)
+			a.jsonError(w, publicationHTTPStatus(err), sanitizeAPIError(err))
+			return
+		}
+		f := a.publicationReqFields(r, "unpublish", t0)
+		f.ContentID, f.StatusCode = id.Hex(), 200
+		observe.LogPublication("unpublish", f)
+		a.auditLog(r, "content.unpublish", "content", id.Hex(), nil)
+		a.jsonResponse(w, http.StatusOK, map[string]interface{}{"success": true})
 		return
 	}
 
@@ -673,7 +922,7 @@ func (a *APIHandler) APIListContentVersions(w http.ResponseWriter, r *http.Reque
 	}
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -692,7 +941,7 @@ func (a *APIHandler) APIGetContentVersion(w http.ResponseWriter, r *http.Request
 	}
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -718,7 +967,7 @@ func (a *APIHandler) APIRevertContentVersion(w http.ResponseWriter, r *http.Requ
 
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -930,7 +1179,7 @@ func (a *APIHandler) APISearchReplacePreview(w http.ResponseWriter, r *http.Requ
 		Pairs   []srPair `json:"pairs"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -1028,6 +1277,14 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Lane 2A: execute requires Idempotency-Key (428 when absent) with zero
+	// mutation — before the bulk slot, body parsing, scanning, or writes.
+	// The stable per-page auto-republish keys below derive from this header.
+	if strings.TrimSpace(r.Header.Get("Idempotency-Key")) == "" {
+		a.jsonErrorCode(w, 428, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required for search-replace execute")
+		return
+	}
+
 	if !acquireBulkOp() {
 		a.jsonError(w, http.StatusTooManyRequests, "a bulk operation is already in progress, please retry shortly")
 		return
@@ -1043,7 +1300,7 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 		AutoRepublish  bool     `json:"auto_republish"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -1061,6 +1318,9 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 	// Enforce a maximum duration for the entire operation.
 	ctx, cancel := context.WithTimeout(r.Context(), bulkOpTimeout)
 	defer cancel()
+
+	// Task 16D: stable per-page operation keys for auto-republish.
+	srReqKey := searchReplaceRequestKey(r)
 
 	// Stream documents one-by-one — avoids loading the full collection into memory.
 	cursor, err := a.contentService.StreamContent(ctx, false)
@@ -1128,7 +1388,11 @@ func (a *APIHandler) APISearchReplaceExecute(w http.ResponseWriter, r *http.Requ
 			return nil
 		}
 		if req.AutoRepublish && wasPublished {
-			a.contentService.PublishContent(ctx, content.ID)
+			// Task 16D: republish through PublicationService under a stable
+			// per-page key — retries replay, never duplicate.
+			_ = a.contentService.PublishInternal(ctx, content.ID,
+				"search-replace", "/api/v1/search-replace/execute",
+				services.SearchReplaceOpKey(srReqKey, content.ID))
 		}
 		return &UpdatedPage{
 			ID: content.ID.Hex(), Title: newTitle,
@@ -1280,17 +1544,28 @@ func (a *APIHandler) renderContentWithWarnings(r *http.Request, content *models.
 // Fork copies and held pages are never published here: they are returned in
 // "skipped" with a reason instead of "failed". publish_all_drafts does not
 // consider fork copies at all (they are not drafts of the site).
+// Task 16C: routes per item through PublicationService when wired (no raw
+// GenerateStaticPage), requires Idempotency-Key (428 when absent), and
+// returns per-item Publication IDs. Legacy path preserved when unwired.
 func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Request) {
 	if !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
+	// Lane 2A: batch items are existing pages by ID — require edit in
+	// addition to publish (generation scope matrix), 403 with zero mutation
+	// before body parsing or any publish call.
+	if !a.requirePermission(w, r, auth.PermContentEdit) {
+		return
+	}
+	// Task 16F: request duration for the structured batch log.
+	t0 := time.Now()
 
 	var req struct {
 		IDs              []string `json:"ids"`
 		PublishAllDrafts bool     `json:"publish_all_drafts"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -1352,6 +1627,83 @@ func (a *APIHandler) APIBatchPublishContent(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	var publications []map[string]string
+	if a.publicationService != nil {
+		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if key == "" {
+			f := a.publicationReqFields(r, "batch_publish", t0)
+			f.StatusCode, f.ErrorCode = 428, "IDEMPOTENCY_KEY_REQUIRED"
+			observe.LogPublication("publish_rejected", f)
+			a.jsonErrorCode(w, 428, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required for batch publish")
+			return
+		}
+		for _, id := range ids {
+			// Lane 2A: per-item idempotency under the batch key. The
+			// UNIQUE(owner, method, path, key) index (EnsureProductIndexes)
+			// isolates each item via its path suffix, so a same-key retry
+			// replays cached per-item responses instead of minting
+			// duplicate publications. Mirrors the single-publish
+			// Begin/Publish/Complete shape.
+			var opID *primitive.ObjectID
+			var opAttempt int64
+			if a.idempotencyService != nil {
+				owner := ""
+				if u := a.getAPIUser(r); u != nil {
+					owner = u.OperationOwner()
+				}
+				itemPath := strings.TrimSuffix(strings.TrimSpace(r.URL.Path), "/") + "/items/" + id.Hex()
+				op, berr := a.beginLegacyPublication(r.Context(), owner, r.Method, itemPath, key)
+				if berr != nil {
+					failed = append(failed, withBulkFailCode(map[string]string{"id": id.Hex(), "error": sanitizeAPIError(berr)}, publication.CodeOf(berr)))
+					continue
+				}
+				if op.Replay && op.Response != nil {
+					pid, _ := op.Response["publication_id"].(string)
+					purl, _ := op.Response["public_url"].(string)
+					published = append(published, id.Hex())
+					publications = append(publications, map[string]string{
+						"id": id.Hex(), "publication_id": pid, "public_url": purl,
+					})
+					continue
+				}
+				opID = &op.ID
+				opAttempt = op.Attempt
+				r = r.WithContext(idempotency.WithLeaseGeneration(r.Context(), op.LeaseGeneration))
+			}
+			pubActor, pubVia, pubSession := publishAttribution(r)
+			pubAdmin := false
+			if u := a.getAPIUser(r); u != nil && u.Role == "admin" {
+				pubAdmin = true
+			}
+			res, perr := a.publicationService.Publish(r.Context(), publication.PublishRequest{ContentID: id, IdempotencyRecord: opID, Actor: pubActor, Via: pubVia, AgentSession: pubSession, AuthorIsAdmin: pubAdmin})
+			if perr != nil {
+				failed = append(failed, withBulkFailCode(map[string]string{"id": id.Hex(), "error": sanitizeAPIError(perr)}, publication.CodeOf(perr)))
+			} else {
+				if opID != nil && a.idempotencyService != nil {
+					_, _ = a.idempotencyService.Complete(r.Context(), *opID, opAttempt, 200, map[string]any{
+						"success":        true,
+						"publication_id": res.PublicationID.Hex(), "public_url": res.PublicURL,
+						"content_id": res.ContentID.Hex(), "full_path": res.FullPath,
+					}, false)
+				}
+				published = append(published, id.Hex())
+				publications = append(publications, map[string]string{
+					"id": id.Hex(), "publication_id": res.PublicationID.Hex(),
+					"public_url": res.PublicURL,
+				})
+			}
+		}
+		a.auditLog(r, "content.batch_publish", "content", "", map[string]interface{}{"count": len(published)})
+		f := a.publicationReqFields(r, "batch_publish", t0)
+		f.StatusCode = 200
+		observe.LogPublication("batch_publish", f)
+		a.jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"published":    published,
+			"publications": publications,
+			"failed":       failed,
+		})
+		return
+	}
 	for _, id := range ids {
 		err := a.contentService.PublishContent(r.Context(), id)
 		switch {
@@ -1385,7 +1737,7 @@ func (a *APIHandler) APIPreviewContent(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid content ID")
 		return
 	}
 
@@ -1438,16 +1790,17 @@ func (a *APIHandler) APIUpdateContentByPath(w http.ResponseWriter, r *http.Reque
 	if content == nil {
 		return
 	}
+	wasPublished := content.Published
 
 	// Sandbox-only keys may write to fork copies only, never live pages.
 	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && content.ForkID == nil {
-		a.jsonError(w, http.StatusForbidden, "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
+		a.jsonErrorCode(w, http.StatusForbidden, "PERMISSION_DENIED", "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
 		return
 	}
 
 	var raw map[string]json.RawMessage
 	if err := a.decodeJSON(r, &raw); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -1506,8 +1859,15 @@ func (a *APIHandler) APIUpdateContentByPath(w http.ResponseWriter, r *http.Reque
 	if versionComment != "" {
 		args = append(args, versionComment)
 	}
+	if content.Hold && content.Published && !wasPublished {
+		a.jsonError(w, http.StatusConflict, services.ErrContentHeld.Error())
+		return
+	}
+	if content.ForkID == nil && a.rejectPublishedDirectWrite(w, wasPublished, content.Published) {
+		return
+	}
 	if err := a.contentService.UpdateContent(r.Context(), content, args...); err != nil {
-		a.jsonError(w, contentErrorStatus(err), err.Error())
+		a.contentWriteError(w, err)
 		return
 	}
 
@@ -1559,7 +1919,7 @@ func (a *APIHandler) APIScopedSearchReplacePreview(w http.ResponseWriter, r *htt
 		Scope   scopeFilter `json:"scope"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 	if req.Search == "" {
@@ -1648,6 +2008,13 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 		return
 	}
 
+	// Lane 2A: scoped execute requires Idempotency-Key (428 when absent)
+	// with zero mutation — mirrors the global execute path.
+	if strings.TrimSpace(r.Header.Get("Idempotency-Key")) == "" {
+		a.jsonErrorCode(w, 428, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required for search-replace execute")
+		return
+	}
+
 	if !acquireBulkOp() {
 		a.jsonError(w, http.StatusTooManyRequests, "a bulk operation is already in progress, please retry shortly")
 		return
@@ -1663,7 +2030,7 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 		Scope          scopeFilter `json:"scope"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 	if req.Search == "" {
@@ -1692,6 +2059,8 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Task 16D: stable per-page operation keys for auto-republish.
+	scopedReqKey := searchReplaceRequestKey(r)
 
 	// Push scope filters to MongoDB and stream results to avoid loading the full
 	// scoped set into memory before processing starts.
@@ -1746,7 +2115,11 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 			return nil
 		}
 		if req.AutoRepublish && wasPublished {
-			a.contentService.PublishContent(ctx, content.ID)
+			// Task 16D: republish through PublicationService under a stable
+			// per-page key — retries replay, never duplicate.
+			_ = a.contentService.PublishInternal(ctx, content.ID,
+				"search-replace", "/api/v1/search-replace/scoped/execute",
+				services.SearchReplaceOpKey(scopedReqKey, content.ID))
 		}
 		return &UpdatedPage{
 			ID: content.ID.Hex(), Title: newTitle,
@@ -1816,6 +2189,60 @@ func (a *APIHandler) APIScopedSearchReplaceExecute(w http.ResponseWriter, r *htt
 		resp["warning"] = "operation timed out; results are partial"
 	}
 	a.jsonResponse(w, http.StatusOK, resp)
+}
+
+// publicationHTTPStatus maps saga errors to HTTP statuses (spec §27).
+// Falls back to 500 for unknown internals; never leaks driver detail
+// (sanitizeAPIError handles the body).
+func publicationHTTPStatus(err error) int {
+	code := publication.CodeOf(err)
+	switch code {
+	case publication.CodeNotFound, "CONTENT_NOT_FOUND":
+		return http.StatusNotFound
+	case "FIELD_VALIDATION_FAILED", "PATH_INVALID", "CONTENT_PUBLISH_FAILED", publication.CodeRenderValidation:
+		return 422
+	case "TEMPLATE_NOT_ACTIVE", "TEMPLATE_VERSION_CHANGED", "PATH_CONFLICT",
+		"PUBLICATION_CONFLICT", "PAGE_PUBLISH_IN_PROGRESS", "CONTENT_VERSION_CONFLICT":
+		return http.StatusConflict
+	case "PUBLIC_URL_RESOLUTION_FAILED":
+		return http.StatusFailedDependency
+	default:
+		if publication.IsConflict(err) {
+			return http.StatusConflict
+		}
+		return http.StatusInternalServerError
+	}
+}
+
+// idemHTTPStatus maps idempotency Begin errors to HTTP statuses.
+func idemHTTPStatus(err error) int {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "IDEMPOTENCY_CONFLICT"), strings.Contains(msg, "conflict"):
+		return http.StatusConflict
+	case strings.Contains(msg, "STALE_ATTEMPT"), strings.Contains(msg, "stale"):
+		return http.StatusConflict
+	case strings.Contains(msg, "REQUEST_IN_PROGRESS"), strings.Contains(msg, "in progress"):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// searchReplaceRequestKey returns the stable key for one search-replace
+// execute request (Task 16D): the caller's Idempotency-Key header when
+// present, else one fresh random key for this request. Per-page operation
+// keys (sr/<reqkey>/<contentID>) make auto-republish retries replay instead
+// of minting duplicate Publications.
+func searchReplaceRequestKey(r *http.Request) string {
+	if key := strings.TrimSpace(r.Header.Get("Idempotency-Key")); key != "" {
+		return key
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("sr-req-%d", time.Now().UnixNano())
+	}
+	return "sr-req-" + hex.EncodeToString(b[:])
 }
 
 // sanitizeAPIError converts internal errors to safe external messages,
@@ -1900,6 +2327,7 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 			Category        string                 `json:"category"`
 			Tags            []string               `json:"tags"`
 			MetaDescription string                 `json:"meta_description"`
+			Remark          string                 `json:"remark"`
 			OGImage         string                 `json:"og_image"`
 			NoIndex         bool                   `json:"noindex"`
 			AuthorName      string                 `json:"author_name"`
@@ -1915,7 +2343,7 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 		Upsert         bool   `json:"upsert"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -1926,6 +2354,18 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 	if len(req.Items) > 100 {
 		a.jsonError(w, http.StatusBadRequest, "maximum 100 items per batch")
 		return
+	}
+
+	// Lane 2B: bulk-create is a draft-only write path — it mints no
+	// Publication row, no outbox event, and no idempotency record. Accepting
+	// published:true would persist a live flag without control-plane truth
+	// (the pre-V3 divergence). Reject with a 400 that directs to the publish
+	// endpoints; this also covers upsert mode below, which shares the flag.
+	for i, item := range req.Items {
+		if item.Published {
+			a.jsonError(w, http.StatusBadRequest, fmt.Sprintf("item %d: published:true is not accepted on bulk-create (it would bypass publication records, outbox delivery, and idempotency) — create the item as a draft, then publish via POST /api/v1/content/{id}/publish, POST /api/v1/content/batch-publish, or the page-generation publish endpoint", i))
+			return
+		}
 	}
 
 	// Resolve templates and folders once
@@ -1969,6 +2409,7 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 			Category:        item.Category,
 			Tags:            item.Tags,
 			MetaDescription: item.MetaDescription,
+			Remark:          item.Remark,
 			OGImage:         item.OGImage,
 			NoIndex:         item.NoIndex,
 			AuthorName:      item.AuthorName,
@@ -2008,13 +2449,14 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 			Action   string `json:"action"`
 			Success  bool   `json:"success"`
 			Error    string `json:"error,omitempty"`
+			Code     string `json:"code,omitempty"`
 		}
 		results := make([]upsertResult, len(items))
 		succeeded := 0
 		for i, c := range items {
 			created, err := a.contentService.UpsertContent(r.Context(), c, req.VersionComment)
 			if err != nil {
-				results[i] = upsertResult{Index: i, Success: false, Error: sanitizeAPIError(err)}
+				results[i] = upsertResult{Index: i, Success: false, Error: sanitizeAPIError(err), Code: bulkItemCode(err)}
 			} else {
 				action := "updated"
 				if created {
@@ -2075,6 +2517,7 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 		Data            map[string]interface{} `json:"data,omitempty"`
 		ClearFields     []string               `json:"clear_fields,omitempty"`
 		MetaDescription string                 `json:"meta_description,omitempty"`
+		Remark          string                 `json:"remark,omitempty"`
 	}
 	var req struct {
 		Updates        []updateSpec `json:"updates"`
@@ -2082,7 +2525,7 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 		DryRun         bool         `json:"dry_run"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 	if len(req.Updates) == 0 {
@@ -2103,6 +2546,7 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 		ID      string `json:"id"`
 		Success bool   `json:"success"`
 		Error   string `json:"error,omitempty"`
+		Code    string `json:"code,omitempty"`
 	}
 
 	// Parse all IDs up front so we can batch-fetch content in one query.
@@ -2208,6 +2652,9 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 					if job.upd.MetaDescription != "" {
 						c.MetaDescription = job.upd.MetaDescription
 					}
+					if job.upd.Remark != "" {
+						c.Remark = job.upd.Remark
+					}
 					if job.upd.Data != nil {
 						if c.Data == nil {
 							c.Data = make(map[string]interface{})
@@ -2224,7 +2671,7 @@ func (a *APIHandler) APIBulkUpdateContent(w http.ResponseWriter, r *http.Request
 					}
 					var res UpdateResult
 					if err := a.contentService.UpdateContent(r.Context(), c, versionComment); err != nil {
-						res = UpdateResult{ID: job.upd.ID, Success: false, Error: sanitizeAPIError(err)}
+						res = UpdateResult{ID: job.upd.ID, Success: false, Error: sanitizeAPIError(err), Code: bulkItemCode(err)}
 					} else {
 						res = UpdateResult{ID: job.upd.ID, Success: true}
 					}
@@ -2326,7 +2773,7 @@ func (a *APIHandler) APIBulkFieldOperation(w http.ResponseWriter, r *http.Reques
 		Scope          scopeFilter `json:"scope"`
 	}
 	if err := a.decodeJSON(r, &req); err != nil {
-		a.jsonError(w, http.StatusBadRequest, "invalid request body")
+		a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 		return
 	}
 
@@ -2345,7 +2792,7 @@ func (a *APIHandler) APIBulkFieldOperation(w http.ResponseWriter, r *http.Reques
 		"deleted": true, "slug": true, "full_path": true, "folder_path": true,
 		"folder_id": true, "created_at": true, "updated_at": true, "published_at": true,
 		"fork_id": true, "category": true, "tags": true, "meta_description": true,
-		"og_image": true, "content_hash": true, "use_header": true, "use_footer": true,
+		"remark": true, "og_image": true, "content_hash": true, "use_header": true, "use_footer": true,
 		"use_theme": true, "raw_mode": true, "locked_by": true, "locked_at": true,
 		"noindex": true, "author_name": true, "author_url": true, "content_modified_at": true,
 		"hold": true,
@@ -2380,6 +2827,7 @@ func (a *APIHandler) APIBulkFieldOperation(w http.ResponseWriter, r *http.Reques
 		Success  bool   `json:"success"`
 		HasValue bool   `json:"has_value,omitempty"` // dry_run only: whether the field currently has a non-empty value
 		Error    string `json:"error,omitempty"`
+		Code     string `json:"code,omitempty"`
 	}
 
 	results := make([]ItemResult, len(contents))
@@ -2441,7 +2889,7 @@ func (a *APIHandler) APIBulkFieldOperation(w http.ResponseWriter, r *http.Reques
 					c.Data[req.Field] = newVal
 					var res ItemResult
 					if err := a.contentService.UpdateContent(r.Context(), &c, versionComment); err != nil {
-						res = ItemResult{ID: c.ID.Hex(), Title: c.Title, FullPath: c.FullPath, Success: false, Error: sanitizeAPIError(err)}
+						res = ItemResult{ID: c.ID.Hex(), Title: c.Title, FullPath: c.FullPath, Success: false, Error: sanitizeAPIError(err), Code: bulkItemCode(err)}
 					} else {
 						res = ItemResult{ID: c.ID.Hex(), Title: c.Title, FullPath: c.FullPath, Success: true}
 					}
@@ -2498,7 +2946,7 @@ func (a *APIHandler) APIExportContent(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == "POST" {
 		if err := a.decodeJSON(r, &req); err != nil {
-			a.jsonError(w, http.StatusBadRequest, "invalid request body")
+			a.jsonErrorCode(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body")
 			return
 		}
 	}

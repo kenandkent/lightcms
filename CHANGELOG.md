@@ -256,6 +256,66 @@ Every feature works on any LightCMS install. Existing sites behave as before unt
 ### Fixed
 - sitemap.xml no longer lists soft-deleted pages or fork copies, and its query uses a projection instead of loading full content documents.
 
+## [7.3.0] - 2026-09-30
+
+### Added — V3 templatized page generation and static publication system
+- **Immutable publication records**: every publish mints a staged → active `content_publications` record with SHA-256 content hash, renderer version, and build SHA; canonical files cut over atomically with `.previous-*` sidecars for restart repair.
+- **Template versions**: immutable v1+ snapshots with contract/render hashes and a draft → active → deprecated lifecycle. Publishing against a non-active template is rejected with 409 `TEMPLATE_NOT_ACTIVE`.
+- **Idempotent operations**: stable operation keys for scheduler, import, copilot, search-replace, and upgrade callers; same-key replay creates no duplicate publication or outbox row; crashed-worker lease takeover instead of duplicates.
+- **Migration**: `migrate-publications` dry-run/apply reconciles legacy pages (verified vs `legacy_unverified` import, missing-static and invalid-path blocking reports), backfills template v1 + `current_version`, then swaps to the canonical index set. Resume-safe; re-run after completion is a no-op.
+- **Recovery scanner**: startup/interval pass repairs cutover crashes (previous restore, unpublish-backup restore, canonical rebuild), enforces the migration-gated orphan rule, and never deletes bytes (quarantine preserves).
+- **Legacy entry compatibility**: single binary serves the existing publish/unpublish/regenerate/by-path/asset routes with V3 semantics; manual regenerate is a fail-safe no-op returning 200 until the 410-vs-upgrade-redirect decision lands.
+- **MCP**: 122 tools including `get_template_schema`; public read-only MCP endpoint unchanged.
+
+### Fixed
+- Recovery scanner no longer treats fork copies as live pages: a fork sharing a live path previously drove the no-active orphan rule and quarantined the serving canonical (found by the 7.3.0 release rehearsal; regression test `TestScannerForkCopyKeepsLiveOnline`).
+- Migration template backfill now matches templates lacking `current_version` entirely (`$exists: false` alongside `$lte: 0`), per §35.2.
+- Publish/rollback error mapping preserves spec §27 not-found codes: unknown rollback source → 404 `PUBLICATION_NOT_FOUND`, unknown template/version → 404, template version conflict → 409 (previously all collapsed to 500 `INTERNAL_ERROR`).
+- Removed the dead `isStoreErr` tautology in the saga error mapper (both branches returned the same retryable 503).
+
+### Added — post-rehearsal waves 1–4 (i18n, contracts, admin UX)
+- **Bilingual UI (zh/en)**: full Chinese/English internationalization of the admin console and public site — ~986 dictionary keys behind per-string `i18n` template calls, language switcher, and the root-scope `Lang` fix so layout partials resolve translations.
+- **Edit-page publish controls**: a 发布上线 (Publish) button posting to the saga-backed `/cm/content/{id}/publish` with an `expected_active_id` lost-update precondition, a 发布历史 (Publications) link into the restore/rollback history, and help text explaining the published checkbox flow.
+- **Typed API client errors**: `apiclient` auto-mints `Idempotency-Key` headers on search-replace executes and parses both error envelope shapes into `APIError{Status, Code, Message, Retryable, RequestID}`.
+- **Machine-readable legacy error codes**: session/CSRF JSON errors now emit `{"error":"<message>","code":"<CODE>"}` — the `error` field stays a string for existing clients, codes documented in docs/API.md §12.
+- **MCP publish transparency**: `publish_content` / `publish_multiple` return `publication_id` + `public_url` JSON, and tool descriptions state the exact permissions required (`content.edit` + `content.publish`).
+
+### Changed — post-rehearsal waves 1–4 (scope, control plane, RBAC)
+- **Publish scope enforcement**: REST publish and batch-publish require `content.edit` + `content.publish`; publish, batch-publish, and search-replace execute reject missing idempotency keys with 428 `IDEMPOTENCY_KEY_REQUIRED`.
+- **Batch publish is per-item idempotent**: replaying a batch under the same key returns the original per-item outcomes instead of minting duplicate publications; bulk create rejects `published:true` (it would bypass publication records, outbox delivery, and idempotency) with an actionable 400.
+- **Admin form saves route through the publication control plane**: checking 已发布 on create or update runs the PublicationService saga (Publication record, static bytes, audit/outbox owned by the saga); unchecking runs the saga unpublish; unwired installs keep the legacy flag behavior byte-for-byte.
+- **Admin RBAC**: granular permission gates on destructive admin POSTs (delete content/template/snippet), on all seven publication endpoints (publish, restore-and-publish, revert-live, upgrade start/run, publications, upgrade preview), and on content create/update/revert (viewer → 403; contributor keeps the submit-for-approval flow).
+
+### Fixed — post-rehearsal waves 1–4 (correctness)
+- Serving-layer safety filters and served-truth alignment: path/case/asset canonical guards so redirects, slugs, and generated-file lookups agree on one canonical form.
+- Outbox durability: webhook outbox idempotency, delivery payload race, and embedding search-index pinning under concurrent publish.
+- Asset-canonical collision guard shared with the admin upload form (uploads could claim a path the canonical index already owned).
+- Saga error mapping with spec §27 codes plus comment attribution provenance, template rename race, and the theme-writer path.
+- Version concurrency: `saveVersion` inserts the CAS-allocated version number and heals only when that version already exists — a slower concurrent writer can no longer jump history and skip its version (`UNIQUE(content_id, version)` holds under load).
+- **Admin publication forms work end-to-end**: restore/revert buttons always failed because forms never emitted the required `idempotency_key`, and 恢复为草稿 posted to an unregistered route (404); forms now carry render-time idempotency keys + `expected_active_id`, retry preserves both, and 恢复为草稿 targets the registered revert route.
+- Upgrade UI: the preview page's start form posted to a GET-only route (405) and the job retry form re-created jobs instead of running them — now targeting `/upgrade-start` and `/upgrade-jobs/{id}/run`.
+- Admin product pages parse and execute the admin layout (raw `{{i18n}}`/CSRF placeholders previously shipped as literal page text) and stamp CSRF tokens on their POST forms (they were unpostable behind `csrf.Protect`).
+- Delete-page button is a top-level form again: the previously nested `<form>` start tag was dropped by HTML parsers, silently turning 删除页面 into a save.
+- Merge result lists `requires_publish` entries as links to their edit pages, so the merge → publish flow is reachable.
+
+### Fixed — independent implementation review R01–R12 + admin/API hardening
+- **V3 actor authorization (R01)**: the product API actor dropped the RBAC role and treated empty scopes as allow-all — a viewer could create/edit/publish through the new endpoints. `Actor` now carries `Role`; every generation check uses `Can()` (role ∩ sandbox-only ∩ key-scope allowlist, mirroring `auth.UserHasPermission`).
+- **Production renderer (R02)**: the saga rendered with an inline converter marking every string trusted HTML. Production now renders through the frozen snapshot pipeline (Markdown per field type, sanitizer policy, snippets, wikilinks, TOC, lc:query) with script-policy `admin_only` resolved from real authorship (`AuthorIsAdmin` threaded from every publish caller) and renderer provenance taken from the actual result. Hostile vectors fail closed (`RENDER_UNSAFE_CONTENT`) instead of shipping.
+- **Atomic canonical cutover (R03)**: republish prepared `.next` only after moving canonical away, exposing a missing-file window. Now: verify `.next` first, copy (not move) the backup, flip with one atomic rename — readers see complete old or new bytes, never ENOENT.
+- **Idempotency state machine (R04–R07)**: expired leases are CAS-taken-over and resumed from the durable snapshot (same-key retries converge instead of wedging on `REQUEST_IN_PROGRESS`); authorization runs before `Begin` so 403 creates no lease; completed replays short-circuit before template/version/validation gates (same key survives upgrades); validation-cache replays rebuild their 422 (with details) instead of degrading to 200-empty; idempotency hashes no longer embed the resolved template version; a lease heartbeat with cancel-on-loss plus pre-completion ownership checks fences stale workers; content writes are skipped on resume via the op binding.
+- **Activation integrity (R08/R11)**: rename redirects commit in the activation transaction (post-commit backfill kept as the retry path); indeterminate commits (txn error + read-back error) return `ACTIVATION_UNKNOWN` with zero compensation — staged records, files, and backups are retained for scanner/same-key retry (same-key resume reuses the frozen publication via idempotent re-stage); unpublish mirrors the protocol symmetrically.
+- **Deployment gates (R10/R12)**: single-instance boot gate (liveness heartbeat + fail-fast on a rival) — scale-out stays unsupported and explicit; production refuses to boot on non-HTTPS/invalid public base URLs.
+- **Serving + admin RBAC gaps**: `ServePage` filters soft-deleted rows; all mutating admin endpoints (assets, folders, collections, redirects, settings, keys, messages, link tools, search-replace) enforce their API-matrix permissions; copilot publish requires edit + publish; middleware 401s carry sibling codes.
+- **Provenance gaps closed**: REST single/batch publish, admin form/API publishes, comments, and deletes now attribute actor/via/session (or preserve middleware stamps); admin publish carries an idempotency key with takeover/resume; single-point writes reject `published:true` (fork rows exempt — the flag is inert there and merge clears it); CAS losses map to 409; embedding batch excludes forks and projects; legacy `printf "%q"` double-escape fixed.
+
+### Fixed — review-feedback round (same release)
+- **Lease fencing (R07 complete)**: `Complete`/`MarkTerminal`/`Bind`/`Freeze` CAS on the caller-owned lease generation (carried via context, backward compatible when absent) — a stale worker can no longer write onto a taken-over attempt (`IDEMPOTENCY_LEASE_LOST`); `Begin` retries the TTL-expiry race instead of handing out an unpersisted ID; publish-side binding failures release the lease.
+- **Unpublish attribution**: `UnpublishRequest` carries actor/via/session into the unpublished row and the outbox event; saga audit merges request provenance/session.
+- **Single-instance gate hardening (R10)**: multi-rival scan (a stale local reap never masks a live rival), same-host dead-pid reaping with fail-closed parsing, graceful self-removal guarded by `started_at`, `prod` env covered by the HTTPS gate.
+- **Error-code unification**: middleware table aligned to `defaultErrorCode` (403 `PERMISSION_DENIED`, 422 `VALIDATION_FAILED`, 503 `SERVICE_UNAVAILABLE`); bulk per-item failures carry machine codes; validation-cache replays rebuild their 422 with field details (BSON-safe decode).
+- **Background crash-takeover**: fixed the `PublishInternal` shadowed-op bug that wedged every scheduler crash retry on `IDEMPOTENCY_NOT_FOUND` — takeovers now converge with exactly one publication (pinned e2e verdicts revised to the fixed behavior).
+- Minor: `InsertStaged` tolerance compares path/template; admin `ACTIVATION_UNKNOWN` retryable; `content_forks` resolver index; embedding stats exclude forks; `lc:query`/snapshot drift documented; dead `publish()` removed.
+
 ---
 
 ## [7.2.2] - 2026-07-07

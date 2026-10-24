@@ -210,10 +210,20 @@ func (a *App) runContent(args []string) error {
 		if id == "" {
 			return fmt.Errorf("content ID required")
 		}
-		if err := a.client.PublishContent(ctx, id); err != nil {
+		// Task 16C: publishes through PublicationService via REST; the
+		// client sends an Idempotency-Key and the server answers with the
+		// new Publication ID + Public URL.
+		res, err := a.client.PublishContentResult(ctx, id)
+		if err != nil {
 			return err
 		}
-		fmt.Println("Content published successfully")
+		if a.json {
+			return printJSON(res)
+		}
+		fmt.Printf("Content published successfully (publication %s)\n", res.PublicationID)
+		if res.PublicURL != "" {
+			fmt.Printf("Public URL: %s\n", res.PublicURL)
+		}
 		return nil
 
 	case "unpublish":

@@ -21,7 +21,7 @@ func stored744(t *testing.T, cs *ContentService, id primitive.ObjectID) bson.M {
 
 // A page deleted through the service is no longer flagged published, and
 // restoring it publishes it again.
-func TestDeleteContent_ClearsPublished_RestorePublishesAgain(t *testing.T) {
+func TestDeleteContent_PreservesPublishedProjectionUntilUnpublish(t *testing.T) {
 	cs, _, _, ctx := hooks742(t)
 	id := seed742(t, cs, models.Content{Title: "G1", Slug: "g1-pub", FullPath: "/g1-pub", Published: true})
 
@@ -29,8 +29,8 @@ func TestDeleteContent_ClearsPublished_RestorePublishesAgain(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 	row := stored744(t, cs, id)
-	if row["published"] != false {
-		t.Errorf("deleted row still has published=%v", row["published"])
+	if row["published"] != true {
+		t.Errorf("draft deletion changed published projection=%v", row["published"])
 	}
 	if row["published_before_delete"] != true {
 		t.Errorf("deleted row has published_before_delete=%v, want true", row["published_before_delete"])
@@ -48,7 +48,7 @@ func TestDeleteContent_ClearsPublished_RestorePublishesAgain(t *testing.T) {
 	}
 }
 
-func TestRestoreContent_DraftStaysDraft_HeldStaysUnpublished(t *testing.T) {
+func TestRestoreContent_DoesNotPerformAPublication(t *testing.T) {
 	cs, _, _, ctx := hooks742(t)
 	draft := seed742(t, cs, models.Content{Title: "G2", Slug: "g2-draft", FullPath: "/g2-draft"})
 	held := seed742(t, cs, models.Content{Title: "G3", Slug: "g3-held", FullPath: "/g3-held", Published: true})
@@ -66,8 +66,8 @@ func TestRestoreContent_DraftStaysDraft_HeldStaysUnpublished(t *testing.T) {
 		if err := cs.RestoreContent(ctx, id); err != nil {
 			t.Fatalf("restore: %v", err)
 		}
-		if row := stored744(t, cs, id); row["published"] == true {
-			t.Errorf("%v restored as published", row["full_path"])
+		if row := stored744(t, cs, id); row["published"] != (id == held) {
+			t.Errorf("%v restore changed the preexisting publication projection", row["full_path"])
 		}
 	}
 }

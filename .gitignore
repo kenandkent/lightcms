@@ -1,14 +1,21 @@
-# Binaries
-lightcms
+# Binaries (root-anchored: bare names would exclude any same-named directory,
+# e.g. cmd/server/ — do NOT un-anchor these)
+/lightcms
 bin/
-server
+/server
 
 # Uploads (user content)
 static/uploads/*
 !static/uploads/.gitkeep
 
-# Generated sitemap (site-specific, not part of software)
+# Generated sitemap (site-specific, not part of software; regenerated on demand)
 static/sitemap.xml
+internal/handlers/static/sitemap.xml
+
+# Generated theme CSS (regenerated from DB settings on every boot and by
+# package tests using their own CWD — never track, or every run dirties the tree)
+static/css/theme-vars.css
+internal/handlers/static/css/theme-vars.css
 
 # Generated content (site-specific, not part of software)
 content/
@@ -19,6 +26,9 @@ config.prod.json
 .env
 .env.local
 .env.test
+
+# Independent report export packages, private source snapshots and credentials
+/var/static-delivery/
 
 # Registry tokens (contain auth secrets)
 .mcpregistry_*
@@ -53,3 +63,7 @@ dist/
 *.out
 go.work
 VIBECTL.md
+---
+# Python bytecode (generator side-effects)
+__pycache__/
+*.pyc

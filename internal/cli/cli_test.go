@@ -30,7 +30,15 @@ func newTestServer() *httptest.Server {
 	mux.HandleFunc("/api/v1/content/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
-		case strings.HasSuffix(path, "/publish"), strings.HasSuffix(path, "/unpublish"),
+		case strings.HasSuffix(path, "/publish"):
+			// Task 16C: publish answers with the new Publication ID + URL.
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true, "publication_id": "pub-cli-1",
+				"public_url": "http://x/test", "full_path": "/test",
+				"content_id": "c1", "content_version": 2,
+			})
+		case strings.HasSuffix(path, "/unpublish"),
 			strings.HasSuffix(path, "/restore"), strings.HasSuffix(path, "/revert"):
 			w.WriteHeader(http.StatusOK)
 		case strings.Contains(path, "/versions"):

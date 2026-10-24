@@ -1,0 +1,22 @@
+{
+  "template": "technology-report",
+  "title": "A clearer view of the next market cycle",
+  "slug": "technology-report-demo",
+  "folder_path": "/reports",
+  "mode": "draft",
+  "data": {
+    "headline": "A clearer view of the next market cycle",
+    "summary": "An illustrative report showing how evidence, context and limitations can be presented in a readable publishing format.",
+    "author": "Research desk",
+    "category": "Technology report",
+    "headline_zh": "更清晰地观察下一个市场周期",
+    "summary_zh": "示例报告展示如何清晰呈现证据、背景与分析局限。",
+    "category_zh": "科技报告",
+    "body": "## Executive summary\n\nThis is **illustrative template content**, not a real market forecast, security finding or exchange announcement. Replace every paragraph with verified reporting before publication.\n\n## Evidence and context\n\nExplain the source, observation date and measurement method. Separate documented facts from interpretation.\n\n| Observation | Source | Limitation |\n| --- | --- | --- |\n| Insert verified observation | Link to original source | Explain coverage |\n| Add comparable evidence | Describe methodology | State uncertainty |\n\n> A strong conclusion should make its assumptions visible.\n\n## What to watch next\n\n1. Identify a measurable follow-up signal.\n2. Explain what would challenge the thesis.\n3. State the relevant timeframe.\n\n## Sources and limitations\n\nAdd source links, dates and limitations here. This demonstration contains no investment recommendation.",
+    "body_zh": "## 核心摘要\n\n这是**模板演示内容**，并非真实市场预测、安全发现或交易所公告。发布前请使用经核实的报道替换所有段落。\n\n## 证据与背景\n\n注明信息来源、观察日期与测量方法，区分事实和解读。\n\n| 观察 | 来源 | 局限 |\n| --- | --- | --- |\n| 填入经核实的观察 | 原始来源链接 | 说明覆盖范围 |\n\n> 有说服力的结论应让假设清晰可见。\n\n## 后续关注\n\n1. 定义可测量的后续信号。\n2. 说明哪些变化会挑战判断。\n3. 明确适用时间范围。\n\n## 来源与局限\n\n在这里补充来源、日期和局限。本示例不提供投资建议。",
+    "share_image_url": "https://publisher.example/static/images/report-templates/technology-report-share.png",
+    "share_image_alt": "Technology report — illustrative report cover",
+    "favicon_url": "https://publisher.example/static/images/report-templates/technology-report-icon.svg",
+    "touch_icon_url": "https://publisher.example/static/images/report-templates/technology-report-touch.png"
+  }
+}

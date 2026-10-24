@@ -16,6 +16,7 @@ type Content struct {
 	Category        string                 `json:"category"`
 	Tags            []string               `json:"tags,omitempty"`
 	MetaDescription string                 `json:"meta_description"`
+	Remark          string                 `json:"remark,omitempty"`
 	OGImage         string                 `json:"og_image"`
 	NoIndex         bool                   `json:"noindex,omitempty"`
 	Hold            bool                   `json:"hold,omitempty"`
@@ -100,6 +101,7 @@ type CreateContentRequest struct {
 	Category        string                 `json:"category,omitempty"`
 	Tags            []string               `json:"tags,omitempty"`
 	MetaDescription string                 `json:"meta_description,omitempty"`
+	Remark          string                 `json:"remark,omitempty"`
 	OGImage         string                 `json:"og_image,omitempty"`
 	NoIndex         bool                   `json:"noindex,omitempty"`
 	Hold            bool                   `json:"hold,omitempty"`

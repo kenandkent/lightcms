@@ -9,6 +9,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // SchedulerService runs a background ticker that publishes content whose
@@ -61,6 +62,10 @@ func (s *SchedulerService) Stop() {
 // runOnce queries for due content and publishes each item. Fork copies are
 // never due (they inherit publish_at from the page they were copied from);
 // held pages are skipped until their hold is cleared.
+// runOnce queries for due content and publishes each item.
+// Task 16D: every item publishes through PublicationService under a stable
+// operation key (scheduler/<id>/v<version>) — a tick retry replays instead
+// of minting a duplicate Publication/outbox row.
 func (s *SchedulerService) runOnce(ctx context.Context) {
 	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -69,10 +74,18 @@ func (s *SchedulerService) runOnce(ctx context.Context) {
 		"publish_at": bson.M{"$lte": time.Now()},
 		"published":  false,
 		"deleted":    bson.M{"$ne": true},
-		"fork_id":    nil,
+		// Lane 1B: never auto-publish sandbox or unapproved rows.
+		// fork_id:nil matches both missing and null (live rows omit the
+		// field via omitempty); pending_approval $ne:true covers
+		// missing/false (approval sets explicit true).
+		"fork_id":          nil,
+		"pending_approval": bson.M{"$ne": true},
 	}
 
-	cursor, err := s.db.FindMany(runCtx, "content", filter)
+	cursor, err := s.db.FindMany(runCtx, "content", filter,
+		// The loop only reads _id + current_version: project so the ~4KB
+		// embedding vector (and the full data map) never crosses the wire.
+		options.Find().SetProjection(bson.M{"current_version": 1, "hold": 1}))
 	if err != nil {
 		log.Printf("[scheduler] query failed: %v", err)
 		return
@@ -80,8 +93,9 @@ func (s *SchedulerService) runOnce(ctx context.Context) {
 	defer cursor.Close(runCtx)
 
 	type minContent struct {
-		ID   primitive.ObjectID `bson:"_id"`
-		Hold bool               `bson:"hold"`
+		ID             primitive.ObjectID `bson:"_id"`
+		CurrentVersion int64              `bson:"current_version"`
+		Hold           bool               `bson:"hold"`
 	}
 
 	for cursor.Next(runCtx) {
@@ -98,7 +112,9 @@ func (s *SchedulerService) runOnce(ctx context.Context) {
 			continue
 		}
 		delete(s.heldLogged, item.ID)
-		if err := s.contentService.PublishContent(runCtx, item.ID); err != nil {
+		key := SchedulerOpKey(item.ID, item.CurrentVersion)
+		if err := s.contentService.PublishInternal(runCtx, item.ID,
+			"scheduler", "/internal/scheduler/publish", key); err != nil {
 			log.Printf("[scheduler] failed to publish %s: %v", item.ID.Hex(), err)
 		} else {
 			log.Printf("[scheduler] published content %s", item.ID.Hex())

@@ -1,0 +1,80 @@
+# LightCMS V3 — test MongoDB replica set (Task 0).
+#
+# Single-node replica set: the minimum topology that supports multi-document
+# transactions (required by Task 2 `DB.WithTransaction` and every publication /
+# idempotency / outbox test in the V3 program). Standalone `mongod` CANNOT run
+# transactions — tests must fail, not silently pass, against standalone.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up -d
+#   docker compose -f docker-compose.test.yml logs mongo-init   # confirm "RS already initialized or newly initiated"
+#   # ... run tests with MONGODB_URI from .env.test ...
+#   docker compose -f docker-compose.test.yml down        # teardown (data volume kept)
+#   docker compose -f docker-compose.test.yml down -v     # teardown INCLUDING test data
+#
+# Never point this stack at production data. The test database name MUST
+# contain "test" — enforced by the safety guard in internal/testutil/testutil.go
+# (MustConnectTestDB refuses any DATABASE_NAME without "test").
+
+services:
+  mongo-test:
+    image: mongo:7.0.14
+    container_name: lightcms-mongo-test
+    command: ["--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-test-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # One-shot replica-set initiator. Exits 0 once rs0 is initialized
+  # (or confirms it already is, so `up` is idempotent across restarts).
+  mongo-init:
+    image: mongo:7.0.14
+    container_name: lightcms-mongo-init
+    depends_on:
+      mongo-test:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        for i in $$(seq 1 30); do
+          if mongosh --host mongo-test --quiet --eval '
+            try {
+              const st = rs.status();
+              if (st.ok === 1) { print("RS already initialized"); quit(0); }
+              quit(1);
+            } catch (e) {
+              const cfg = { _id: "rs0", members: [{ _id: 0, host: "mongo-test:27017" }] };
+              rs.initiate(cfg);
+              print("RS initiate issued");
+              quit(0);
+            }'; then
+            # Wait until this node reports PRIMARY/SECONDARY (i.e. RS truly ready for transactions).
+            for j in $$(seq 1 30); do
+              STATE=$$(mongosh --host mongo-test --quiet --eval 'try { rs.status().myState } catch(e) { -1 }' | tail -n 1)
+              if [ "$$STATE" = "1" ] || [ "$$STATE" = "2" ]; then
+                echo "RS ready (myState=$$STATE)"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "RS initiated but node never reached PRIMARY/SECONDARY" >&2
+            exit 1
+          fi
+          sleep 2
+        done
+        echo "Failed to initialize replica set" >&2
+        exit 1
+    restart: "no"
+
+volumes:
+  mongo-test-data:
+    name: lightcms-mongo-test-data

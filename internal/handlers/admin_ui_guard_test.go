@@ -170,7 +170,7 @@ func nodeText(n *html.Node) string {
 func submitButton(t *testing.T, doc *html.Node, label string) *html.Node {
 	t.Helper()
 	buttons := findNodes(doc, func(n *html.Node) bool {
-		return n.Data == "button" && htmlAttr(n, "type") == "submit" && nodeText(n) == label
+		return n.Data == "button" && htmlAttr(n, "type") == "submit" && (nodeText(n) == label || (label == "Update" && nodeText(n) == "更新"))
 	})
 	if len(buttons) != 1 {
 		t.Fatalf("found %d %q submit buttons, want 1", len(buttons), label)

@@ -398,12 +398,11 @@ func TestAdminReplace_LeavesForkCopiesAlone(t *testing.T) {
 	if n, _ := h.db.Count(context.Background(), "content_versions", bson.M{"content_id": bson.M{"$in": []primitive.ObjectID{forkCopy, forkOnly}}}); n != 0 {
 		t.Errorf("%d versions written for fork copies", n)
 	}
-	// The published live page is regenerated with the new text.
-	if html, err := os.ReadFile(staticFile("/adminsr-page")); err != nil {
-		t.Errorf("published live page was not regenerated: %v", err)
-	} else if strings.Contains(string(html), "wombat") {
-		t.Errorf("regenerated page still has the old text: %s", html)
+	// Replacements save draft versions; only an explicit publication changes live bytes.
+	if _, err := os.Stat(staticFile("/adminsr-page")); !os.IsNotExist(err) {
+		t.Errorf("draft replacement unexpectedly generated a live page: %v", err)
 	}
+
 }
 
 func TestAdminDeleteContent_ForkCopyLeavesLivePageIntact(t *testing.T) {
@@ -476,8 +475,8 @@ func TestAdminDeleteContent_ForkCopyLeavesLivePageIntact(t *testing.T) {
 	if c := loadPage(t, h.db, live); !c.Deleted {
 		t.Error("live page not deleted by an editor")
 	}
-	if _, err := os.Stat(staticFile("/admindel-page")); err == nil {
-		t.Error("deleting the live page left its static file behind")
+	if _, err := os.Stat(staticFile("/admindel-page")); err != nil {
+		t.Error("draft deletion changed canonical bytes before unpublish")
 	}
 }
 

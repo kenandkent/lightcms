@@ -51,7 +51,9 @@ func loadEnvTest() {
 				if idx := strings.IndexByte(line, '='); idx > 0 {
 					key := strings.TrimSpace(line[:idx])
 					val := strings.TrimSpace(line[idx+1:])
-					os.Setenv(key, val)
+					if _, explicit := os.LookupEnv(key); !explicit {
+						os.Setenv(key, val)
+					}
 				}
 			}
 			return
@@ -213,6 +215,9 @@ func FailOp(op string) func(string, string) error {
 // duplicate key errors when MigrateToMultiUser runs in subsequent tests.
 func CleanupCollections(t *testing.T, db *database.DB) {
 	t.Helper()
+	if name := db.DatabaseName(); !strings.Contains(strings.ToLower(name), "test") {
+		t.Fatalf("testutil: REFUSING cleanup — database name %q does not contain 'test'", name)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -226,6 +231,15 @@ func CleanupCollections(t *testing.T, db *database.DB) {
 		"content_forks", "approval_workflows", "approval_requests",
 		"import_sources", "import_jobs", "link_check_jobs", "regen_jobs",
 		"maintenance_reports", "agent_digests",
+		"template_versions", "content_publications", "idempotency_records",
+		"webhook_outbox", "system_migrations", "counters",
+		"workflow_jobs", "workflow_items", "workflow_events", "workflow_capacity",
+		"template_upgrade_jobs", "artifact_objects", "artifact_refs", "artifact_cleanup_plans",
+		"dependency_rows", "dependency_publications", "dependency_state", "instance_liveness",
+		"static_delivery_accounts", "static_delivery_credentials", "static_delivery_exports",
+		"static_delivery_jobs", "static_delivery_operations", "static_delivery_page_status",
+		"static_delivery_previews", "static_delivery_recovery_previews", "static_delivery_releases",
+		"static_delivery_settings", "static_delivery_targets",
 	}
 	for _, name := range collections {
 		db.Collection(name).Drop(ctx) //nolint:errcheck

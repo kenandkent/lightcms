@@ -43,7 +43,7 @@ func TestForkService_CreateGetList(t *testing.T) {
 	ctx := context.Background()
 	uid := primitive.NewObjectID()
 
-	fork, err := fs.Create(ctx, "Campaign", "Q3 launch", uid, "ed@x.com")
+	fork, err := fs.Create(ctx, "Campaign", "Q3 launch", uid, "ed@x.com", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestForkService_PageLifecycle(t *testing.T) {
 	ctx := context.Background()
 	uid := primitive.NewObjectID()
 
-	fork, err := fs.Create(ctx, "F", "", uid, "ed@x.com")
+	fork, err := fs.Create(ctx, "F", "", uid, "ed@x.com", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestForkService_ArchiveAndDelete(t *testing.T) {
 	ctx := context.Background()
 	uid := primitive.NewObjectID()
 
-	fork, err := fs.Create(ctx, "ToArchive", "", uid, "ed@x.com")
+	fork, err := fs.Create(ctx, "ToArchive", "", uid, "ed@x.com", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestForkService_ArchiveAndDelete(t *testing.T) {
 		t.Errorf("status = %q, want archived", got.Status)
 	}
 
-	fork2, _ := fs.Create(ctx, "ToDelete", "", uid, "ed@x.com")
+	fork2, _ := fs.Create(ctx, "ToDelete", "", uid, "ed@x.com", "")
 	if err := fs.Delete(ctx, fork2.ID); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestForkService_Diff(t *testing.T) {
 
 	liveID := seedLiveContent(t, db, "Original Title", "/diff-page")
 
-	fork, err := fs.Create(ctx, "diff-fork", "", uid, "a@x.com")
+	fork, err := fs.Create(ctx, "diff-fork", "", uid, "a@x.com", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestForkCopy_NoStaticSideEffects(t *testing.T) {
 		t.Fatalf("load live: %v", err)
 	}
 
-	fork, _ := fs.Create(ctx, "guard-fork", "", primitive.NewObjectID(), "a@x.com")
+	fork, _ := fs.Create(ctx, "guard-fork", "", primitive.NewObjectID(), "a@x.com", "")
 	copyPage, err := fs.ForkPage(ctx, fork.ID, liveID)
 	if err != nil {
 		t.Fatalf("ForkPage: %v", err)

@@ -416,10 +416,16 @@ func TestContentLifecycleNotifiesIndexNow(t *testing.T) {
 		t.Errorf("no-op save queued %v", p)
 	}
 
-	// Edit: queued.
+	// Draft edits do not notify; an explicit render/publication does.
 	got, _ = svc.GetContent(ctx, c.ID)
 	got.Data["content"] = "v2"
 	svc.UpdateContent(ctx, got)
+	if p := pending(); len(p) != 0 {
+		t.Errorf("draft edit queued %v", p)
+	}
+	if err := svc.GenerateStaticPage(ctx, got); err != nil {
+		t.Fatal(err)
+	}
 	if p := pending(); !p["/in-test"] {
 		t.Errorf("edit did not queue: %v", p)
 	}
@@ -436,6 +442,10 @@ func TestContentLifecycleNotifiesIndexNow(t *testing.T) {
 	got, _ = svc.GetContent(ctx, c.ID)
 	got.Slug = "in-test-2"
 	svc.UpdateContent(ctx, got)
+	if p := pending(); len(p) != 0 {
+		t.Errorf("draft rename queued %v", p)
+	}
+	svc.NotifyPublishedPaths(ctx, "/in-test", "/in-test-2")
 	if p := pending(); !p["/in-test"] || !p["/in-test-2"] {
 		t.Errorf("rename should queue old+new: %v", p)
 	}
@@ -454,8 +464,8 @@ func TestContentLifecycleNotifiesIndexNow(t *testing.T) {
 	if err := svc.DeleteContent(ctx, c.ID); err != nil {
 		t.Fatal(err)
 	}
-	if p := pending(); !p["/in-test-2"] {
-		t.Errorf("delete did not queue: %v", p)
+	if p := pending(); len(p) != 0 {
+		t.Errorf("draft deletion queued before unpublish: %v", p)
 	}
 
 	// Explicitly suppressed context.

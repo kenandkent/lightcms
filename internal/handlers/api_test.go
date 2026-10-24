@@ -54,6 +54,10 @@ func TestJsonError(t *testing.T) {
 	if body["error"] != "something broke" {
 		t.Fatalf("unexpected error field: %v", body)
 	}
+	// The error string stays a string; the sibling code is status-derived.
+	if body["code"] != "INVALID_REQUEST" {
+		t.Fatalf("expected status-derived code INVALID_REQUEST, got %v", body["code"])
+	}
 }
 
 func TestDecodeJSON(t *testing.T) {

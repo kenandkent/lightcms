@@ -52,6 +52,7 @@ func loadPage(t *testing.T, db *database.DB, id primitive.ObjectID) models.Conte
 func apiCall(t *testing.T, h http.HandlerFunc, method, target, body string, vars map[string]string) (*httptest.ResponseRecorder, map[string]interface{}) {
 	t.Helper()
 	req := authReq(method, target, strings.NewReader(body))
+	req.Header.Set("Idempotency-Key", "test-"+primitive.NewObjectID().Hex())
 	if vars != nil {
 		req = mux.SetURLVars(req, vars)
 	}

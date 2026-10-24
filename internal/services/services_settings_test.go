@@ -83,6 +83,9 @@ func TestApprovalService_TemplateTrigger(t *testing.T) {
 		ID: primitive.NewObjectID(), TemplateID: tmplID, Title: "T", Slug: "t", FullPath: "/t",
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
+	if err := cs.CreateContent(ctx, content); err != nil {
+		t.Fatal(err)
+	}
 	req, err := aps.SubmitContentForApproval(ctx, content, primitive.NewObjectID(), "a@x.com")
 	if err != nil {
 		t.Fatalf("SubmitContentForApproval(template trigger): %v", err)

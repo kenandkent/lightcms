@@ -31,7 +31,11 @@ func TestApprovalService_SubmitApproveRejectCancel(t *testing.T) {
 	}
 
 	newContent := func(path string) *models.Content {
-		return &models.Content{ID: primitive.NewObjectID(), Title: "T", FullPath: path, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+		content := &models.Content{ID: primitive.NewObjectID(), Title: "T", FullPath: path, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+		if _, err := db.InsertOne(ctx, "content", content); err != nil {
+			t.Fatal(err)
+		}
+		return content
 	}
 
 	// Submit + approve.
