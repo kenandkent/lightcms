@@ -60,7 +60,20 @@ func (s *TargetService) Create(ctx context.Context, account primitive.ObjectID, 
 		}
 	}
 	target := Target{Record: newRecord(), AccountRef: account, AccountID: a.AccountID, Name: strings.TrimSpace(name), WorkerName: worker, Environment: environment, Origin: origin, ConfigRevision: 1, Status: "draft", InstallationID: s.installation, AssetLimit: 20000}
-	_, e = s.repo.collection("targets").InsertOne(ctx, target)
+	e = s.repo.db.WithTransaction(ctx, func(sc mongo.SessionContext) error {
+		if err := s.repo.touchManagementRecord(sc, "accounts", account); err != nil {
+			return err
+		}
+		current, err := s.accounts.Get(sc, account)
+		if err != nil {
+			return err
+		}
+		if current.Status == "archived" {
+			return failure(CodeAccountDisabled, "account is archived", nil)
+		}
+		_, err = s.repo.collection("targets").InsertOne(sc, target)
+		return err
+	})
 	if mongo.IsDuplicateKeyError(e) {
 		return Target{}, failure(CodeTargetExists, "Worker target already exists; restore the existing target", nil)
 	}
@@ -75,6 +88,9 @@ func (s *TargetService) List(ctx context.Context) ([]Target, error) {
 	out := []Target{}
 	e = cur.All(ctx, &out)
 	return out, e
+}
+func (s *TargetService) Get(ctx context.Context, id primitive.ObjectID) (Target, error) {
+	return s.repo.GetTarget(ctx, id)
 }
 func (s *TargetService) remoteFor(ctx context.Context, t Target, revision int64) (Remote, error) {
 	if s.remote == nil {

@@ -51,6 +51,7 @@ type Target struct {
 	Environment                      string             `bson:"environment" json:"environment"`
 	Origin                           string             `bson:"public_origin" json:"public_origin"`
 	ConfigRevision                   int64              `bson:"config_revision" json:"config_revision"`
+	ManagementRevision               int64              `bson:"management_revision" json:"management_revision"`
 	CurrentRevision                  int64              `bson:"current_revision" json:"current_revision"`
 	CurrentReleaseID                 primitive.ObjectID `bson:"current_release_id" json:"current_release_id"`
 	ActiveJobID                      primitive.ObjectID `bson:"active_job_id" json:"active_job_id"`

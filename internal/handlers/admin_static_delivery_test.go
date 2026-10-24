@@ -21,12 +21,12 @@ func TestAdminStaticDeliveryTemplateUsesSafeForms(t *testing.T) {
 		t.Fatal(e)
 	}
 	var b bytes.Buffer
-	e = tmpl.Execute(&b, map[string]any{"Accounts": []sd.Account{a}, "CSRFField": template.HTML(`<input name="gorilla.csrf.Token" value="csrf-proof">`), "Lang": "zh", "IsAuthenticated": true})
+	e = tmpl.Execute(&b, map[string]any{"CF": cloudflareLabels("zh"), "Accounts": []cloudflareAccountView{{Account: a, Workers: []sd.Target{}}}, "CSRFField": template.HTML(`<input name="gorilla.csrf.Token" value="csrf-proof">`), "Lang": "zh", "IsAuthenticated": true})
 	if e != nil {
 		t.Fatal(e)
 	}
 	html := b.String()
-	for _, want := range []string{"Cloudflare 账号与发布目标", "账号读取已验证", "部署写入尚未验证", "type=\"password\"", "csrf-proof", "id=\"account-token\"", "id=\"target-account\""} {
+	for _, want := range []string{"Cloudflare 管理", "账号读取已验证", "部署写入尚未验证", "type=\"password\"", "csrf-proof", "id=\"account-token\"", "id=\"cf-worker-account\""} {
 		if !strings.Contains(html, want) {
 			t.Error("missing ", want)
 		}

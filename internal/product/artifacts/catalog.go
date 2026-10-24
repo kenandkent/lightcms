@@ -17,6 +17,7 @@ import (
 type Object struct {
 	Hash       string    `bson:"_id" json:"hash"`
 	Size       int64     `bson:"size" json:"size"`
+	MIME       string    `bson:"mime,omitempty" json:"mime,omitempty"`
 	State      string    `bson:"state" json:"state"`
 	Generation int64     `bson:"generation" json:"generation"`
 	Pinned     bool      `bson:"pinned" json:"pinned"`
@@ -53,8 +54,11 @@ func NewCatalog(db *database.DB, store *Store, retention, failed int) *Catalog {
 }
 func (c *Catalog) EnsureIndexes(ctx context.Context) error {
 	for collection, keys := range map[string][]mongo.IndexModel{
-		"artifact_objects": {{Keys: bson.D{{Key: "state", Value: 1}, {Key: "pinned", Value: 1}, {Key: "created_at", Value: 1}}}},
-		"artifact_refs":    {{Keys: bson.D{{Key: "hash", Value: 1}, {Key: "expires_at", Value: 1}}}, {Keys: bson.D{{Key: "owner", Value: 1}}}, {Keys: bson.D{{Key: "expires_at", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)}},
+		"artifact_objects": {
+			{Keys: bson.D{{Key: "state", Value: 1}, {Key: "pinned", Value: 1}, {Key: "created_at", Value: 1}}},
+			{Keys: bson.D{{Key: "created_at", Value: -1}, {Key: "_id", Value: 1}}},
+		},
+		"artifact_refs": {{Keys: bson.D{{Key: "hash", Value: 1}, {Key: "expires_at", Value: 1}}}, {Keys: bson.D{{Key: "owner", Value: 1}}}, {Keys: bson.D{{Key: "expires_at", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)}},
 	} {
 		if _, err := c.DB.Collection(collection).Indexes().CreateMany(ctx, keys); err != nil {
 			return err
@@ -82,7 +86,7 @@ func (c *Catalog) Register(ctx context.Context, ref Ref, failed bool) error {
 		var old Object
 		err := c.DB.Collection("artifact_objects").FindOne(sc, bson.M{"_id": ref.Hash}).Decode(&old)
 		if errors.Is(err, mongo.ErrNoDocuments) {
-			_, err := c.DB.Collection("artifact_objects").InsertOne(sc, Object{Hash: ref.Hash, Size: ref.Size, State: "available", Generation: 1, Failed: failed, CreatedAt: time.Now()})
+			_, err := c.DB.Collection("artifact_objects").InsertOne(sc, Object{Hash: ref.Hash, Size: ref.Size, MIME: ref.MIME, State: "available", Generation: 1, Failed: failed, CreatedAt: time.Now()})
 			return err
 		}
 		if err != nil {
@@ -97,7 +101,7 @@ func (c *Catalog) Register(ctx context.Context, ref Ref, failed bool) error {
 		if old.State == "available" {
 			return nil
 		}
-		_, err = c.DB.Collection("artifact_objects").UpdateOne(sc, bson.M{"_id": ref.Hash, "state": "deleted", "generation": old.Generation}, bson.M{"$set": bson.M{"state": "available", "failed": failed, "created_at": time.Now()}, "$inc": bson.M{"generation": 1}, "$unset": bson.M{"delete_plan": "", "deleted_at": ""}})
+		_, err = c.DB.Collection("artifact_objects").UpdateOne(sc, bson.M{"_id": ref.Hash, "state": "deleted", "generation": old.Generation}, bson.M{"$set": bson.M{"state": "available", "mime": ref.MIME, "failed": failed, "created_at": time.Now()}, "$inc": bson.M{"generation": 1}, "$unset": bson.M{"delete_plan": "", "deleted_at": ""}})
 		return err
 	})
 }

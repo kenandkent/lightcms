@@ -2,11 +2,20 @@ package handlers
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/metavert-io/lightcms/v7/internal/i18n"
 	"github.com/metavert-io/lightcms/v7/internal/models"
 	"github.com/metavert-io/lightcms/v7/internal/product/artifacts"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"net/http"
-	"time"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 type artifactMaintenance interface {
@@ -19,42 +28,124 @@ type artifactPinning interface {
 	PinObject(context.Context, string, bool) error
 }
 
+// Optional to keep existing maintenance integrations and test doubles valid.
+type artifactBrowser interface {
+	ListObjects(context.Context, artifacts.ListQuery) (artifacts.ObjectPage, error)
+	GetObject(context.Context, string) (artifacts.ObjectDetail, error)
+}
+
+func validArtifactHash(hash string) bool {
+	if len(hash) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(hash)
+	return err == nil && hash == strings.ToLower(hash)
+}
+
+func artifactPageURL(r *http.Request, page int) string {
+	query := url.Values{}
+	for _, key := range []string{"q", "state", "pin", "lang"} {
+		if value := r.URL.Query().Get(key); value != "" {
+			query.Set(key, value)
+		}
+	}
+	if page > 1 {
+		query.Set("page", strconv.Itoa(page))
+	}
+	if len(query) == 0 {
+		return "/cm/artifacts"
+	}
+	return "/cm/artifacts?" + query.Encode()
+}
+
 func (h *Handler) AdminArtifactsPage(w http.ResponseWriter, r *http.Request) {
 	if !h.deliveryAdminAllowed(w, r) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	if h.staticDelivery == nil || h.staticDelivery.Artifacts == nil {
-		http.Error(w, "产物管理暂不可用", 503)
+	labels := artifactManagementText(i18n.LangFromRequest(r))
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, labels["method_error"], http.StatusMethodNotAllowed)
 		return
 	}
-	data := map[string]any{}
+	if h.staticDelivery == nil || h.staticDelivery.Artifacts == nil {
+		http.Error(w, labels["unavailable"], http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	browser, canBrowse := h.staticDelivery.Artifacts.(artifactBrowser)
+	if r.Method == http.MethodGet && r.URL.Query().Get("format") == "json" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		fail := func(status int, message string) {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+		}
+		if !canBrowse {
+			fail(http.StatusServiceUnavailable, labels["list_unavailable"])
+			return
+		}
+		hash := r.URL.Query().Get("hash")
+		if !validArtifactHash(hash) {
+			fail(http.StatusBadRequest, labels["invalid_hash"])
+			return
+		}
+		detail, err := browser.GetObject(ctx, hash)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			fail(http.StatusNotFound, labels["not_found"])
+			return
+		}
+		if err != nil {
+			fail(http.StatusServiceUnavailable, labels["detail_error"])
+			return
+		}
+		_ = json.NewEncoder(w).Encode(detail)
+		return
+	}
+	page := 1
+	if value := r.URL.Query().Get("page"); value != "" {
+		var err error
+		page, err = strconv.Atoi(value)
+		if err != nil || page < 1 || page > 1000 {
+			http.Error(w, labels["filter_error"], http.StatusBadRequest)
+			return
+		}
+	}
+	data := map[string]any{"CanBrowse": canBrowse, "Search": r.URL.Query().Get("q"), "State": r.URL.Query().Get("state"), "Pin": r.URL.Query().Get("pin"), "PageNumber": page, "ListURL": artifactPageURL(r, page)}
 	pinning, canPin := h.staticDelivery.Artifacts.(artifactPinning)
 	data["CanPin"] = canPin
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, 4096)
 		if err := r.ParseForm(); err != nil {
-			http.Error(w, "表单格式错误", 400)
+			http.Error(w, labels["form_error"], http.StatusBadRequest)
 			return
 		}
 		user, _ := h.auth.GetCurrentUser(r)
 		owner := user.ID
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
 		var err error
-		switch r.FormValue("action") {
+		action := r.FormValue("action")
+		if (action == "unpin" || action == "confirm" || action == "resume") && r.FormValue("confirmed") != "yes" {
+			http.Error(w, labels["confirmation_required"], http.StatusBadRequest)
+			return
+		}
+		if (action == "pin" || action == "unpin") && !validArtifactHash(r.FormValue("hash")) {
+			http.Error(w, labels["invalid_hash"], http.StatusBadRequest)
+			return
+		}
+		if (action == "confirm" || action == "resume") && !validArtifactHash(r.FormValue("digest")) {
+			http.Error(w, labels["invalid_plan"], http.StatusBadRequest)
+			return
+		}
+		switch action {
 		case "pin", "unpin":
 			if !canPin {
-				http.Error(w, "固定保留功能暂不可用", 503)
+				http.Error(w, labels["pin_unavailable"], http.StatusServiceUnavailable)
 				return
 			}
-			if r.FormValue("action") == "unpin" && r.FormValue("confirmed") != "yes" {
-				http.Error(w, "解除固定保留需要明确确认", 400)
-				return
-			}
-			err = pinning.PinObject(ctx, r.FormValue("hash"), r.FormValue("action") == "pin")
+			err = pinning.PinObject(ctx, r.FormValue("hash"), action == "pin")
 			if err == nil {
-				data["Notice"] = "固定保留状态已更新；解除固定不等于立即删除，清理仍须重新预览并确认。"
+				data["Notice"] = labels["pin_saved"]
 			}
 		case "preview":
 			var plan artifacts.CleanupPlan
@@ -65,36 +156,39 @@ func (h *Handler) AdminArtifactsPage(w http.ResponseWriter, r *http.Request) {
 		case "confirm":
 			err = h.staticDelivery.Artifacts.ConfirmCleanup(ctx, owner, r.FormValue("digest"), r.FormValue("confirmed") == "yes")
 			if err == nil {
-				data["Notice"] = "本次候选清理已完成。"
+				data["Notice"] = labels["cleanup_done"]
 			}
 		case "resume":
 			err = h.staticDelivery.Artifacts.ResumeCleanup(ctx, owner, r.FormValue("digest"), r.FormValue("confirmed") == "yes")
 			if err == nil {
-				data["Notice"] = "已核实并继续该计划中已开始的删除；未开始的候选需要重新预览。"
+				data["Notice"] = labels["resume_done"]
 			}
 		default:
-			http.Error(w, "未知操作", 400)
+			http.Error(w, labels["unknown_action"], http.StatusBadRequest)
 			return
 		}
 		if err != nil {
-			data["Error"] = "操作未完成。确认是否已勾选、计划是否过期或文件是否已被新任务引用。中断的删除可使用原计划编号继续；其他情况请重新预览。"
+			data["Error"] = labels["action_error"]
 			data["Digest"] = r.FormValue("digest")
+			data["ResumeOpen"] = action == "confirm" || action == "resume"
 		} else if action := r.FormValue("action"); action != "preview" && h.auditService != nil {
 			uid, _ := primitive.ObjectIDFromHex(user.ID)
 			h.auditService.LogAsync(models.AuditLog{UserID: uid, UserEmail: user.Email, Action: "artifact." + action, Resource: "artifact", ResourceID: r.FormValue("hash"), Details: map[string]any{"cleanup_plan": r.FormValue("digest")}, IPAddress: r.RemoteAddr})
 		}
 	}
+	if canBrowse {
+		listing, err := browser.ListObjects(ctx, artifacts.ListQuery{Search: r.URL.Query().Get("q"), State: r.URL.Query().Get("state"), Pin: r.URL.Query().Get("pin"), Page: page, Limit: 25})
+		if err != nil {
+			data["ListError"] = labels["list_error"]
+		} else {
+			data["Listing"] = listing
+			if page > 1 {
+				data["PreviousURL"] = artifactPageURL(r, page-1)
+			}
+			if listing.HasNext {
+				data["NextURL"] = artifactPageURL(r, page+1)
+			}
+		}
+	}
 	h.renderAdmin(w, r, "artifacts", data)
-}
-func init() {
-	adminTemplates["artifacts"] = adminLayoutStart + `
-<div class="page-header"><h1>静态产物管理</h1></div>
-<p>只管理新对象存储中的私有产物，不删除文章、模板、旧版快照或 Cloudflare 资源。默认保留期：正常产物90天，失败产物7天，实际以服务器配置为准；当前发布、未决任务及固定保留的文件不会进入候选。</p>
-{{if .CanPin}}<details class="card" style="padding:24px;margin:24px 0"><summary>手动固定保留 / 解除固定</summary><p>输入对象 SHA-256（清理预览中可查看）。固定无自动过期时间；解除固定不会移除当前发布或任务引用。</p><form method="POST" action="/cm/artifacts"><input type="hidden" name="gorilla.csrf.Token" value="{{.CSRFToken}}"><label>对象哈希 <input name="hash" required minlength="64" maxlength="64" pattern="[a-f0-9]{64}" style="width:100%"></label><label style="display:block;margin:20px 0"><input type="checkbox" name="confirmed" value="yes"> 确认解除固定后可进入后续清理候选</label><button name="action" value="pin" class="btn btn-secondary">固定保留</button> <button name="action" value="unpin" class="btn btn-secondary">解除固定</button></form></details>{{end}}
-{{if .Notice}}<p role="status">{{.Notice}}</p>{{end}}{{if .Error}}<p role="alert">{{.Error}}</p>{{end}}
-<form method="POST" action="/cm/artifacts" style="margin:24px 0"><input type="hidden" name="gorilla.csrf.Token" value="{{.CSRFToken}}"><input type="hidden" name="action" value="preview"><button class="btn btn-secondary">预览可清理文件（不删除）</button></form>
-{{with .Plan}}<section class="card" style="padding:24px"><h2>清理预览</h2><p>计划编号：<code style="overflow-wrap:anywhere">{{.Digest}}</code></p><p>有效期至 {{.ExpiresAt}}。每批最多100个对象，确认时会再次检查引用。</p><ul>{{range .Items}}<li style="overflow-wrap:anywhere">{{.Hash}} · {{.Size}} bytes</li>{{else}}<li>没有符合清理条件的文件。</li>{{end}}</ul>
-{{if .Items}}<form method="POST" action="/cm/artifacts"><input type="hidden" name="gorilla.csrf.Token" value="{{$.CSRFToken}}"><input type="hidden" name="action" value="confirm"><input type="hidden" name="digest" value="{{.Digest}}"><label><input type="checkbox" name="confirmed" value="yes" required> 确认永久删除以上无引用对象；需要保留的备份已单独验证</label><p><button class="btn btn-secondary">确认清理</button></p></form>{{end}}</section>{{end}}
-<details style="margin-top:24px"><summary>继续中断的清理</summary><p>仅处理原计划已经标记为删除中的对象，不扩大范围，也不处理未开始的候选。</p><form method="POST" action="/cm/artifacts"><input type="hidden" name="gorilla.csrf.Token" value="{{.CSRFToken}}"><input type="hidden" name="action" value="resume"><label>原计划编号 <input name="digest" value="{{.Digest}}" required minlength="64" maxlength="64"></label><p><label><input type="checkbox" name="confirmed" value="yes" required> 确认继续已开始的删除</label></p><button class="btn btn-secondary">继续清理</button></form></details>
-` + adminLayoutEnd
 }

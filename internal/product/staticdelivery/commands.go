@@ -463,6 +463,9 @@ func (s *CommandService) SubmitDeployment(ctx context.Context, a ActorSnapshot, 
 		} else if !errors.Is(e, mongo.ErrNoDocuments) {
 			return e
 		}
+		if e := s.repo.touchManagementRecord(sc, "targets", j.TargetID); e != nil {
+			return e
+		}
 		if j.QueueMode != queueMerge {
 			if e := s.repo.ClaimTarget(sc, j.TargetID, j.ID, j.ExpectedRevision); e != nil {
 				return e

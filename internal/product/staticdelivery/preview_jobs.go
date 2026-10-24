@@ -102,7 +102,7 @@ func (s *CommandService) SubmitPreview(ctx context.Context, a ActorSnapshot, key
 	if err != nil {
 		return result, err
 	}
-	j, err := s.previewRunner.Repo.Submit(ctx, jobs.Submission{Kind: "delivery_preview", Actor: a.Owner, Key: key, InputRef: target.Hex(), Items: []jobs.Input{{Key: "prepare", Data: bson.M{"execution": encoded}}}})
+	j, err := s.submitManagedWorkflow(ctx, target, jobs.Submission{Kind: "delivery_preview", Actor: a.Owner, Key: key, InputRef: target.Hex(), Items: []jobs.Input{{Key: "prepare", Data: bson.M{"execution": encoded}}}})
 	if err != nil {
 		return result, workflowAPIError(err)
 	}

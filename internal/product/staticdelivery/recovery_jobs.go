@@ -12,6 +12,7 @@ import (
 type recoveryCommitFence struct{}
 type RecoveryJobResult struct {
 	JobID         primitive.ObjectID `json:"job_id"`
+	TargetID      primitive.ObjectID `json:"target_id"`
 	State         string             `json:"state"`
 	ErrorCode     string             `json:"error_code,omitempty"`
 	DeliveryJobID primitive.ObjectID `json:"delivery_job_id,omitempty"`
@@ -65,7 +66,7 @@ func (s *CommandService) SubmitRecovery(ctx context.Context, a ActorSnapshot, id
 	if err != nil {
 		return RecoveryJobResult{}, err
 	}
-	job, err := s.previewRunner.Repo.Submit(ctx, jobs.Submission{Kind: "delivery_recovery", Actor: a.Owner, Key: digest, InputRef: id.Hex(), Items: []jobs.Input{{Key: "prepare", Data: bson.M{"execution": raw}}}})
+	job, err := s.submitManagedWorkflow(ctx, id, jobs.Submission{Kind: "delivery_recovery", Actor: a.Owner, Key: digest, InputRef: id.Hex(), Items: []jobs.Input{{Key: "prepare", Data: bson.M{"execution": raw}}}})
 	if err != nil {
 		return RecoveryJobResult{}, workflowAPIError(err)
 	}
@@ -87,6 +88,7 @@ func (s *CommandService) GetRecoveryJob(ctx context.Context, a ActorSnapshot, id
 	if job.Kind != "delivery_recovery" || job.Actor != a.Owner && a.Role != "admin" {
 		return result, failure(CodePermissionDenied, "recovery belongs to another actor", nil)
 	}
+	result.TargetID, _ = primitive.ObjectIDFromHex(job.InputRef)
 	result.State = job.State
 	result.ErrorCode = job.ErrorCode
 	if job.State == "succeeded" {

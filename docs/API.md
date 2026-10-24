@@ -352,6 +352,18 @@ curl -o /dev/null -w "%{http_code}\n" https://ibreeze.agency/reports/q3-review
 
 REST 静态发布契约以 [static-delivery-v1.yaml](openapi/static-delivery-v1.yaml) 为准，后台会话接口将 `/api/v1` 换成 `/cm/static-delivery/api` 并携带 CSRF。原有同步预览、CRUD、MCP/CLI、原站点 Publication 接口保留。
 
+后台 Cloudflare 管理继续使用原 `/cm/static-delivery` 路由。以下为管理员会话表单接口，均需 CSRF，不属于 `/api/v1` JSON 接口；成功返回303并保留 `account` 弹窗上下文。
+
+| 方法与路径 | 新增管理行为 |
+| --- | --- |
+| `POST /cm/static-delivery/accounts/{id}/delete` | 必须 `confirm_delete=yes`；事务性删除本地账号、其 Worker 配置及凭证，不删除远端 Worker、历史任务或产物文件 |
+| `POST /cm/static-delivery/targets/{id}/update` | `account_ref`、`expected_config_revision`、`expected_management_revision`、`name`、`worker_name`、`environment`、`public_origin`；拒绝跨账号、旧版本和忙碌配置；初始化后禁止改脚本名，已有发布的域名/环境改动走维护部署。显示名称只增加管理版本，不改变部署配置版本 |
+| `POST /cm/static-delivery/targets/{id}/delete` | 必须 `account_ref`、`confirm_delete=yes`；仅删除该账号下的本地 Worker 配置；排队或未决任务返回409 |
+| `GET /cm/artifacts?format=json&hash={sha256}` | 管理员只读产物元数据与有界活跃引用，缺少对象返回404；不返回文件内容、Token或服务器绝对路径 |
+
+Worker 页面维护支持 `/cm/static-delivery/maintenance?target_id={id}` 直接打开指定目标详情。菜单重构不改变原有发布、任务中心、运行状态和产物清理服务的契约。
+原来的仅含 `recovery_job_id` 的恢复链接继续有效；恢复任务状态返回 `target_id`，页面据此定位 Worker。任务中心的既有链接不需要修改。
+
 | 操作 | 新增或保持的约定 |
 | --- | --- |
 | `POST /static-targets/{id}/deployment-preview` | 携带 `Prefer: respond-async` 和 `Idempotency-Key` 返回 202 准备任务；不携带 Prefer 保持旧同步响应。缺失键返回 428；不同输入复用键返回 409；队列满返回 429 |

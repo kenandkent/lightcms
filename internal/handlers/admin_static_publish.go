@@ -3,6 +3,7 @@ package handlers
 import (
 	"github.com/gorilla/mux"
 	"github.com/metavert-io/lightcms/v7/internal/auth"
+	"github.com/metavert-io/lightcms/v7/internal/i18n"
 	"github.com/metavert-io/lightcms/v7/internal/models"
 	deliveryapi "github.com/metavert-io/lightcms/v7/internal/product/staticdelivery/httpapi"
 	"go.mongodb.org/mongo-driver/bson"
@@ -32,7 +33,7 @@ func (h *Handler) AdminStaticPublishPage(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Cache-Control", "no-store")
 	data := map[string]any{}
 	if h.staticDelivery == nil || h.staticDelivery.Commands == nil {
-		data["ModuleError"] = "内容静态发布模块不可用，请检查服务启动日志。"
+		data["ModuleError"] = staticPublishText(i18n.LangFromRequest(r))["moduleError"]
 		h.renderAdmin(w, r, "static_delivery_publish", data)
 		return
 	}

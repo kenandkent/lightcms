@@ -9847,6 +9847,10 @@ const adminLayoutStart = `<!DOCTYPE html>
                     <div class="nav-section-title">{{i18n "section.content" "内容" $.Lang}}</div>
                     <a href="/cm" class="nav-link">📊 {{i18n "nav.dashboard" "仪表盘" $.Lang}}</a>
                     <a href="/cm/content" class="nav-link">📄 {{i18n "nav.content" "内容管理" $.Lang}}</a>
+                    {{if and .CurrentUser (eq .CurrentUser.Role "admin")}}
+                    <a href="/cm/static-delivery/maintenance" class="nav-link">{{if eq .Lang "en"}}Worker pages{{else}}Worker 页面维护{{end}}</a>
+                    <a href="/cm/artifacts" class="nav-link">{{if eq .Lang "en"}}Static artifacts{{else}}静态产物管理{{end}}</a>
+                    {{end}}
                     <a href="/cm/templates" class="nav-link">📋 {{i18n "nav.templates" "模板" $.Lang}}</a>
                     <a href="/cm/snippets" class="nav-link">✂️ {{i18n "nav.snippets" "代码片段" $.Lang}}</a>
                     <a href="/cm/collections" class="nav-link">📁 {{i18n "nav.collections" "合集" $.Lang}}</a>
@@ -9868,11 +9872,9 @@ const adminLayoutStart = `<!DOCTYPE html>
                     <a href="/cm/security" class="nav-link">🔒 {{i18n "nav.security" "安全" $.Lang}}</a>
                     <a href="/cm/webhooks" class="nav-link">🔔 {{i18n "nav.webhooks" "Webhook" $.Lang}}</a>
                     {{if and .CurrentUser (eq .CurrentUser.Role "admin")}}
-                    <a href="/cm/static-delivery" class="nav-link">Cloudflare 静态发布</a>
-                    <a href="/cm/static-delivery/maintenance" class="nav-link">Worker 页面维护</a>
+                    <a href="/cm/static-delivery" class="nav-link">{{if eq .Lang "en"}}Cloudflare management{{else}}Cloudflare 管理{{end}}</a>
                     <a href="/cm/tasks" class="nav-link">任务中心</a>
                     <a href="/cm/operations" class="nav-link">运行状态</a>
-                    <a href="/cm/artifacts" class="nav-link">静态产物管理</a>
                     <a href="/cm/users" class="nav-link">👥 {{i18n "nav.users" "用户" $.Lang}}</a>
                     <a href="/cm/audit" class="nav-link">📜 {{i18n "nav.audit" "审计日志" $.Lang}}</a>
                     <a href="/cm/analytics" class="nav-link">📊 {{i18n "nav.analytics" "数据分析" $.Lang}}</a>
